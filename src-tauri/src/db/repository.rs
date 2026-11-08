@@ -46,20 +46,20 @@ impl Repository {
             "INSERT INTO channels (id, name, type, base_url, api_key, models, status, priority, weight, config, model_mapping, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"
         )
-        .bind(&id)
-        .bind(&input.name)
-        .bind(&input.channel_type)
-        .bind(&input.base_url)
-        .bind(&input.api_key)
-        .bind(&models)
-        .bind(input.priority.unwrap_or(0))
-        .bind(input.weight.unwrap_or(1))
-        .bind(&config)
-        .bind(&model_mapping)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+            .bind(&id)
+            .bind(&input.name)
+            .bind(&input.channel_type)
+            .bind(&input.base_url)
+            .bind(&input.api_key)
+            .bind(&models)
+            .bind(input.priority.unwrap_or(0))
+            .bind(input.weight.unwrap_or(1))
+            .bind(&config)
+            .bind(&model_mapping)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
 
         self.get_channel(&id).await
     }
@@ -167,16 +167,16 @@ impl Repository {
             "INSERT INTO api_keys (id, name, key, status, allowed_models, allowed_channels, quota_limit, quota_used, created_at, updated_at)
              VALUES (?, ?, ?, 1, ?, ?, ?, 0, ?, ?)"
         )
-        .bind(&id)
-        .bind(&input.name)
-        .bind(&key)
-        .bind(&allowed_models)
-        .bind(&allowed_channels)
-        .bind(input.quota_limit.unwrap_or(-1))
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+            .bind(&id)
+            .bind(&input.name)
+            .bind(&key)
+            .bind(&allowed_models)
+            .bind(&allowed_channels)
+            .bind(input.quota_limit.unwrap_or(-1))
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
 
         sqlx::query_as::<_, ApiKey>("SELECT * FROM api_keys WHERE id = ?")
             .bind(&id)
@@ -216,35 +216,73 @@ impl Repository {
 
     pub async fn create_log(&self, log: &RequestLog) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO request_logs (id, api_key_id, api_key_name, channel_id, channel_name, model, upstream_model, mode, status_code, prompt_tokens, completion_tokens, total_tokens, duration_ms, error_message, is_stream, is_retry, created_at, request_body)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO request_logs (id, api_key_id, api_key_name, channel_id, channel_name, model, upstream_model, mode, status_code, prompt_tokens, completion_tokens, total_tokens, duration_ms, error_message, is_stream, is_retry, created_at, request_body, risk_level, risk_score, risk_summary, security_action, sanitized, blocked_reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
-        .bind(&log.id)
-        .bind(&log.api_key_id)
-        .bind(&log.api_key_name)
-        .bind(&log.channel_id)
-        .bind(&log.channel_name)
-        .bind(&log.model)
-        .bind(&log.upstream_model)
-        .bind(&log.mode)
-        .bind(log.status_code)
-        .bind(log.prompt_tokens)
-        .bind(log.completion_tokens)
-        .bind(log.total_tokens)
-        .bind(log.duration_ms)
-        .bind(&log.error_message)
-        .bind(log.is_stream)
-        .bind(log.is_retry)
-        .bind(&log.created_at)
-        .bind(&log.request_body)
-        .execute(&self.pool)
-        .await?;
+            .bind(&log.id)
+            .bind(&log.api_key_id)
+            .bind(&log.api_key_name)
+            .bind(&log.channel_id)
+            .bind(&log.channel_name)
+            .bind(&log.model)
+            .bind(&log.upstream_model)
+            .bind(&log.mode)
+            .bind(log.status_code)
+            .bind(log.prompt_tokens)
+            .bind(log.completion_tokens)
+            .bind(log.total_tokens)
+            .bind(log.duration_ms)
+            .bind(&log.error_message)
+            .bind(log.is_stream)
+            .bind(log.is_retry)
+            .bind(&log.created_at)
+            .bind(&log.request_body)
+            .bind(&log.risk_level)
+            .bind(log.risk_score)
+            .bind(&log.risk_summary)
+            .bind(&log.security_action)
+            .bind(log.sanitized)
+            .bind(&log.blocked_reason)
+            .execute(&self.pool)
+            .await?;
         // Backfill seq with rowid for new rows
         sqlx::query("UPDATE request_logs SET seq = rowid WHERE id = ? AND seq IS NULL")
             .bind(&log.id)
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn create_security_findings(&self, log_id: &str, findings: &[crate::security::SecurityFinding], action: &str) -> Result<(), sqlx::Error> {
+        for finding in findings {
+            sqlx::query(
+                "INSERT INTO request_security_findings (id, log_id, phase, category, rule_id, severity, title, description, location, evidence_masked, evidence_hash, action, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+                .bind(crate::utils::id::new_id())
+                .bind(log_id)
+                .bind(&finding.phase)
+                .bind(&finding.category)
+                .bind(&finding.rule_id)
+                .bind(finding.severity.as_str())
+                .bind(&finding.title)
+                .bind(&finding.description)
+                .bind(&finding.location)
+                .bind(&finding.evidence_masked)
+                .bind(Option::<String>::None)
+                .bind(action)
+                .bind(crate::utils::time::now_iso())
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_security_findings(&self, log_id: &str) -> Result<Vec<RequestSecurityFinding>, sqlx::Error> {
+        sqlx::query_as::<_, RequestSecurityFinding>("SELECT * FROM request_security_findings WHERE log_id = ? ORDER BY created_at ASC")
+            .bind(log_id)
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub async fn get_log(&self, id: &str) -> Result<RequestLog, sqlx::Error> {
@@ -281,10 +319,10 @@ impl Repository {
         sqlx::query_as::<_, RequestLog>(
             "SELECT * FROM request_logs ORDER BY created_at DESC LIMIT ? OFFSET ?"
         )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub async fn search_logs(
@@ -349,53 +387,53 @@ impl Repository {
         let today_requests: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM request_logs WHERE created_at LIKE ?"
         )
-        .bind(&today_prefix)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .bind(&today_prefix)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         let today_total_tokens: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(total_tokens), 0) FROM request_logs WHERE created_at LIKE ?"
         )
-        .bind(&today_prefix)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .bind(&today_prefix)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         let active_channels: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM channels WHERE status = 1"
         )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         let total_channels: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channels")
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         let total_api_keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys")
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         let total_requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         let total_tokens: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(total_tokens), 0) FROM request_logs")
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         let avg_latency: f64 = sqlx::query_scalar(
             "SELECT COALESCE(AVG(duration_ms), 0) FROM request_logs WHERE created_at LIKE ?"
         )
-        .bind(&today_prefix)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0.0);
+            .bind(&today_prefix)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0.0);
 
         Ok(DashboardStats {
             today_requests,
@@ -423,8 +461,8 @@ impl Repository {
              GROUP BY date
              ORDER BY date DESC"
         )
-        .bind(&since)
-        .fetch_all(&self.pool)
-        .await
+            .bind(&since)
+            .fetch_all(&self.pool)
+            .await
     }
 }
