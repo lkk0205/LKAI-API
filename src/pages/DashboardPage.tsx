@@ -100,7 +100,7 @@ export function DashboardPage() {
               <Workflow className="h-3.5 w-3.5" /> 控制台首页
             </div>
             <div className="mt-4 flex items-center gap-2">
-              <h1 className="text-3xl font-semibold tracking-[-0.03em] text-slate-900">欢迎使用 WaLiAPI</h1>
+              <h1 className="text-3xl font-semibold tracking-[-0.03em] text-slate-900">欢迎使用 LKAIAPI</h1>
               <button
                 onClick={() => setShowHelp(true)}
                 className="inline-flex items-center justify-center rounded-full border border-slate-200 bg-slate-50 p-1 text-slate-400 transition-all hover:border-blue-200 hover:bg-blue-50 hover:text-blue-600"
