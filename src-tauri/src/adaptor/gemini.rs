@@ -30,7 +30,7 @@ impl Adaptor for GeminiAdaptor {
     async fn forward(&self, request: &ProxyRequest, config: &ChannelConfig) -> Result<(u16, serde_json::Value, Option<TokenUsage>), anyhow::Error> {
         let model = request.body.get("model").and_then(|m| m.as_str()).unwrap_or("gemini-2.0-flash");
         let url = format!("{}/v1beta/models/{}:generateContent?key={}", config.base_url.trim_end_matches('/'), model, config.api_key);
-        
+
         let openai_body = &request.body;
         let gemini_body = convert_openai_to_gemini(openai_body);
 
@@ -38,7 +38,7 @@ impl Adaptor for GeminiAdaptor {
         let resp = client.post(&url).header("Content-Type", "application/json").json(&gemini_body).send().await?;
         let status = resp.status().as_u16();
         let gemini_json: serde_json::Value = resp.json().await?;
-        
+
         let openai_response = convert_gemini_to_openai(&gemini_json, model);
         let usage = openai_response.get("usage").and_then(|u| Some(TokenUsage {
             prompt_tokens: u.get("prompt_tokens")?.as_u64()?,
@@ -52,7 +52,7 @@ impl Adaptor for GeminiAdaptor {
     async fn forward_stream(&self, request: &ProxyRequest, config: &ChannelConfig) -> Result<reqwest::Response, anyhow::Error> {
         let model = request.body.get("model").and_then(|m| m.as_str()).unwrap_or("gemini-2.0-flash");
         let url = format!("{}/v1beta/models/{}:streamGenerateContent?key={}&alt=sse", config.base_url.trim_end_matches('/'), model, config.api_key);
-        
+
         let openai_body = &request.body;
         let gemini_body = convert_openai_to_gemini(openai_body);
 
@@ -64,19 +64,30 @@ impl Adaptor for GeminiAdaptor {
 
 fn convert_openai_to_gemini(body: &serde_json::Value) -> serde_json::Value {
     let messages = body.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default();
-    
+
     let mut system_instruction = None;
     let mut contents = Vec::new();
 
     for msg in &messages {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
         let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        
+
         if role == "system" {
             system_instruction = Some(serde_json::json!({
                 "parts": [{"text": content}]
             }));
         } else {
+            // Skip empty assistant messages without tool_calls
+            if role == "assistant" && content.is_empty() {
+                let has_tool_calls = msg
+                    .get("tool_calls")
+                    .and_then(|t| t.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
+                if !has_tool_calls {
+                    continue;
+                }
+            }
             contents.push(serde_json::json!({
                 "role": if role == "assistant" { "model" } else { "user" },
                 "parts": [{"text": content}]

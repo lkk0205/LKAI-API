@@ -7,11 +7,11 @@ pub struct ClaudeAdaptor;
 impl Adaptor for ClaudeAdaptor {
     fn channel_type(&self) -> &'static str { "claude" }
     fn default_models(&self) -> Vec<&'static str> { vec!["claude-sonnet-4-20250514", "claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022"] }
-    fn default_base_url(&self) -> &str { "https://api.anthropic.com" }
+    fn default_base_url(&self) -> &str { "https://api.anthropic.com/v1" }
 
     async fn test(&self, config: &ChannelConfig) -> Result<TestResult, anyhow::Error> {
         let start = std::time::Instant::now();
-        let url = format!("{}/v1/messages", config.base_url.trim_end_matches('/'));
+        let url = format!("{}/messages", config.base_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": config.models.first().map(|s| s.as_str()).unwrap_or("claude-3-5-haiku-20241022"),
             "max_tokens": 1,
@@ -27,10 +27,16 @@ impl Adaptor for ClaudeAdaptor {
             .send().await {
             Ok(r) => {
                 let latency = start.elapsed().as_millis() as u64;
-                if r.status().is_success() || r.status().as_u16() == 400 {
+                let status = r.status();
+                if status.is_success() {
                     Ok(TestResult { success: true, message: "连接成功".to_string(), latency_ms: latency })
                 } else {
-                    Ok(TestResult { success: false, message: format!("HTTP {}", r.status()), latency_ms: latency })
+                    let body = r.text().await.unwrap_or_default();
+                    let err_msg = serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).map(String::from))
+                        .unwrap_or(body);
+                    Ok(TestResult { success: false, message: format!("HTTP {} {}", status.as_u16(), err_msg), latency_ms: latency })
                 }
             }
             Err(e) => Ok(TestResult { success: false, message: format!("连接失败: {}", e), latency_ms: start.elapsed().as_millis() as u64 }),
@@ -38,19 +44,19 @@ impl Adaptor for ClaudeAdaptor {
     }
 
     async fn forward(&self, request: &ProxyRequest, config: &ChannelConfig) -> Result<(u16, serde_json::Value, Option<TokenUsage>), anyhow::Error> {
-        let url = format!("{}/v1/messages", config.base_url.trim_end_matches('/'));
+        let url = format!("{}/messages", config.base_url.trim_end_matches('/'));
         let openai_body = &request.body;
-        
+
         // Convert OpenAI format to Claude format
         let model = openai_body.get("model").and_then(|m| m.as_str()).unwrap_or("claude-3-5-haiku-20241022");
         let messages = openai_body.get("messages").cloned().unwrap_or(serde_json::Value::Array(vec![]));
         let max_tokens = openai_body.get("max_tokens").and_then(|m| m.as_u64()).unwrap_or(4096);
         let temperature = openai_body.get("temperature").cloned();
         let stream = openai_body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-        
+
         // Extract system message if present
         let (system, claude_messages) = convert_openai_messages_to_claude(&messages);
-        
+
         let mut claude_body = serde_json::json!({
             "model": model,
             "max_tokens": max_tokens,
@@ -87,13 +93,13 @@ impl Adaptor for ClaudeAdaptor {
     }
 
     async fn forward_stream(&self, request: &ProxyRequest, config: &ChannelConfig) -> Result<reqwest::Response, anyhow::Error> {
-        let url = format!("{}/v1/messages", config.base_url.trim_end_matches('/'));
+        let url = format!("{}/messages", config.base_url.trim_end_matches('/'));
         let openai_body = &request.body;
         let model = openai_body.get("model").and_then(|m| m.as_str()).unwrap_or("claude-3-5-haiku-20241022");
         let messages = openai_body.get("messages").cloned().unwrap_or(serde_json::Value::Array(vec![]));
         let max_tokens = openai_body.get("max_tokens").and_then(|m| m.as_u64()).unwrap_or(4096);
         let (system, claude_messages) = convert_openai_messages_to_claude(&messages);
-        
+
         let mut claude_body = serde_json::json!({
             "model": model,
             "max_tokens": max_tokens,
@@ -128,12 +134,29 @@ fn convert_openai_messages_to_claude(messages: &serde_json::Value) -> (Option<St
     for msg in msgs {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
         let content = msg.get("content").cloned().unwrap_or(serde_json::Value::String(String::new()));
-        
+
         if role == "system" {
             if let Some(s) = content.as_str() {
                 system = Some(s.to_string());
             }
         } else {
+            // Skip empty assistant messages without tool_calls
+            if role == "assistant" {
+                let is_empty = match &content {
+                    serde_json::Value::Null => true,
+                    serde_json::Value::String(s) => s.is_empty(),
+                    serde_json::Value::Array(a) => a.is_empty(),
+                    _ => false,
+                };
+                let has_tool_calls = msg
+                    .get("tool_calls")
+                    .and_then(|t| t.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
+                if is_empty && !has_tool_calls {
+                    continue;
+                }
+            }
             claude_msgs.push(serde_json::json!({
                 "role": if role == "assistant" { "assistant" } else { "user" },
                 "content": content,
