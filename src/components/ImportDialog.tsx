@@ -2,7 +2,7 @@ import { useState } from "react";
 import { importExportApi, type ImportResult, type ScannedSource } from "../lib/api";
 import { X, Upload, FileJson, ScanLine, Check, AlertCircle, Loader2, ChevronDown, ChevronRight } from "lucide-react";
 
-type ImportMode = "menu" | "walicode" | "waliapi" | "scan";
+type ImportMode = "menu" | "walicode" | "lkapi" | "scan";
 
 export function ImportDialog({ onClose, onImported }: {
   onClose: () => void;
@@ -37,8 +37,8 @@ export function ImportDialog({ onClose, onImported }: {
     setLoading(false);
   };
 
-  // ─── Waliapi import ────────────────────────────────────────
-  const handleWaliapiImport = async () => {
+  // ─── Lkapi import ────────────────────────────────────────
+  const handleLkapiImport = async () => {
     setLoading(true);
     setError(null);
     try {
@@ -47,7 +47,7 @@ export function ImportDialog({ onClose, onImported }: {
         setLoading(false);
         return;
       }
-      const res = await importExportApi.importWaliapiExport(content);
+      const res = await importExportApi.importLkapiExport(content);
       setResult(res);
       if (res.imported > 0) {
         onImported();
@@ -121,7 +121,7 @@ export function ImportDialog({ onClose, onImported }: {
           <h2 className="text-lg font-semibold">
             {mode === "menu" && "导入渠道"}
             {mode === "walicode" && "导入 WaLiCode 备份"}
-            {mode === "waliapi" && "导入 LKAIAPI 导出文件"}
+            {mode === "lkapi" && "导入 LKAPI 导出文件"}
             {mode === "scan" && "扫描本地 AI 配置"}
           </h2>
           <button onClick={onClose} className="action-secondary px-3 py-2"><X size={18} /></button>
@@ -164,9 +164,9 @@ export function ImportDialog({ onClose, onImported }: {
 
               <ImportOption
                 icon={<Upload size={20} />}
-                title="导入 LKAIAPI 导出文件"
-                description="从其他 LKAIAPI 实例导出的 JSON 文件导入渠道"
-                onClick={() => { setMode("waliapi"); setResult(null); setError(null); }}
+                title="导入 LKAPI 导出文件"
+                description="从其他 LKAPI 实例导出的 JSON 文件导入渠道"
+                onClick={() => { setMode("lkapi"); setResult(null); setError(null); }}
               />
 
               <ImportOption
@@ -211,19 +211,19 @@ export function ImportDialog({ onClose, onImported }: {
             </div>
           )}
 
-          {/* Waliapi mode */}
-          {mode === "waliapi" && (
+          {/* Lkapi mode */}
+          {mode === "lkapi" && (
             <div className="space-y-4">
               <div className="rounded-2xl border border-border bg-background/40 px-4 py-4 text-sm">
-                <p className="mb-2 font-medium">LKAIAPI 导出文件导入说明</p>
+                <p className="mb-2 font-medium">LKAPI 导出文件导入说明</p>
                 <ul className="space-y-1 text-muted-foreground text-xs">
-                  <li>• 支持其他 LKAIAPI 实例导出的 JSON 文件</li>
+                  <li>• 支持其他 LKAPI 实例导出的 JSON 文件</li>
                   <li>• 包含渠道类型、模型列表、API Key 等完整信息</li>
                   <li>• 已存在的同名渠道将被跳过</li>
                 </ul>
               </div>
               <button
-                onClick={handleWaliapiImport}
+                onClick={handleLkapiImport}
                 disabled={loading}
                 className="action-primary w-full justify-center"
               >

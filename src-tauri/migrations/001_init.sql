@@ -1,4 +1,4 @@
--- WaLiAPI database initialization
+-- LKAPI database initialization
 
 -- 渠道表
 CREATE TABLE IF NOT EXISTS channels (

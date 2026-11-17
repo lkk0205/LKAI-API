@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 // ─── Export types ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct WaliapiExport {
+pub struct LkapiExport {
     pub version: String,
     pub exported_at: String,
     pub r#type: String,
@@ -123,7 +123,7 @@ pub struct ImportResult {
 
 // ─── Commands ───────────────────────────────────────────────────────────────
 
-/// Export all channels as a waliapi JSON backup
+/// Export all channels as a lkapi JSON backup
 #[tauri::command]
 pub async fn export_channels(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
@@ -131,10 +131,10 @@ pub async fn export_channels(
     let repo = Repository::new(state.db.pool.clone());
     let channels = repo.get_all_channels().await.map_err(|e| e.to_string())?;
 
-    let export = WaliapiExport {
+    let export = LkapiExport {
         version: "1.0".to_string(),
         exported_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-        r#type: "waliapi-export".to_string(),
+        r#type: "lkapi-export".to_string(),
         channels: channels.into_iter().map(ExportedChannel::from).collect(),
     };
 
@@ -249,14 +249,14 @@ pub async fn import_walicode_backup(
     Ok(ImportResult { imported, skipped, errors })
 }
 
-/// Import channels from a waliapi export JSON file content
+/// Import channels from a lkapi export JSON file content
 #[tauri::command]
-pub async fn import_waliapi_export(
+pub async fn import_lkapi_export(
     content: String,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<ImportResult, String> {
-    let export: WaliapiExport =
-        serde_json::from_str(&content).map_err(|e| format!("解析 waliapi 导出文件失败: {}", e))?;
+    let export: LkapiExport =
+        serde_json::from_str(&content).map_err(|e| format!("解析 lkapi 导出文件失败: {}", e))?;
 
     let repo = Repository::new(state.db.pool.clone());
     let existing = repo.get_all_channels().await.map_err(|e| e.to_string())?;

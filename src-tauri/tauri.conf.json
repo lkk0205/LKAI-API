@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "WaLiAPI",
+  "productName": "LKAPI",
   "version": "0.1.4",
-  "identifier": "waliapi.xiaofuge.cn",
+  "identifier": "lkapi.xiaofuge.cn",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "WaLiAPI - Local LLM Gateway",
+        "title": "LKAPI - Local LLM Gateway",
         "width": 1400,
         "height": 960,
         "minWidth": 1100,
@@ -40,7 +40,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey":
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJDOUNEMjk4MDA3ODQ3NUEKUldSYVIzZ0FtTktjdkRxUkJpNEJiMm5ydCtxd3Q1WnRnNmtzVjJRbjNyMldvTnhobVJiQWI1ZloK",
       "endpoints": [
       ]
     }

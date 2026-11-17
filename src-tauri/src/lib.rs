@@ -39,7 +39,7 @@ pub fn run() {
         .plugin(
             tauri_plugin_sql::Builder::default()
                 .add_migrations(
-                    "sqlite:waliapi.db",
+                    "sqlite:lkapi.db",
                     vec![tauri_plugin_sql::Migration {
                         version: 1,
                         description: "init database",
@@ -64,7 +64,7 @@ pub fn run() {
             TrayIconBuilder::with_id("main")
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
-                .tooltip("WaLiAPI - Local LLM API Gateway")
+                .tooltip("LKAPI - Local LLM API Gateway")
                 .show_menu_on_left_click(false)
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
@@ -159,7 +159,7 @@ pub fn run() {
             commands::security::delete_custom_security_rule,
             commands::import_export::export_channels,
             commands::import_export::import_walicode_backup,
-            commands::import_export::import_waliapi_export,
+            commands::import_export::import_lkapi_export,
             commands::import_export::scan_local_ai_configs,
             commands::import_export::import_scanned_sources,
             commands::import_export::pick_import_file,
@@ -188,7 +188,7 @@ pub fn run() {
             commands::services::get_service_statuses,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building WaLiAPI")
+        .expect("error while building LKAPI")
         .run(|app, event| {
             #[cfg(target_os = "macos")]
             {
