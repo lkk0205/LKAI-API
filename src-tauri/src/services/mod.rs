@@ -1,4 +1,5 @@
 pub mod knowledge;
+pub mod mcp;
 
 use async_trait::async_trait;
 use axum::Router;
@@ -46,6 +47,7 @@ impl ServiceRegistry {
         // 3-3 注册 KnowledgeService;3-6 注册 McpService。
         let mut registry = Self { services: vec![] };
         registry.register(Box::new(knowledge::KnowledgeService));
+        registry.register(Box::new(mcp::McpService));
         registry
     }
 
