@@ -141,6 +141,22 @@ impl Repository {
         Ok(())
     }
 
+    pub async fn reorder_channels(&self, ordered_ids: &[String]) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        let mut tx = self.pool.begin().await?;
+        for (i, id) in ordered_ids.iter().enumerate() {
+            let priority = (ordered_ids.len() - i) as i64;
+            sqlx::query("UPDATE channels SET priority = ?, updated_at = ? WHERE id = ?")
+                .bind(priority)
+                .bind(&now)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     // ==================== API Key ====================
 
     pub async fn get_all_api_keys(&self) -> Result<Vec<ApiKey>, sqlx::Error> {
@@ -247,8 +263,8 @@ impl Repository {
             .bind(&log.trace_id)
             .execute(&self.pool)
             .await?;
-        // Backfill seq with rowid for new rows
-        sqlx::query("UPDATE request_logs SET seq = rowid WHERE id = ? AND seq IS NULL")
+        // Backfill seq with rowid for new rows (seq defaults to 0, so check for 0)
+        sqlx::query("UPDATE request_logs SET seq = rowid WHERE id = ? AND (seq IS NULL OR seq = 0)")
             .bind(&log.id)
             .execute(&self.pool)
             .await?;
@@ -443,6 +459,21 @@ impl Repository {
             .await
             .unwrap_or(0.0);
 
+        let total_knowledge_bases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_knowledge_bases")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
+
+        let total_kb_documents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_documents")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
+
+        let total_kb_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_chunks")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
+
         Ok(DashboardStats {
             today_requests,
             today_total_tokens,
@@ -452,7 +483,26 @@ impl Repository {
             total_api_keys,
             total_requests,
             total_tokens,
+            total_knowledge_bases,
+            total_kb_documents,
+            total_kb_chunks,
         })
+    }
+
+    pub async fn get_channel_stats(&self) -> Result<Vec<ChannelStats>, sqlx::Error> {
+        sqlx::query_as::<_, ChannelStats>(
+            "SELECT\n                r.channel_id as channel_id,\n                COUNT(*) as total_calls,\n                SUM(CASE WHEN r.status_code >= 200 AND r.status_code < 300 THEN 1 ELSE 0 END) as success_calls,\n                SUM(CASE WHEN r.status_code >= 200 AND r.status_code < 300 THEN 0 ELSE 1 END) as failed_calls,\n                COALESCE(SUM(r.total_tokens), 0) as total_tokens,\n                COALESCE(SUM(r.prompt_tokens), 0) as prompt_tokens,\n                COALESCE(SUM(r.completion_tokens), 0) as completion_tokens,\n                COALESCE(AVG(r.duration_ms), 0) as avg_latency_ms,\n                MAX(r.created_at) as last_call_at\n            FROM request_logs r\n            WHERE r.channel_id IS NOT NULL\n            GROUP BY r.channel_id"
+        )
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    pub async fn get_api_key_stats(&self) -> Result<Vec<ApiKeyStats>, sqlx::Error> {
+        sqlx::query_as::<_, ApiKeyStats>(
+            "SELECT\n                r.api_key_id as api_key_id,\n                COUNT(*) as total_calls,\n                SUM(CASE WHEN r.status_code >= 200 AND r.status_code < 300 THEN 1 ELSE 0 END) as success_calls,\n                SUM(CASE WHEN r.status_code >= 200 AND r.status_code < 300 THEN 0 ELSE 1 END) as failed_calls,\n                COALESCE(SUM(r.total_tokens), 0) as total_tokens,\n                COALESCE(SUM(r.prompt_tokens), 0) as prompt_tokens,\n                COALESCE(SUM(r.completion_tokens), 0) as completion_tokens,\n                COALESCE(AVG(r.duration_ms), 0) as avg_latency_ms,\n                MAX(r.created_at) as last_call_at\n            FROM request_logs r\n            WHERE r.api_key_id IS NOT NULL\n            GROUP BY r.api_key_id"
+        )
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub async fn get_log_stats(&self, days: i64) -> Result<Vec<LogStats>, sqlx::Error> {

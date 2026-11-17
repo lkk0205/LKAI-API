@@ -86,16 +86,16 @@ pub async fn seed_builtin_rules(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             "INSERT OR IGNORE INTO security_builtin_rules (id, rule_id, category, severity, title, description, toggle_key, enabled, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)"
         )
-        .bind(id)
-        .bind(rule_id)
-        .bind(category)
-        .bind(severity)
-        .bind(title)
-        .bind(desc)
-        .bind(toggle_key)
-        .bind(&now)
-        .execute(pool)
-        .await?;
+            .bind(id)
+            .bind(rule_id)
+            .bind(category)
+            .bind(severity)
+            .bind(title)
+            .bind(desc)
+            .bind(toggle_key)
+            .bind(&now)
+            .execute(pool)
+            .await?;
     }
     Ok(())
 }
@@ -109,16 +109,17 @@ impl BuiltinRuleRepository {
         sqlx::query_as::<_, BuiltinRule>(
             "SELECT * FROM security_builtin_rules ORDER BY rule_id"
         )
-        .fetch_all(pool)
-        .await
+            .fetch_all(pool)
+            .await
     }
 
+    #[allow(dead_code)]
     pub async fn get_enabled(pool: &SqlitePool) -> Result<Vec<BuiltinRule>, sqlx::Error> {
         sqlx::query_as::<_, BuiltinRule>(
             "SELECT * FROM security_builtin_rules WHERE enabled = 1 ORDER BY rule_id"
         )
-        .fetch_all(pool)
-        .await
+            .fetch_all(pool)
+            .await
     }
 
     pub async fn update(
@@ -181,16 +182,17 @@ impl CustomRuleRepository {
         sqlx::query_as::<_, CustomRule>(
             "SELECT * FROM security_custom_rules ORDER BY created_at DESC",
         )
-        .fetch_all(pool)
-        .await
+            .fetch_all(pool)
+            .await
     }
 
+    #[allow(dead_code)]
     pub async fn get_enabled(pool: &SqlitePool) -> Result<Vec<CustomRule>, sqlx::Error> {
         sqlx::query_as::<_, CustomRule>(
             "SELECT * FROM security_custom_rules WHERE enabled = 1 ORDER BY created_at DESC",
         )
-        .fetch_all(pool)
-        .await
+            .fetch_all(pool)
+            .await
     }
 
     pub async fn create(pool: &SqlitePool, input: &CreateCustomRuleInput) -> Result<CustomRule, sqlx::Error> {
@@ -203,16 +205,16 @@ impl CustomRuleRepository {
             "INSERT INTO security_custom_rules (id, rule_type, category, pattern, severity, action, enabled, description, created_at)
              VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)"
         )
-        .bind(&id)
-        .bind(&input.rule_type)
-        .bind(&input.category)
-        .bind(&input.pattern)
-        .bind(&severity)
-        .bind(&action)
-        .bind(&input.description)
-        .bind(&now)
-        .execute(pool)
-        .await?;
+            .bind(&id)
+            .bind(&input.rule_type)
+            .bind(&input.category)
+            .bind(&input.pattern)
+            .bind(&severity)
+            .bind(&action)
+            .bind(&input.description)
+            .bind(&now)
+            .execute(pool)
+            .await?;
 
         sqlx::query_as::<_, CustomRule>("SELECT * FROM security_custom_rules WHERE id = ?")
             .bind(&id)
@@ -240,6 +242,7 @@ impl CustomRuleRepository {
 
 // ─── Rule matching helpers ──────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub fn apply_custom_rules(
     text: &str,
     phase: &str,
@@ -266,6 +269,7 @@ pub fn apply_custom_rules(
     }
 }
 
+#[allow(dead_code)]
 pub fn is_whitelisted(category: &str, value: &str, custom_rules: &[CustomRule]) -> bool {
     let lower = value.to_ascii_lowercase();
     custom_rules.iter().any(|r| {
@@ -276,6 +280,7 @@ pub fn is_whitelisted(category: &str, value: &str, custom_rules: &[CustomRule]) 
     })
 }
 
+#[allow(dead_code)]
 fn parse_severity(s: &str) -> RiskLevel {
     match s {
         "info" => RiskLevel::Info,

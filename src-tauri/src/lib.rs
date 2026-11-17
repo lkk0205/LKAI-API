@@ -122,15 +122,19 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::channel::get_channels,
             commands::channel::get_channel,
+            commands::channel::get_channel_api_key,
             commands::channel::create_channel,
             commands::channel::update_channel,
             commands::channel::toggle_channel,
             commands::channel::delete_channel,
             commands::channel::test_channel,
+            commands::channel::get_channel_stats,
+            commands::channel::reorder_channels,
             commands::api_key::get_api_keys,
             commands::api_key::create_api_key,
             commands::api_key::update_api_key,
             commands::api_key::delete_api_key,
+            commands::api_key::get_api_key_stats,
             commands::log::get_logs,
             commands::log::get_log,
             commands::log::get_log_security_findings,
@@ -160,7 +164,6 @@ pub fn run() {
             commands::import_export::import_scanned_sources,
             commands::import_export::pick_import_file,
             commands::import_export::save_export_file,
-            commands::services::get_service_statuses,
             // Knowledge Base
             commands::knowledge_base::get_knowledge_bases,
             commands::knowledge_base::create_knowledge_base,
@@ -182,6 +185,7 @@ pub fn run() {
             commands::knowledge_base::build_kb_index,
             commands::knowledge_base::drop_kb_index,
             commands::knowledge_base::get_kb_tags,
+            commands::services::get_service_statuses,
         ])
         .build(tauri::generate_context!())
         .expect("error while building WaLiAPI")

@@ -1,4 +1,4 @@
-use crate::db::models::{Channel, CreateChannelInput, UpdateChannelInput};
+use crate::db::models::{Channel, CreateChannelInput, UpdateChannelInput, ChannelStats};
 use crate::db::repository::Repository;
 use crate::AppState;
 use crate::adaptor::{get_adaptor, ChannelConfig};
@@ -70,6 +70,13 @@ pub async fn get_channel(id: String, state: tauri::State<'_, std::sync::Arc<AppS
 }
 
 #[tauri::command]
+pub async fn get_channel_api_key(id: String, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<String, String> {
+    let repo = Repository::new(state.db.pool.clone());
+    let channel = repo.get_channel(&id).await.map_err(|e| e.to_string())?;
+    Ok(channel.api_key)
+}
+
+#[tauri::command]
 pub async fn create_channel(input: CreateChannelInput, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<ChannelDto, String> {
     let repo = Repository::new(state.db.pool.clone());
     repo.create_channel(&input).await.map_err(|e| e.to_string()).map(to_dto)
@@ -93,6 +100,12 @@ pub async fn delete_channel(id: String, state: tauri::State<'_, std::sync::Arc<A
     repo.delete_channel(&id).await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn get_channel_stats(state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<Vec<ChannelStats>, String> {
+    let repo = Repository::new(state.db.pool.clone());
+    repo.get_channel_stats().await.map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TestChannelResult {
     pub success: bool,
@@ -104,7 +117,7 @@ pub struct TestChannelResult {
 pub async fn test_channel(id: String, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<TestChannelResult, String> {
     let repo = Repository::new(state.db.pool.clone());
     let channel = repo.get_channel(&id).await.map_err(|e| e.to_string())?;
-    
+
     let config = ChannelConfig {
         base_url: channel.base_url.clone(),
         api_key: channel.api_key.clone(),
@@ -115,12 +128,19 @@ pub async fn test_channel(id: String, state: tauri::State<'_, std::sync::Arc<App
 
     let adaptor = get_adaptor(&channel.channel_type);
     let result = adaptor.test(&config).await.map_err(|e| e.to_string())?;
-    
+
     repo.update_channel_test_result(&id, result.success).await.map_err(|e| e.to_string())?;
-    
+
     Ok(TestChannelResult {
         success: result.success,
         message: result.message,
         latency_ms: result.latency_ms,
     })
+}
+
+#[tauri::command]
+pub async fn reorder_channels(ordered_ids: Vec<String>, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<(), String> {
+    let repo = Repository::new(state.db.pool.clone());
+    repo.reorder_channels(&ordered_ids).await.map_err(|e| e.to_string())?;
+    Ok(())
 }

@@ -91,14 +91,14 @@ fn scan_credentials(text: &str, phase: &str, location: &str, findings: &mut Vec<
         let lower = t.to_ascii_lowercase();
         let is_secret =
             (t.starts_with("sk-") && t.len() >= 24) ||
-            (t.starts_with("sk-ant-") && t.len() >= 30) ||
-            (t.starts_with("ghp_") && t.len() >= 20) ||
-            (t.starts_with("gho_") && t.len() >= 20) ||
-            (t.starts_with("xoxb-") && t.len() >= 20) ||
-            (t.starts_with("AKIA") && t.len() >= 16) ||
-            (t.starts_with("AIza") && t.len() >= 20) ||
-            (t.starts_with("eyJ") && t.len() >= 30 && t.contains('.')) ||
-            lower.starts_with("bearer ");
+                (t.starts_with("sk-ant-") && t.len() >= 30) ||
+                (t.starts_with("ghp_") && t.len() >= 20) ||
+                (t.starts_with("gho_") && t.len() >= 20) ||
+                (t.starts_with("xoxb-") && t.len() >= 20) ||
+                (t.starts_with("AKIA") && t.len() >= 16) ||
+                (t.starts_with("AIza") && t.len() >= 20) ||
+                (t.starts_with("eyJ") && t.len() >= 30 && t.contains('.')) ||
+                lower.starts_with("bearer ");
         if is_secret {
             add(findings, phase, "credential", "credential.secret_token", RiskLevel::High, "发现疑似密钥/Token", "请求内容中出现 API Key、Bearer Token、GitHub Token、JWT 或云厂商密钥样式字符串。", location, t);
             break;
@@ -232,6 +232,7 @@ fn add(
     });
 }
 
+#[allow(dead_code)]
 pub fn add_finding(
     f: &mut Vec<SecurityFinding>,
     phase: &str,
