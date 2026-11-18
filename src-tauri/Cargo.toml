@@ -1,6 +1,6 @@
 [package]
 name = "lkapi"
-version = "0.1.4"
+version = "0.1.2"
 description = "LKAPI - Local LLM API Gateway"
 authors = ["xiaofuge"]
 edition = "2021"
