@@ -42,6 +42,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJDOUNEMjk4MDA3ODQ3NUEKUldSYVIzZ0FtTktjdkRxUkJpNEJiMm5ydCtxd3Q1WnRnNmtzVjJRbjNyMldvTnhobVJiQWI1ZloK",
       "endpoints": [
+        "https://github.com/lkk0205/LKAI-API/releases/latest/download/latest.json"
       ]
     }
   }
