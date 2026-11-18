@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'lkapi-v*'
+  workflow_dispatch:
+
+jobs:
+  # Windows 先跑：负责创建 draft release，并完成版本一致性校验
+  windows:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: setup node
+        uses: actions/setup-node@v5
+        with:
+          node-version: lts/*
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # 与本地 pnpm 大版本保持一致，避免本地/CI 写出不同格式的 lock
+      - name: install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - name: install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: verify versions (package.json / tauri.conf.json / tag / Cargo.lock)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONF=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          PKG=$(node -p "require('./package.json').version")
+          echo "tauri.conf.json=$CONF  package.json=$PKG  ref=${GITHUB_REF_NAME:-none}"
+          if [ "$CONF" != "$PKG" ]; then
+            echo "::error::package.json ($PKG) 与 tauri.conf.json ($CONF) 版本不一致"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAGVER="${GITHUB_REF_NAME#lkapi-v}"
+            if [ "$TAGVER" != "$CONF" ]; then
+              echo "::error::tag 是 $TAGVER，但 tauri.conf.json 是 $CONF，先改版本号再打 tag"
+              exit 1
+            fi
+          fi
+          cd src-tauri
+          cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: build Tauri app (windows)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: lkapi-v__VERSION__
+          releaseName: 'LKAPI v__VERSION__'
+          releaseBody: 'Windows 下载 -setup.exe；Linux 下载 .AppImage（应用内自动更新仅对 AppImage 生效）。'
+          releaseDraft: true
+          prerelease: false
+          args: '--bundles nsis'
+
+  # Linux 串行在 Windows 之后：避免两个 job 同时读改写同一个 latest.json
+  linux:
+    needs: windows
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: setup node
+        uses: actions/setup-node@v5
+        with:
+          node-version: lts/*
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - name: install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: build Tauri app (linux)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: lkapi-v__VERSION__
+          releaseName: 'LKAPI v__VERSION__'
+          releaseBody: 'Windows 下载 -setup.exe；Linux 下载 .AppImage（应用内自动更新仅对 AppImage 生效）。'
+          releaseDraft: true
+          prerelease: false
+          args: '--bundles deb,appimage,rpm'
