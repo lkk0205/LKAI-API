@@ -47,7 +47,7 @@ export function ImportDialog({ onClose, onImported }: {
         setLoading(false);
         return;
       }
-      const res = await importExportApi.importLkapiExport(content);
+      const res = await importExportApi.importWaliapiExport(content);
       setResult(res);
       if (res.imported > 0) {
         onImported();
