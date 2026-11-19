@@ -29,7 +29,7 @@ const navItems = [
     { to: "/settings", icon: Settings, label: "设置" },
 ];
 
-const githubUrl = "https://github.com/fuzhengwei/WaLiAPI";
+const githubUrl = "https://github.com/lkk0205/LKAI-API";
 const appVersion = packageJson.version;
 
 export function Sidebar({
@@ -55,11 +55,11 @@ export function Sidebar({
             <div className="surface rounded-[22px] p-5">
                 <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-white shadow-[0_8px_16px_rgba(47,111,237,0.18)] overflow-hidden">
-                        <img src="/logo.png" alt="WaLiAPI" className="h-full w-full object-cover" />
+                        <img src="/logo.png" alt="LKAPI" className="h-full w-full object-cover" />
                     </div>
                     <div className="min-w-0 flex-1">
                         <div className="flex items-center justify-between gap-2">
-                            <div className="text-[20px] font-bold tracking-[-0.04em] text-slate-900 leading-none">WaLiAPI</div>
+                            <div className="text-[20px] font-bold tracking-[-0.04em] text-slate-900 leading-none">LKAPI</div>
                             <button
                                 onClick={onCheckUpdate}
                                 className={`relative rounded-full border px-2 py-0.5 text-[10px] font-semibold transition-colors ${
@@ -149,7 +149,7 @@ export function Sidebar({
           </span>
                     <span className="min-w-0 flex-1">
             <span className="block font-medium">GitHub 开源仓库</span>
-            <span className="block truncate text-xs text-slate-500">github.com/fuzhengwei/WaLiAPI</span>
+            <span className="block truncate text-xs text-slate-500">github.com/lkk0205/LKAI-API</span>
           </span>
                     <ExternalLink size={14} className="text-slate-400" />
                 </button>

@@ -208,7 +208,7 @@ export function ChannelsPage() {
                                     <Upload size={16} className="text-muted-foreground" />
                                     <div className="text-left">
                                         <div>导入渠道</div>
-                                        <div className="text-xs text-muted-foreground">WaLiAPI 导出 / 扫描本地 / WaLiCode 备份</div>
+                                        <div className="text-xs text-muted-foreground">LKAPI 导出 / 扫描本地 / WaLiCode 备份</div>
                                     </div>
                                 </button>
                             </div>
