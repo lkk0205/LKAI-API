@@ -158,6 +158,7 @@ function getRoleMeta(role: string) {
 export function LogsPage() {
     const [logs, setLogs] = useState<RequestLog[]>([]);
     const [loading, setLoading] = useState(false);
+    const [loadError, setLoadError] = useState(false);
     const [page, setPage] = useState(0);
     const [expandedId, setExpandedId] = useState<string | null>(null);
     const [showCleanModal, setShowCleanModal] = useState(false);
@@ -192,7 +193,7 @@ export function LogsPage() {
             trace_id: filterTraceId || undefined,
         })
             .then(setLogs)
-            .catch(() => {})
+            .catch(() => setLoadError(true))
             .finally(() => setLoading(false));
     }, [keyword, filterApiKey, filterChannel, filterModel, filterDateFrom, filterDateTo, filterTraceId]);
 
@@ -366,9 +367,20 @@ export function LogsPage() {
                 <div className="surface h-full overflow-hidden rounded-[24px] flex flex-col">
                     {logs.length === 0 ? (
                         <div className="flex flex-1 flex-col items-center justify-center gap-2 text-center">
-                            <ScrollText className="h-12 w-12 text-muted-foreground/70" />
-                            <p className="text-base font-medium">暂无审计日志</p>
-                            <p className="text-sm text-muted-foreground">当有模型请求经过网关后，这里会显示调用记录</p>
+                            {loadError ? (
+                                <>
+                                    <AlertCircle className="h-12 w-12 text-red-400/70" />
+                                    <p className="text-base font-medium">日志加载失败</p>
+                                    <p className="text-sm text-muted-foreground">请检查服务是否已启动</p>
+                                    <button onClick={() => load(page)} className="mt-1 rounded-lg bg-blue-600 px-4 py-2 text-xs font-medium text-white hover:bg-blue-700">重新加载</button>
+                                </>
+                            ) : (
+                                <>
+                                    <ScrollText className="h-12 w-12 text-muted-foreground/70" />
+                                    <p className="text-base font-medium">暂无审计日志</p>
+                                    <p className="text-sm text-muted-foreground">当有模型请求经过网关后，这里会显示调用记录</p>
+                                </>
+                            )}
                         </div>
                     ) : (
                         <>
@@ -577,7 +589,28 @@ function LogDetail({ log }: { log: RequestLog }) {
     const byteSize = log.request_body ? new Blob([log.request_body]).size : 0;
     const sizeLabel = byteSize > 1024 ? `${(byteSize / 1024).toFixed(1)} KB` : `${byteSize} B`;
 
-    const messages: Array<Record<string, unknown>> = parsed && Array.isArray(parsed.messages) ? parsed.messages : [];
+    // Support both Chat Completions (messages) and Responses API (input) formats
+    const rawMessages: Array<Record<string, unknown>> = parsed && Array.isArray(parsed.messages) ? parsed.messages : [];
+    const rawInput: Array<Record<string, unknown>> = parsed && Array.isArray(parsed.input) ? parsed.input : [];
+    // Normalize Responses API input items to a common message-like structure for display
+    const messages: Array<Record<string, unknown>> = rawMessages.length > 0
+        ? rawMessages
+        : rawInput.map((item, idx) => {
+            // Responses API input items have: role, content (array of {type, text})
+            const role = item.role as string || 'user';
+            const contentArr = Array.isArray(item.content) ? item.content as Array<Record<string, unknown>> : [];
+            // Extract text from content parts (input_text / output_text / text types)
+            const textParts = contentArr
+                .filter(p => p.type === 'input_text' || p.type === 'output_text' || p.type === 'text')
+                .map(p => p.text as string)
+                .join('\n');
+            return {
+                role,
+                content: textParts || '',
+                _source: 'responses' as const,
+                _index: idx,
+            };
+        });
     const [messagesExpanded, setMessagesExpanded] = useState(messages.length <= 5);
     const allToolNames = useMemo(() => collectAllToolNames(messages), [messages]);
     const modelRequested = (parsed?.model as string) || log.model;

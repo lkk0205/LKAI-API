@@ -25,14 +25,25 @@ import {
 
 export function DashboardPage() {
     const [stats, setStats] = useState<DashboardStats | null>(null);
+    const [loadError, setLoadError] = useState(false);
     const [showHelp, setShowHelp] = useState(false);
     const navigate = useNavigate();
 
     useEffect(() => {
-        statsApi.getDashboard().then(setStats).catch(() => {});
-        const interval = setInterval(() => statsApi.getDashboard().then(setStats).catch(() => {}), 10000);
+        const doLoad = () => statsApi.getDashboard().then(setStats).catch(() => setLoadError(true));
+        doLoad();
+        const interval = setInterval(doLoad, 10000);
         return () => clearInterval(interval);
     }, []);
+
+    if (loadError && !stats) {
+        return (
+            <div className="page-shell flex flex-col items-center justify-center gap-3 text-sm text-slate-500">
+                <p>数据加载失败，请检查服务是否已启动。</p>
+                <button onClick={() => window.location.reload()} className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-medium text-white hover:bg-blue-700">重新加载</button>
+            </div>
+        );
+    }
 
     if (!stats) {
         return <div className="page-shell text-sm text-slate-500">加载中...</div>;
@@ -73,7 +84,7 @@ export function DashboardPage() {
                             <Workflow className="h-3.5 w-3.5" /> 控制台首页
                         </div>
                         <div className="mt-4 flex items-center gap-2">
-                            <h1 className="text-3xl font-semibold tracking-[-0.03em] text-slate-900">欢迎使用 LKAPI</h1>
+                            <h1 className="text-3xl font-semibold tracking-[-0.03em] text-slate-900">欢迎使用 WaLiAPI</h1>
                             <button
                                 onClick={() => setShowHelp(true)}
                                 className="inline-flex items-center justify-center rounded-full border border-slate-200 bg-slate-50 p-1 text-slate-400 transition-all hover:border-blue-200 hover:bg-blue-50 hover:text-blue-600"
@@ -229,7 +240,7 @@ export function DashboardPage() {
                                     num: "2",
                                     required: true,
                                     title: "创建本地密钥",
-                                    desc: "进入「API 密钥」页面，点击「新建密钥」生成 `sk-lkapi-*` 格式的本地访问令牌，用于下游客户端调用。",
+                                    desc: "进入「API 密钥」页面，点击「新建密钥」生成 `sk-waliapi-*` 格式的本地访问令牌，用于下游客户端调用。",
                                     route: "/api-keys",
                                     routeLabel: "前往 API 密钥",
                                 },

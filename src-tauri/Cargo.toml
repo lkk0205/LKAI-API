@@ -1,8 +1,8 @@
 [package]
 name = "lkapi"
-version = "0.1.4"
+version = "0.1.6"
 description = "LKAPI - Local LLM API Gateway"
-authors = ["xiaofuge"]
+authors = ["liangkun"]
 edition = "2021"
 
 [lib]
@@ -39,6 +39,8 @@ async-stream = "0.3"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
+toml_edit = "0.22"
 
 # Database
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "chrono", "macros"] }

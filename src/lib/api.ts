@@ -7,7 +7,20 @@ import type {
     Settings,
     ServerStatus,
     BuiltinRule, CustomRule, CreateCustomRuleInput, UpdateBuiltinRuleInput,
+    ChannelProtocolPresetGroup,
+    DraftChannelTestInput, DraftChannelTestResult,
+    UpstreamModelsResult,
 } from "../types";
+
+/**
+ * 保存前草稿连通性测试（T07）。后端 `test_channel_draft` 命令已接入。
+ *
+ * 不落库：不创建/更新渠道、不计数配额、不写生产 request log；仅执行每个已选
+ * 端点的最小非流推理探测（可能产生极少上游费用）并返回逐端点结果 + 草稿指纹。
+ */
+export async function testChannelDraft(input: DraftChannelTestInput): Promise<DraftChannelTestResult> {
+    return invoke<DraftChannelTestResult>("test_channel_draft", { input });
+}
 
 // Channel stats
 export interface ChannelStats {
@@ -34,6 +47,13 @@ export const channelApi = {
     test: (id: string) => invoke<TestChannelResult>("test_channel", { id }),
     getStats: () => invoke<ChannelStats[]>("get_channel_stats"),
     reorder: (orderedIds: string[]) => invoke<void>("reorder_channels", { orderedIds }),
+    /** 获取全部协议及其提供商模板（只读；`presets[0]` 恒为 custom option）。 */
+    getPresets: () => invoke<ChannelProtocolPresetGroup[]>("get_channel_presets"),
+    /** 保存前草稿连通性测试（T07，真实后端命令，不落库）。 */
+    testDraft: (input: DraftChannelTestInput) => testChannelDraft(input),
+    /** 拉取上游模型列表（T14）。绝不写库：不覆盖已有模型列表，返回结果供弹窗勾选合并。 */
+    syncUpstreamModels: (input: DraftChannelTestInput) =>
+        invoke<UpstreamModelsResult>("sync_upstream_models", { input }),
 };
 
 // API Key commands
@@ -74,11 +94,19 @@ export const statsApi = {
 };
 
 // Settings commands
+export interface FeatureFlagsDto {
+    new_routeplan: boolean;
+    cross_protocol_codec: boolean;
+    native_responses: boolean;
+    ollama_native: boolean;
+}
+
 export const settingsApi = {
     get: () => invoke<Settings>("get_settings"),
     save: (settings: Settings) => invoke<void>("save_settings", { settings }),
     applyTheme: (theme: string) => invoke<void>("apply_theme", { theme }),
     setAutoStart: (enabled: boolean) => invoke<void>("set_auto_start", { enabled }),
+    getFeatureFlags: () => invoke<FeatureFlagsDto>("get_feature_flags"),
 };
 
 // Server commands
@@ -111,7 +139,7 @@ export interface ScanResult {
 export const importExportApi = {
     exportChannels: () => invoke<string>("export_channels"),
     importWalicodeBackup: (content: string) => invoke<ImportResult>("import_walicode_backup", { content }),
-    importLkapiExport: (content: string) => invoke<ImportResult>("import_lkapi_export", { content }),
+    importWaliapiExport: (content: string) => invoke<ImportResult>("import_waliapi_export", { content }),
     scanLocalAiConfigs: () => invoke<ScanResult>("scan_local_ai_configs"),
     importScannedSources: (sources: ScannedSource[]) => invoke<ImportResult>("import_scanned_sources", { sources }),
     pickImportFile: () => invoke<string | null>("pick_import_file"),
@@ -149,6 +177,7 @@ export interface KnowledgeBase {
     included_files: string;
     embedding_dim: number;
     index_status: string;
+    embedding_batch_size: number;
     created_at: string;
     updated_at: string;
 }
@@ -254,7 +283,7 @@ export const kbApi = {
     getAll: () => invoke<KnowledgeBase[]>("get_knowledge_bases"),
     create: (input: { name: string; description?: string; embedding_model?: string }) =>
         invoke<KnowledgeBase>("create_knowledge_base", { input }),
-    update: (id: string, input: Partial<{ name: string; description: string; embedding_model: string; embedding_channel_id: string; status: number; mcp_enabled: number; chunk_size: number; chunk_overlap: number; excluded_dirs: string; excluded_files: string; included_files: string }>) =>
+    update: (id: string, input: Partial<{ name: string; description: string; embedding_model: string; embedding_channel_id: string; status: number; mcp_enabled: number; chunk_size: number; chunk_overlap: number; excluded_dirs: string; excluded_files: string; included_files: string; embedding_batch_size: number }>) =>
         invoke<KnowledgeBase>("update_knowledge_base", { id, input }),
     delete: (id: string) => invoke<void>("delete_knowledge_base", { id }),
     getDocuments: (kbId: string) => invoke<KbDocument[]>("get_kb_documents", { kbId }),
@@ -296,4 +325,36 @@ export interface ServiceStatus {
 
 export const serviceApi = {
     getStatuses: () => invoke<ServiceStatus[]>("get_service_statuses"),
+};
+
+// ── App Config (应用配置) ──
+export interface AppInfo {
+    name: string;
+    label: string;
+    icon: string;
+    description: string;
+    config_path: string;
+    config_format: string;
+    available: boolean;
+    applied: boolean;
+    download_url: string;
+}
+
+export interface ApplyResult {
+    success: boolean;
+    message: string;
+}
+
+export interface ConfigContent {
+    exists: boolean;
+    content: string;
+    error: string | null;
+}
+
+export const appConfigApi = {
+    getApps: () => invoke<AppInfo[]>("get_app_configs"),
+    apply: (appName: string, apiKey: string, model: string) => invoke<ApplyResult>("apply_app_config", { appName, apiKey, model }),
+    clear: (appName: string) => invoke<ApplyResult>("clear_app_config", { appName }),
+    getContent: (appName: string) => invoke<ConfigContent>("get_app_config_content", { appName }),
+    openFolder: (appName: string) => invoke<void>("open_config_folder", { appName }),
 };

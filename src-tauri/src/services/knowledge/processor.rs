@@ -1,9 +1,9 @@
 use super::code_parser;
 use super::embedder;
 use super::parser;
-use super::splitter;
-use super::repository::{KbRepository, ChunkInsert};
+use super::repository::{ChunkInsert, KbRepository};
 use super::retriever;
+use super::splitter;
 use crate::db::models::now_iso;
 use crate::db::repository::Repository;
 use sqlx::SqlitePool;
@@ -22,14 +22,17 @@ fn emit_progress(
     progress: u8,
     detail: &str,
 ) {
-    let _ = app.emit("kb-document-progress", serde_json::json!({
-        "doc_id": doc_id,
-        "kb_id": kb_id,
-        "filename": filename,
-        "stage": stage,
-        "progress": progress,
-        "detail": detail,
-    }));
+    let _ = app.emit(
+        "kb-document-progress",
+        serde_json::json!({
+            "doc_id": doc_id,
+            "kb_id": kb_id,
+            "filename": filename,
+            "stage": stage,
+            "progress": progress,
+            "detail": detail,
+        }),
+    );
 }
 
 /// Process an uploaded document: parse → split → embed → store
@@ -51,19 +54,23 @@ pub async fn process_document(
 
     emit_progress(app, doc_id, kb_id, filename, "processing", 0, "开始处理");
 
-    let result = process_document_inner(
-        pool, app, kb_id, doc_id, filename, content, embedding_model,
-    ).await;
+    let result =
+        process_document_inner(pool, app, kb_id, doc_id, filename, content, embedding_model).await;
 
     if let Err(ref e) = result {
         let err_msg = format!("文档「{}」处理失败: {}", filename, e);
-        let _ = repo.update_document_status(doc_id, "failed", Some(&err_msg)).await;
-        let _ = app.emit("kb-document-error", serde_json::json!({
-            "doc_id": doc_id,
-            "kb_id": kb_id,
-            "filename": filename,
-            "error": e,
-        }));
+        let _ = repo
+            .update_document_status(doc_id, "failed", Some(&err_msg))
+            .await;
+        let _ = app.emit(
+            "kb-document-error",
+            serde_json::json!({
+                "doc_id": doc_id,
+                "kb_id": kb_id,
+                "filename": filename,
+                "error": e,
+            }),
+        );
     } else {
         emit_progress(app, doc_id, kb_id, filename, "done", 100, "处理完成");
     }
@@ -97,8 +104,16 @@ async fn process_document_inner(
     emit_progress(app, doc_id, kb_id, filename, "splitting", 15, "文本分块");
     let kb = repo.get_kb(kb_id).await.map_err(|e| e.to_string())?;
     let config = splitter::SplitConfig {
-        chunk_size: if kb.chunk_size > 0 { kb.chunk_size as usize } else { 512 },
-        chunk_overlap: if kb.chunk_overlap > 0 { kb.chunk_overlap as usize } else { 64 },
+        chunk_size: if kb.chunk_size > 0 {
+            kb.chunk_size as usize
+        } else {
+            512
+        },
+        chunk_overlap: if kb.chunk_overlap > 0 {
+            kb.chunk_overlap as usize
+        } else {
+            64
+        },
     };
     let base_metadata = splitter::ChunkMetadata {
         file_path: Some(filename.to_string()),
@@ -106,27 +121,61 @@ async fn process_document_inner(
     };
 
     // 符号感知分块：代码文件且语言受支持时，按 AST 符号边界切分
-    let chunks = match &parsed {
-        parser::ParsedContent::Code { text, language } => {
-            if code_parser::is_supported_language(language) {
-                let symbols = code_parser::extract_symbols(filename, text);
-                emit_progress(
-                    app, doc_id, kb_id, filename, "splitting", 18,
-                    &format!("AST 解析：提取到 {} 个符号", symbols.len()),
-                );
-                splitter::split_code_by_symbols(text, &symbols, &config, &base_metadata)
-            } else {
-                splitter::split(text, &file_type_label, &config, &base_metadata)
-            }
+    // 提前处理代码符号和进度更新（在 catch_unwind 外部，避免传递 AppHandle）
+    let chunks = if let parser::ParsedContent::Code { text, language } = &parsed {
+        if code_parser::is_supported_language(language) {
+            let symbols = code_parser::extract_symbols(filename, text);
+            emit_progress(
+                app,
+                doc_id,
+                kb_id,
+                filename,
+                "splitting",
+                18,
+                &format!("AST 解析：提取到 {} 个符号", symbols.len()),
+            );
+            // 使用 catch_unwind 保护分块操作
+            std::panic::catch_unwind({
+                let text = text.clone();
+                let symbols = symbols.clone();
+                let config = config.clone();
+                let base_metadata = base_metadata.clone();
+                move || splitter::split_code_by_symbols(&text, &symbols, &config, &base_metadata)
+            })
+                .map_err(|_| "文本分块过程发生严重错误".to_string())?
+        } else {
+            std::panic::catch_unwind({
+                let text = text.clone();
+                let file_type_label = file_type_label.clone();
+                let config = config.clone();
+                let base_metadata = base_metadata.clone();
+                move || splitter::split(&text, &file_type_label, &config, &base_metadata)
+            })
+                .map_err(|_| "文本分块过程发生严重错误".to_string())?
         }
-        _ => splitter::split(&text, &file_type_label, &config, &base_metadata),
+    } else {
+        std::panic::catch_unwind({
+            let text = text.clone();
+            let file_type_label = file_type_label.clone();
+            let config = config.clone();
+            let base_metadata = base_metadata.clone();
+            move || splitter::split(&text, &file_type_label, &config, &base_metadata)
+        })
+            .map_err(|_| "文本分块过程发生严重错误".to_string())?
     };
 
     if chunks.is_empty() {
-        repo.update_document_status(doc_id, "ready", None)
-            .await
-            .map_err(|e| e.to_string())?;
-        repo.update_document_counts(doc_id, 0, 0)
+        // 分块后为空状态改为失败,且失败信息给客户端提示
+        let _ = app.emit(
+            "kb-document-error",
+            serde_json::json!({
+                "doc_id": doc_id,
+                "kb_id": kb_id,
+                "filename": filename,
+                "error": "分块后为空，无法继续处理".to_string(),
+            }),
+        );
+        repo.update_document_status(doc_id, "failed", None)
             .await
             .map_err(|e| e.to_string())?;
         return Ok(());
@@ -140,9 +189,18 @@ async fn process_document_inner(
     let main_repo = Repository::new(pool.clone());
 
     // Detect expected embedding dimension from KB config
-    let expected_dim = if kb.embedding_dim > 0 { Some(kb.embedding_dim as usize) } else { None };
+    let expected_dim = if kb.embedding_dim > 0 {
+        Some(kb.embedding_dim as usize)
+    } else {
+        None
+    };
 
-    let batch_size = 32;
+    let batch_size = if kb.embedding_batch_size > 0 {
+        kb.embedding_batch_size as usize
+    } else {
+        32
+    };
+    println!("embedding_batch_size: {}", batch_size);
     let total_batches = ((chunks.len() as f64) / batch_size as f64).ceil() as usize;
     let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     let mut batch_done = 0usize;
@@ -157,7 +215,10 @@ async fn process_document_inner(
                 if emb.len() != dim {
                     tracing::warn!(
                         "Embedding dim mismatch in batch {}: expected {}, got {} (chunk {})",
-                        batch_done, dim, emb.len(), i
+                        batch_done,
+                        dim,
+                        emb.len(),
+                        i
                     );
                 }
             }
@@ -168,7 +229,12 @@ async fn process_document_inner(
         // Embedding progress: 20% ~ 80%
         let pct = 20 + ((batch_done as f64 / total_batches as f64) * 60.0) as u8;
         emit_progress(
-            app, doc_id, kb_id, filename, "embedding", pct,
+            app,
+            doc_id,
+            kb_id,
+            filename,
+            "embedding",
+            pct,
             &format!("向量化 {}/{}", batch_done, total_batches),
         );
     }
@@ -176,7 +242,11 @@ async fn process_document_inner(
     // Auto-detect and update KB embedding dimension if not set
     if expected_dim.is_none() && !all_embeddings.is_empty() {
         let detected_dim = all_embeddings[0].len() as i64;
-        tracing::info!("Auto-detected embedding dim {} for KB {}", detected_dim, kb_id);
+        tracing::info!(
+            "Auto-detected embedding dim {} for KB {}",
+            detected_dim,
+            kb_id
+        );
         repo.update_kb_embedding_dim(kb_id, detected_dim).await.ok();
     }
 
@@ -187,7 +257,12 @@ async fn process_document_inner(
         if i % 10 == 0 || i == chunks_total - 1 {
             let pct = 80 + ((i as f64 + 1.0) / chunks_total as f64 * 15.0) as u8;
             emit_progress(
-                app, doc_id, kb_id, filename, "storing", pct,
+                app,
+                doc_id,
+                kb_id,
+                filename,
+                "storing",
+                pct,
                 &format!("存储切片 {}/{}", i + 1, chunks_total),
             );
         }
@@ -230,18 +305,28 @@ async fn process_document_inner(
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
             if let Err(e) = retriever::build_index(&pool_clone, &kb_id_clone, &app_clone).await {
-                tracing::warn!("Failed to rebuild HNSW index for KB {} after doc: {}", kb_id_clone, e);
-                let _ = app_clone.emit("kb-index-progress", serde_json::json!({
-                    "kb_id": &kb_id_clone,
-                    "status": "error",
-                    "message": format!("索引构建失败: {}", e)
-                }));
+                tracing::warn!(
+                    "Failed to rebuild HNSW index for KB {} after doc: {}",
+                    kb_id_clone,
+                    e
+                );
+                let _ = app_clone.emit(
+                    "kb-index-progress",
+                    serde_json::json!({
+                        "kb_id": &kb_id_clone,
+                        "status": "error",
+                        "message": format!("索引构建失败: {}", e)
+                    }),
+                );
             } else {
-                let _ = app_clone.emit("kb-index-progress", serde_json::json!({
-                    "kb_id": &kb_id_clone,
-                    "status": "ready",
-                    "message": "索引构建完成"
-                }));
+                let _ = app_clone.emit(
+                    "kb-index-progress",
+                    serde_json::json!({
+                        "kb_id": &kb_id_clone,
+                        "status": "ready",
+                        "message": "索引构建完成"
+                    }),
+                );
             }
         });
     });
@@ -259,7 +344,9 @@ pub async fn reindex_document(
     let doc = repo.get_document(doc_id).await.map_err(|e| e.to_string())?;
 
     // Delete existing chunks
-    repo.delete_chunks_by_doc(doc_id).await.map_err(|e| e.to_string())?;
+    repo.delete_chunks_by_doc(doc_id)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Read file content from path
     let content = if let Some(path) = &doc.file_path {
@@ -280,5 +367,5 @@ pub async fn reindex_document(
         &content,
         kb.embedding_model.as_deref(),
     )
-    .await
+        .await
 }

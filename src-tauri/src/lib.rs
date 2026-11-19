@@ -1,27 +1,35 @@
-mod commands;
-mod core;
 mod adaptor;
-mod server;
-mod db;
-mod utils;
-mod security;
+mod channel_presets;
+pub mod commands;
+pub mod core;
+pub mod db;
+mod endpoint_executor;
 mod protocol;
+#[cfg(test)]
+mod rollout_integration_tests;
+pub mod security;
+mod server;
 pub mod services;
+pub mod utils;
 
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager, RunEvent,
 };
 use tauri_plugin_store::StoreExt;
+use tokio::sync::RwLock;
 
 pub struct AppState {
     pub db: Arc<db::Database>,
     pub server_port: Arc<RwLock<u16>>,
     pub server_running: Arc<std::sync::atomic::AtomicBool>,
     pub server_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// T07: short-lived, in-process test-run receipt store used to validate
+    /// `test_run_id + draft_fingerprint + force_save` at channel save time.
+    /// Process restart clears it → every receipt expires → re-test required.
+    pub test_receipts: Arc<crate::services::channel_test::TestReceiptStore>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -39,7 +47,7 @@ pub fn run() {
         .plugin(
             tauri_plugin_sql::Builder::default()
                 .add_migrations(
-                    "sqlite:lkapi.db",
+                    "sqlite:waliapi.db",
                     vec![tauri_plugin_sql::Migration {
                         version: 1,
                         description: "init database",
@@ -64,7 +72,7 @@ pub fn run() {
             TrayIconBuilder::with_id("main")
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
-                .tooltip("LKAPI - Local LLM API Gateway")
+                .tooltip("WaLiAPI - Local LLM API Gateway")
                 .show_menu_on_left_click(false)
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
@@ -108,6 +116,9 @@ pub fn run() {
                     server_port: Arc::new(RwLock::new(0)),
                     server_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     server_handle: Arc::new(RwLock::new(None)),
+                    test_receipts: Arc::new(crate::services::channel_test::TestReceiptStore::new(
+                        std::time::Duration::from_secs(30 * 60),
+                    )),
                 });
                 app_handle.manage(state.clone());
 
@@ -121,6 +132,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::channel::get_channels,
+            commands::channel::get_channel_presets,
             commands::channel::get_channel,
             commands::channel::get_channel_api_key,
             commands::channel::create_channel,
@@ -128,6 +140,8 @@ pub fn run() {
             commands::channel::toggle_channel,
             commands::channel::delete_channel,
             commands::channel::test_channel,
+            commands::channel::test_channel_draft,
+            commands::channel::sync_upstream_models,
             commands::channel::get_channel_stats,
             commands::channel::reorder_channels,
             commands::api_key::get_api_keys,
@@ -144,6 +158,7 @@ pub fn run() {
             commands::log::get_log_stats,
             commands::stats::get_dashboard_stats,
             commands::settings::get_settings,
+            commands::settings::get_feature_flags,
             commands::settings::save_settings,
             commands::settings::apply_theme,
             commands::settings::set_auto_start,
@@ -159,7 +174,7 @@ pub fn run() {
             commands::security::delete_custom_security_rule,
             commands::import_export::export_channels,
             commands::import_export::import_walicode_backup,
-            commands::import_export::import_lkapi_export,
+            commands::import_export::import_waliapi_export,
             commands::import_export::scan_local_ai_configs,
             commands::import_export::import_scanned_sources,
             commands::import_export::pick_import_file,
@@ -186,9 +201,15 @@ pub fn run() {
             commands::knowledge_base::drop_kb_index,
             commands::knowledge_base::get_kb_tags,
             commands::services::get_service_statuses,
+            // App Config (应用配置)
+            commands::app_config::get_app_configs,
+            commands::app_config::apply_app_config,
+            commands::app_config::clear_app_config,
+            commands::app_config::get_app_config_content,
+            commands::app_config::open_config_folder,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building LKAPI")
+        .expect("error while building WaLiAPI")
         .run(|app, event| {
             #[cfg(target_os = "macos")]
             {

@@ -19,6 +19,7 @@ pub struct KbKnowledgeBase {
     pub included_files: String,
     pub embedding_dim: i64,
     pub index_status: String,
+    pub embedding_batch_size: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -44,6 +45,7 @@ pub struct UpdateKbInput {
     pub excluded_dirs: Option<String>,
     pub excluded_files: Option<String>,
     pub included_files: Option<String>,
+    pub embedding_batch_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -189,9 +191,15 @@ pub struct AskInput {
     pub search_mode: Option<String>,
 }
 
-fn default_top_k() -> usize { 5 }
-fn default_chat_model() -> String { "gpt-4o".to_string() }
-fn default_max_rounds() -> usize { 5 }
+fn default_top_k() -> usize {
+    5
+}
+fn default_chat_model() -> String {
+    "gpt-4o".to_string()
+}
+fn default_max_rounds() -> usize {
+    5
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct KbSource {

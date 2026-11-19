@@ -2,8 +2,8 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { channelApi, importExportApi } from "../lib/api";
 import type { ChannelStats } from "../lib/api";
 import type { Channel } from "../types";
-import { CHANNEL_TYPES, formatTime, formatNumber, formatDuration } from "../lib/constants";
-import { Plus, Radio, Trash2, Zap, Power, Edit, Download, ChevronDown, Upload, Loader2, X, Activity, Clock, GripVertical, Eye, EyeOff, Copy, Check } from "lucide-react";
+import { getProtocolLabel, getChannelProviderLabel, formatTime, formatNumber, formatDuration } from "../lib/constants";
+import { Plus, Radio, Trash2, Zap, Power, Edit, Download, ChevronDown, Upload, Loader2, X, Activity, Clock, GripVertical, Eye, EyeOff, Copy, Check, AlertCircle } from "lucide-react";
 import { ChannelForm } from "../components/ChannelForm";
 import { ImportDialog } from "../components/ImportDialog";
 
@@ -19,6 +19,7 @@ export function ChannelsPage() {
     const [exporting, setExporting] = useState(false);
     const [deleteTarget, setDeleteTarget] = useState<Channel | null>(null);
     const [deleting, setDeleting] = useState(false);
+    const [loadError, setLoadError] = useState(false);
     const [actionError, setActionError] = useState<string | null>(null);
     const [draggedId, setDraggedId] = useState<string | null>(null);
     const [dragOverId, setDragOverId] = useState<string | null>(null);
@@ -27,6 +28,7 @@ export function ChannelsPage() {
     const [fullKeyMap, setFullKeyMap] = useState<Record<string, string>>({});
     const [keyLoading, setKeyLoading] = useState<string | null>(null);
     const [copiedKey, setCopiedKey] = useState<string | null>(null);
+    const [copiedModel, setCopiedModel] = useState<string | null>(null);
     const importMenuRef = useRef<HTMLDivElement>(null);
     const dragCounter = useRef(0);
 
@@ -37,6 +39,9 @@ export function ChannelsPage() {
             stats.forEach(s => { map[s.channel_id] = s; });
             setChannelStats(map);
         }).catch(() => {});
+        Promise.all([channelApi.getAll(), channelApi.getStats()])
+            .then(() => setLoadError(false))
+            .catch(() => setLoadError(true));
     }, []);
 
     useEffect(() => { load(); }, [load]);
@@ -56,7 +61,7 @@ export function ChannelsPage() {
         try {
             const content = await importExportApi.exportChannels();
             const timestamp = new Date().toISOString().slice(0, 10);
-            await importExportApi.saveExportFile(content, `lkapi-export-${timestamp}.json`);
+            await importExportApi.saveExportFile(content, `waliapi-export-${timestamp}.json`);
         } catch (e) {
             console.error("Export failed:", e);
         }
@@ -118,6 +123,14 @@ export function ChannelsPage() {
     };
 
     // 复制 API Key
+    const handleCopyModel = async (model: string) => {
+        try {
+            await navigator.clipboard.writeText(model);
+            setCopiedModel(model);
+            setTimeout(() => setCopiedModel(null), 2000);
+        } catch {}
+    };
+
     const handleCopyKey = async (ch: Channel) => {
         const keyToCopy = fullKeyMap[ch.id] || ch.api_key;
         try {
@@ -162,7 +175,8 @@ export function ChannelsPage() {
         setDragOverId(null);
         try {
             await channelApi.reorder(next.map(c => c.id));
-        } catch {
+        } catch (err) {
+            console.error("reorder failed:", err);
             load(); // revert on failure
         }
     };
@@ -194,7 +208,7 @@ export function ChannelsPage() {
                                     <Upload size={16} className="text-muted-foreground" />
                                     <div className="text-left">
                                         <div>导入渠道</div>
-                                        <div className="text-xs text-muted-foreground">LKAPI 导出 / 扫描本地 / WaLiCode 备份</div>
+                                        <div className="text-xs text-muted-foreground">WaLiAPI 导出 / 扫描本地 / WaLiCode 备份</div>
                                     </div>
                                 </button>
                             </div>
@@ -217,20 +231,36 @@ export function ChannelsPage() {
 
             {channels.length === 0 ? (
                 <div className="surface empty-state">
-                    <Radio className="h-12 w-12 text-muted-foreground/70" />
-                    <p className="text-base font-medium">还没有配置任何渠道</p>
-                    <p className="text-sm text-muted-foreground">先添加一个上游服务商，即可开始分发请求</p>
+                    {loadError ? (
+                        <>
+                            <AlertCircle className="h-12 w-12 text-red-400/70" />
+                            <p className="text-base font-medium">数据加载失败</p>
+                            <p className="text-sm text-muted-foreground">请检查服务是否已启动，或点击下方按钮重试</p>
+                            <button onClick={() => load()} className="mt-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-medium text-white hover:bg-blue-700">重新加载</button>
+                        </>
+                    ) : (
+                        <>
+                            <Radio className="h-12 w-12 text-muted-foreground/70" />
+                            <p className="text-base font-medium">还没有配置任何渠道</p>
+                            <p className="text-sm text-muted-foreground">先添加一个上游服务商，即可开始分发请求</p>
+                        </>
+                    )}
                 </div>
             ) : (
                 <div className="space-y-3">
                     {channels.map((ch, idx) => {
-                        const typeInfo = CHANNEL_TYPES.find(t => t.value === ch.type);
                         const result = testResult[ch.id];
                         const stats = channelStats[ch.id];
                         const isDragging = draggedId === ch.id;
                         const isDragOver = dragOverId === ch.id;
                         const isExpanded = expandedId === ch.id;
                         const keyVisible = showKeyMap[ch.id];
+                        // 双标签（设计 3.5）：第一 [协议]，第二 [提供商]，来自规范化身份。
+                        // 后端 DTO 对旧配置也实时推断 protocol/provider，故直接显示真实协议；
+                        // 仅当协议值未知/缺失时才回退到 getProtocolLabel 的 "旧配置"。
+                        const protocolLabel = getProtocolLabel(ch.protocol);
+                        const providerLabel = getChannelProviderLabel(ch.provider);
+                        const displayBaseUrl = ch.native_base_url || ch.base_url;
                         return (
                             <div
                                 key={ch.id}
@@ -245,9 +275,9 @@ export function ChannelsPage() {
                                     isDragOver ? "ring-2 ring-blue-400 ring-offset-1" : ""
                                 }`}
                             >
-                                <div className="flex items-center gap-3">
+                                <div className="flex items-center gap-3 cursor-pointer" onClick={() => setExpandedId(isExpanded ? null : ch.id)}>
                                     {/* 拖拽手柄 */}
-                                    <div className="flex cursor-grab items-center text-slate-300 transition-colors hover:text-slate-400 active:cursor-grabbing">
+                                    <div className="flex cursor-grab items-center text-slate-300 transition-colors hover:text-slate-400 active:cursor-grabbing" onClick={e => e.stopPropagation()}>
                                         <GripVertical size={18} />
                                     </div>
 
@@ -259,16 +289,19 @@ export function ChannelsPage() {
                                     {/* 状态点 */}
                                     <span className={`h-2 w-2 shrink-0 rounded-full ${ch.status === 1 ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]" : "bg-zinc-400"}`} />
 
-                                    {/* 名称 + 类型 */}
+                                    {/* 名称 + 双标签（[协议] [提供商]）+ 规范 Base URL */}
                                     <div className="min-w-0 flex-1">
-                                        <div className="flex items-center gap-2">
+                                        <div className="flex flex-wrap items-center gap-1.5">
                                             <h3 className="truncate text-sm font-semibold tracking-tight">{ch.name}</h3>
-                                            <span className="shrink-0 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-500">
-                        {typeInfo?.label || ch.type}
+                                            <span className="shrink-0 rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[10px] font-semibold text-blue-600">
+                        [{protocolLabel}]
+                      </span>
+                                            <span className="shrink-0 rounded-full border border-purple-200 bg-purple-50 px-2 py-0.5 text-[10px] font-semibold text-purple-600">
+                        [{providerLabel}]
                       </span>
                                         </div>
-                                        <div className="mt-0.5 truncate text-xs font-mono text-slate-400" title={ch.base_url}>
-                                            {ch.base_url}
+                                        <div className="mt-0.5 truncate text-xs font-mono text-slate-400" title={displayBaseUrl}>
+                                            {displayBaseUrl}
                                         </div>
                                     </div>
 
@@ -299,7 +332,7 @@ export function ChannelsPage() {
                                     </div>
 
                                     {/* 操作按钮 */}
-                                    <div className="flex items-center gap-1">
+                                    <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
                                         <button onClick={() => handleTest(ch.id)} disabled={testing === ch.id} className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-blue-50 hover:text-blue-600 disabled:opacity-50" title="测试连接">
                                             {testing === ch.id ? <Loader2 size={15} className="animate-spin" /> : <Zap size={15} />}
                                         </button>
@@ -322,7 +355,7 @@ export function ChannelsPage() {
                                 {result && (
                                     <div className={`mt-2 flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs ${result.success ? "bg-emerald-50 text-emerald-700" : "bg-red-50 text-red-700"}`}>
                                         {result.success ? <><span className="text-emerald-500">✓</span> 连接成功</> : <><span className="text-red-500">✗</span> {result.message}</>}
-                                        <span className="text-slate-400">({result.latency_ms}ms)</span>
+                                        <span className="text-slate-400">({result.latency_ms.toFixed(2)}ms)</span>
                                     </div>
                                 )}
 
@@ -334,7 +367,15 @@ export function ChannelsPage() {
                                             <div className="mb-1.5 text-xs font-semibold text-slate-500">可用模型 ({ch.models.length})</div>
                                             <div className="flex flex-wrap gap-1.5">
                                                 {ch.models.map(m => (
-                                                    <span key={m} className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">{m}</span>
+                                                    <button
+                                                        key={m}
+                                                        onClick={() => handleCopyModel(m)}
+                                                        className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0 text-[11px] font-medium leading-5 transition-all active:scale-95 ${copiedModel === m ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-700 hover:bg-slate-200"}`}
+                                                        title="点击复制"
+                                                    >
+                                                        {m}
+                                                        {copiedModel === m && <Check size={9} className="text-emerald-500" />}
+                                                    </button>
                                                 ))}
                                             </div>
                                         </div>
@@ -344,11 +385,21 @@ export function ChannelsPage() {
                                             <div>
                                                 <div className="mb-1.5 text-xs font-semibold text-slate-500">映射模型</div>
                                                 <div className="flex flex-wrap gap-1.5">
-                                                    {Object.entries(ch.model_mapping).map(([name, target]) => (
-                                                        <span key={name} className="rounded-full bg-violet-50 px-2 py-0.5 text-xs font-medium text-violet-700">
-                              {name} → {target}
-                            </span>
-                                                    ))}
+                                                    {Object.entries(ch.model_mapping).map(([name, target]) => {
+                                                        const targets = Array.isArray(target) ? target : [target];
+                                                        const label = `${name} → ${targets.join(" / ")}`;
+                                                        return (
+                                                            <button
+                                                                key={name}
+                                                                onClick={() => handleCopyModel(name)}
+                                                                className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0 text-[11px] font-medium leading-5 transition-all active:scale-95 ${copiedModel === name ? "bg-emerald-50 text-emerald-700" : "bg-violet-50 text-violet-700 hover:bg-violet-100"}`}
+                                                                title="点击复制映射名"
+                                                            >
+                                                                {label}
+                                                                {copiedModel === name && <Check size={9} className="text-emerald-500" />}
+                                                            </button>
+                                                        );
+                                                    })}
                                                 </div>
                                             </div>
                                         )}
@@ -532,7 +583,7 @@ function DeleteConfirmDialog({
                 <div className="mt-4 rounded-2xl border border-border bg-background/50 px-4 py-3 text-sm">
                     <div className="text-muted-foreground">渠道名称</div>
                     <div className="mt-1 font-medium">{target.name}</div>
-                    <div className="mt-2 text-xs font-mono text-muted-foreground truncate">{target.base_url}</div>
+                    <div className="mt-2 text-xs font-mono text-muted-foreground truncate">{target.native_base_url || target.base_url}</div>
                 </div>
                 <div className="mt-5 flex justify-end gap-2">
                     <button onClick={onClose} className="action-secondary">取消</button>

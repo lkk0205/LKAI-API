@@ -8,6 +8,7 @@ import {
     Key,
     ScrollText,
     Settings,
+    Settings2,
     Server,
     ChevronRight,
     ExternalLink,
@@ -20,15 +21,15 @@ import packageJson from "../../../package.json";
 
 const navItems = [
     { to: "/", icon: LayoutDashboard, label: "仪表盘" },
-    { to: "/usage", icon: BookOpen, label: "使用" },
+    { to: "/usage", icon: BookOpen, label: "使用", subLabel: "API、Codex ... 配置" },
     { to: "/channels", icon: Radio, label: "渠道" },
     { to: "/api-keys", icon: Key, label: "密钥" },
-    { to: "/services", icon: Database, label: "服务" },
+    { to: "/services", icon: Database, label: "服务", subLabel: "知识库、MCP、Skills" },
     { to: "/logs", icon: ScrollText, label: "日志" },
     { to: "/settings", icon: Settings, label: "设置" },
 ];
 
-const githubUrl = "https://gitcode.com/lkk1101/LKAPI";
+const githubUrl = "https://github.com/fuzhengwei/WaLiAPI";
 const appVersion = packageJson.version;
 
 export function Sidebar({
@@ -54,11 +55,11 @@ export function Sidebar({
             <div className="surface rounded-[22px] p-5">
                 <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-white shadow-[0_8px_16px_rgba(47,111,237,0.18)] overflow-hidden">
-                        <img src="/logo.png" alt="LKAPI" className="h-full w-full object-cover" />
+                        <img src="/logo.png" alt="WaLiAPI" className="h-full w-full object-cover" />
                     </div>
                     <div className="min-w-0 flex-1">
                         <div className="flex items-center justify-between gap-2">
-                            <div className="text-[20px] font-bold tracking-[-0.04em] text-slate-900 leading-none">LKAPI</div>
+                            <div className="text-[20px] font-bold tracking-[-0.04em] text-slate-900 leading-none">WaLiAPI</div>
                             <button
                                 onClick={onCheckUpdate}
                                 className={`relative rounded-full border px-2 py-0.5 text-[10px] font-semibold transition-colors ${
@@ -82,7 +83,7 @@ export function Sidebar({
             </div>
 
             <nav className="mt-4 flex-1 min-h-0 space-y-1.5 overflow-y-auto">
-                {navItems.map(({ to, icon: Icon, label }) => (
+                {navItems.map(({ to, icon: Icon, label, subLabel }) => (
                     <NavLink
                         key={to}
                         to={to}
@@ -98,6 +99,11 @@ export function Sidebar({
               <Icon size={17} />
             </span>
                         <span className="font-medium">{label}</span>
+                        {subLabel && (
+                            <span className="ml-1 whitespace-nowrap text-[10px] font-normal text-slate-400" style={{ textShadow: "0 1px 1px rgba(0,0,0,0.06), inset 0 0.5px 0 rgba(255,255,255,0.8)" }}>
+                ({subLabel})
+              </span>
+                        )}
                         <ChevronRight size={15} className="ml-auto opacity-0 transition-opacity group-hover:opacity-40" />
                     </NavLink>
                 ))}
@@ -112,7 +118,16 @@ export function Sidebar({
                                 {serverStatus?.running ? "运行中" : "未启动"}
                             </div>
                         </div>
-                        <span className={`h-2.5 w-2.5 rounded-full ${serverStatus?.running ? "bg-emerald-500" : "bg-rose-500"}`} />
+                        <div className="flex items-center gap-2">
+                            <NavLink
+                                to="/settings#server"
+                                className="flex h-6 w-6 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-white hover:text-slate-700"
+                                title="服务配置"
+                            >
+                                <Settings2 size={14} />
+                            </NavLink>
+                            <span className={`h-2.5 w-2.5 rounded-full ${serverStatus?.running ? "bg-emerald-500" : "bg-rose-500"}`} />
+                        </div>
                     </div>
                     <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-3 text-xs text-slate-500">
                         <Server size={14} className={serverStatus?.running ? "text-emerald-500" : "text-rose-500"} />
@@ -134,7 +149,7 @@ export function Sidebar({
           </span>
                     <span className="min-w-0 flex-1">
             <span className="block font-medium">GitHub 开源仓库</span>
-            <span className="block truncate text-xs text-slate-500">gitcode.com/lkk1101/LKAPI</span>
+            <span className="block truncate text-xs text-slate-500">github.com/fuzhengwei/WaLiAPI</span>
           </span>
                     <ExternalLink size={14} className="text-slate-400" />
                 </button>
