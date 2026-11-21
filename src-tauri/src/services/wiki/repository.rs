@@ -26,9 +26,9 @@ impl WikiRepository {
         sqlx::query_as::<_, WikiProject>(
             "SELECT * FROM wiki_projects ORDER BY created_at DESC"
         )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))
     }
 
     pub async fn get_project(&self, id: &str) -> Result<WikiProject, String> {
@@ -41,6 +41,10 @@ impl WikiRepository {
 
     pub async fn create_project(&self, input: &CreateProjectInput, wiki_dir: &str) -> Result<WikiProject, String> {
         let id = Self::uuid();
+        self.create_project_with_id(&id, input, wiki_dir).await
+    }
+
+    pub async fn create_project_with_id(&self, id: &str, input: &CreateProjectInput, wiki_dir: &str) -> Result<WikiProject, String> {
         let now = Self::now();
         let schema = input.schema_text.clone().unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
 
@@ -48,20 +52,20 @@ impl WikiRepository {
             "INSERT INTO wiki_projects (id, name, description, status, schema_text, wiki_dir, ingest_model, chat_model, ingest_channel_id, chat_channel_id, mcp_enabled, source_count, page_count, created_at, updated_at)
              VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 1, 0, 0, ?, ?)"
         )
-        .bind(&id)
-        .bind(&input.name)
-        .bind(&input.description)
-        .bind(&schema)
-        .bind(wiki_dir)
-        .bind(&input.ingest_model)
-        .bind(&input.chat_model)
-        .bind(&input.ingest_channel_id)
-        .bind(&input.chat_channel_id)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+            .bind(&id)
+            .bind(&input.name)
+            .bind(&input.description)
+            .bind(&schema)
+            .bind(wiki_dir)
+            .bind(&input.ingest_model)
+            .bind(&input.chat_model)
+            .bind(&input.ingest_channel_id)
+            .bind(&input.chat_channel_id)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
 
         self.get_project(&id).await
     }
@@ -83,20 +87,20 @@ impl WikiRepository {
         sqlx::query(
             "UPDATE wiki_projects SET name=?, description=?, status=?, schema_text=?, ingest_model=?, chat_model=?, ingest_channel_id=?, chat_channel_id=?, mcp_enabled=?, updated_at=? WHERE id=?"
         )
-        .bind(&name)
-        .bind(&description)
-        .bind(status)
-        .bind(&schema_text)
-        .bind(&ingest_model)
-        .bind(&chat_model)
-        .bind(&ingest_channel_id)
-        .bind(&chat_channel_id)
-        .bind(mcp_enabled)
-        .bind(&now)
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+            .bind(&name)
+            .bind(&description)
+            .bind(status)
+            .bind(&schema_text)
+            .bind(&ingest_model)
+            .bind(&chat_model)
+            .bind(&ingest_channel_id)
+            .bind(&chat_channel_id)
+            .bind(mcp_enabled)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
 
         self.get_project(id).await
     }
@@ -116,21 +120,21 @@ impl WikiRepository {
         sqlx::query_as::<_, WikiPage>(
             "SELECT * FROM wiki_pages WHERE project_id = ? AND status = 'active' ORDER BY path"
         )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))
     }
 
     pub async fn get_page(&self, project_id: &str, path: &str) -> Result<Option<WikiPage>, String> {
         sqlx::query_as::<_, WikiPage>(
             "SELECT * FROM wiki_pages WHERE project_id = ? AND path = ?"
         )
-        .bind(project_id)
-        .bind(path)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))
+            .bind(project_id)
+            .bind(path)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))
     }
 
     pub async fn upsert_page(
@@ -143,31 +147,33 @@ impl WikiRepository {
         token_count: i64,
         wikilinks: &str,
         frontmatter: &str,
+        tags: &str,
     ) -> Result<(), String> {
         let now = Self::now();
         sqlx::query(
-            "INSERT INTO wiki_pages (id, project_id, path, title, page_type, content_hash, token_count, wikilinks, frontmatter, status, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            "INSERT INTO wiki_pages (id, project_id, path, title, page_type, content_hash, token_count, wikilinks, frontmatter, tags, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
              ON CONFLICT(project_id, path) DO UPDATE SET
                title=excluded.title, page_type=excluded.page_type,
                content_hash=excluded.content_hash, token_count=excluded.token_count,
                wikilinks=excluded.wikilinks, frontmatter=excluded.frontmatter,
-               status='active', updated_at=excluded.updated_at"
+               tags=excluded.tags, status='active', updated_at=excluded.updated_at"
         )
-        .bind(Self::uuid())
-        .bind(project_id)
-        .bind(path)
-        .bind(title)
-        .bind(page_type)
-        .bind(content_hash)
-        .bind(token_count)
-        .bind(wikilinks)
-        .bind(frontmatter)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+            .bind(Self::uuid())
+            .bind(project_id)
+            .bind(path)
+            .bind(title)
+            .bind(page_type)
+            .bind(content_hash)
+            .bind(token_count)
+            .bind(wikilinks)
+            .bind(frontmatter)
+            .bind(tags)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
         Ok(())
     }
 
@@ -191,13 +197,13 @@ impl WikiRepository {
              AND (title LIKE ? OR path LIKE ?)
              ORDER BY title LIMIT ?"
         )
-        .bind(project_id)
-        .bind(&pattern)
-        .bind(&pattern)
-        .bind(top_k as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+            .bind(project_id)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(top_k as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
 
         // Also search in file contents on disk for better recall
         let mut results: Vec<WikiSearchResult> = like_rows.iter().map(|p| {
@@ -216,10 +222,10 @@ impl WikiRepository {
             let all_pages = sqlx::query_as::<_, WikiPage>(
                 "SELECT * FROM wiki_pages WHERE project_id = ? AND status = 'active' ORDER BY title"
             )
-            .bind(project_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
+                .bind(project_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| format!("DB error: {}", e))?;
 
             let existing_paths: std::collections::HashSet<String> = results.iter().map(|r| r.path.clone()).collect();
 
@@ -236,6 +242,9 @@ impl WikiRepository {
                         let pos = content_lower.find(&query_lower).unwrap_or(0);
                         let start = if pos > 60 { pos - 60 } else { 0 };
                         let end = std::cmp::min(start + 200, content.len());
+                        // Align to char boundaries to avoid splitting multi-byte UTF-8 chars
+                        let start = content.floor_char_boundary(start);
+                        let end = content.ceil_char_boundary(end);
                         let snippet = format!("...{}...", &content[start..end].replace('\n', " "));
 
                         results.push(WikiSearchResult {
@@ -280,10 +289,10 @@ impl WikiRepository {
         sqlx::query_as::<_, WikiSource>(
             "SELECT * FROM wiki_sources WHERE project_id = ? ORDER BY created_at DESC"
         )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))
     }
 
     pub async fn add_source(&self, project_id: &str, input: &AddSourceInput, content_hash: Option<&str>, file_size: i64) -> Result<WikiSource, String> {
@@ -293,18 +302,18 @@ impl WikiRepository {
             "INSERT INTO wiki_sources (id, project_id, source_type, filename, file_path, source_url, content_hash, file_size, status, page_count, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)"
         )
-        .bind(&id)
-        .bind(project_id)
-        .bind(&input.source_type)
-        .bind(&input.filename)
-        .bind(&input.file_path)
-        .bind(&input.source_url)
-        .bind(content_hash)
-        .bind(file_size)
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+            .bind(&id)
+            .bind(project_id)
+            .bind(&input.source_type)
+            .bind(&input.filename)
+            .bind(&input.file_path)
+            .bind(&input.source_url)
+            .bind(content_hash)
+            .bind(file_size)
+            .bind(&now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
 
         sqlx::query_as::<_, WikiSource>("SELECT * FROM wiki_sources WHERE id = ?")
             .bind(&id)
@@ -327,14 +336,14 @@ impl WikiRepository {
         sqlx::query(
             "UPDATE wiki_sources SET status=?, page_count=?, error_message=?, ingested_at=? WHERE id=?"
         )
-        .bind(status)
-        .bind(page_count)
-        .bind(error)
-        .bind(if status == "ingested" { Some(now.clone()) } else { None })
-        .bind(source_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+            .bind(status)
+            .bind(page_count)
+            .bind(error)
+            .bind(if status == "ingested" { Some(now.clone()) } else { None })
+            .bind(source_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
         Ok(())
     }
 
@@ -347,14 +356,14 @@ impl WikiRepository {
             "INSERT INTO wiki_ingest_queue (id, project_id, source_id, task_type, status, progress, total_steps, done_steps, created_at)
              VALUES (?, ?, ?, ?, 'pending', 0, 0, 0, ?)"
         )
-        .bind(&id)
-        .bind(project_id)
-        .bind(source_id)
-        .bind(task_type)
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+            .bind(&id)
+            .bind(project_id)
+            .bind(source_id)
+            .bind(task_type)
+            .bind(&now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
         Ok(id)
     }
 
@@ -365,18 +374,18 @@ impl WikiRepository {
         sqlx::query(
             "UPDATE wiki_ingest_queue SET status=?, progress=?, done_steps=?, total_steps=?, result_json=?, error_message=?, started_at=COALESCE(?, started_at), completed_at=COALESCE(?, completed_at) WHERE id=?"
         )
-        .bind(status)
-        .bind(progress)
-        .bind(done_steps)
-        .bind(total_steps)
-        .bind(result)
-        .bind(error)
-        .bind(started.as_deref())
-        .bind(completed.as_deref())
-        .bind(task_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+            .bind(status)
+            .bind(progress)
+            .bind(done_steps)
+            .bind(total_steps)
+            .bind(result)
+            .bind(error)
+            .bind(started.as_deref())
+            .bind(completed.as_deref())
+            .bind(task_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
         Ok(())
     }
 
@@ -384,36 +393,10 @@ impl WikiRepository {
         sqlx::query_as::<_, WikiIngestTask>(
             "SELECT * FROM wiki_ingest_queue WHERE project_id = ? ORDER BY created_at DESC LIMIT 20"
         )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))
-    }
-
-    // ── Reviews ──
-
-    pub async fn list_reviews(&self, project_id: &str, resolved: Option<bool>) -> Result<Vec<WikiReview>, String> {
-        let query = match resolved {
-            None => "SELECT * FROM wiki_reviews WHERE project_id = ? ORDER BY created_at DESC",
-            Some(false) => "SELECT * FROM wiki_reviews WHERE project_id = ? AND resolved = 0 ORDER BY created_at DESC",
-            Some(true) => "SELECT * FROM wiki_reviews WHERE project_id = ? AND resolved = 1 ORDER BY created_at DESC",
-        };
-        sqlx::query_as::<_, WikiReview>(query)
             .bind(project_id)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| format!("DB error: {}", e))
-    }
-
-    pub async fn resolve_review(&self, review_id: &str) -> Result<(), String> {
-        let now = Self::now();
-        sqlx::query("UPDATE wiki_reviews SET resolved = 1, resolved_at = ? WHERE id = ?")
-            .bind(&now)
-            .bind(review_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
-        Ok(())
     }
 
     // ── Sessions ──
@@ -422,10 +405,10 @@ impl WikiRepository {
         sqlx::query_as::<_, WikiSession>(
             "SELECT * FROM wiki_sessions WHERE project_id = ? ORDER BY created_at DESC LIMIT 50"
         )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))
     }
 
     pub async fn add_session(&self, project_id: &str, role: &str, content: &str, sources: Option<&str>, model: Option<&str>) -> Result<(), String> {
@@ -435,16 +418,16 @@ impl WikiRepository {
             "INSERT INTO wiki_sessions (id, project_id, role, content, sources_json, model, tokens_used, created_at)
              VALUES (?, ?, ?, ?, ?, ?, 0, ?)"
         )
-        .bind(&id)
-        .bind(project_id)
-        .bind(role)
-        .bind(content)
-        .bind(sources)
-        .bind(model)
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+            .bind(&id)
+            .bind(project_id)
+            .bind(role)
+            .bind(content)
+            .bind(sources)
+            .bind(model)
+            .bind(&now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
         Ok(())
     }
 
@@ -455,6 +438,39 @@ impl WikiRepository {
             .await
             .map_err(|e| format!("DB error: {}", e))?;
         Ok(())
+    }
+
+    // ── Tags ──
+
+    pub async fn get_tags(&self, project_id: &str, limit: usize) -> Result<Vec<crate::services::wiki::models::WikiTag>, String> {
+        // Collect tags from all active pages in the project
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT tags FROM wiki_pages WHERE project_id = ? AND status = 'active'"
+        )
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
+
+        let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (tags_json,) in &rows {
+            let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
+            for tag in tags {
+                let tag = tag.trim().to_lowercase();
+                if !tag.is_empty() {
+                    *freq.entry(tag).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut freq_vec: Vec<(String, usize)> = freq.into_iter().collect();
+        freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+        Ok(freq_vec
+            .into_iter()
+            .take(limit)
+            .map(|(word, count)| crate::services::wiki::models::WikiTag { word, count })
+            .collect())
     }
 
     // ── Graph ──
@@ -476,10 +492,10 @@ impl WikiRepository {
         let edges_rows = sqlx::query_as::<_, WikiGraphEdgeRow>(
             "SELECT * FROM wiki_graph_edges WHERE project_id = ? ORDER BY weight DESC"
         )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
 
         let edges: Vec<GraphEdge> = edges_rows.iter().map(|r| GraphEdge {
             source: r.source_page.clone(),
@@ -497,34 +513,34 @@ impl WikiRepository {
         let page_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM wiki_pages WHERE project_id = ? AND status = 'active'"
         )
-        .bind(project_id)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .bind(project_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         let source_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM wiki_sources WHERE project_id = ? AND status = 'ingested'"
         )
-        .bind(project_id)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .bind(project_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         let review_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM wiki_reviews WHERE project_id = ? AND resolved = 0"
         )
-        .bind(project_id)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .bind(project_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         let page_types: Vec<(String, i64)> = sqlx::query_as(
             "SELECT page_type, COUNT(*) as cnt FROM wiki_pages WHERE project_id = ? AND status = 'active' GROUP BY page_type"
         )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await
-        .unwrap_or_default();
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default();
 
         let type_map: serde_json::Map<String, serde_json::Value> = page_types.into_iter()
             .map(|(t, c)| (t, serde_json::Value::Number(c.into())))
