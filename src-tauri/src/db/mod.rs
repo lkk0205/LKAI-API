@@ -39,11 +39,11 @@ async fn fix_legacy_migration_checksums(pool: &SqlitePool) {
         let result = sqlx::query(
             "UPDATE _sqlx_migrations SET checksum = ? WHERE version = ? AND checksum != ?",
         )
-            .bind(&new_checksum)
-            .bind(version)
-            .bind(&new_checksum)
-            .execute(pool)
-            .await;
+        .bind(&new_checksum)
+        .bind(version)
+        .bind(&new_checksum)
+        .execute(pool)
+        .await;
 
         if let Ok(res) = result {
             if res.rows_affected() > 0 {
@@ -65,13 +65,12 @@ fn migration_max_version() -> i64 {
 /// 数据库当前迁移版本：`_sqlx_migrations` 中最大的已成功版本。
 /// 表不存在或为空时返回 0（全新数据库）。
 async fn current_db_version(pool: &SqlitePool) -> i64 {
-    let max: Option<i64> = sqlx::query_scalar(
-        "SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1",
-    )
-        .fetch_one(pool)
-        .await
-        .ok()
-        .flatten();
+    let max: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+            .fetch_one(pool)
+            .await
+            .ok()
+            .flatten();
     max.unwrap_or(0)
 }
 
@@ -156,8 +155,12 @@ impl Database {
             .path()
             .app_data_dir()
             .expect("failed to get app data dir");
+        Self::new_with_path(&app_data_dir).await
+    }
 
-        std::fs::create_dir_all(&app_data_dir).expect("failed to create app data dir");
+    /// headless（waliapi-web）入口：显式指定数据目录。
+    pub async fn new_with_path(app_data_dir: &Path) -> Self {
+        std::fs::create_dir_all(app_data_dir).expect("failed to create app data dir");
 
         let db_path = app_data_dir.join("waliapi.db");
         let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
@@ -182,6 +185,12 @@ impl Database {
             .run(&pool)
             .await
             .expect("failed to run database migrations");
+
+        // 补建升级前切片的关键词投影，不改动已有正文和向量。
+        crate::services::knowledge::repository::KbRepository::new(pool.clone())
+            .backfill_search_text()
+            .await
+            .expect("failed to backfill knowledge search index");
 
         // Seed built-in security rules if table exists and is empty
         let _ = crate::security::rules::seed_builtin_rules(&pool).await;

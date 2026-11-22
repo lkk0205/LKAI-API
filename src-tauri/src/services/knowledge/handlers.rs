@@ -1,20 +1,18 @@
-use super::embedder;
 use super::models::*;
 use super::processor;
 use super::rag;
 use super::repository::KbRepository;
 use super::retriever;
-use crate::db::repository::Repository;
+use crate::server::knowledge_access::{self, KnowledgeAccess};
 use crate::server::router::SharedState;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
+    Extension,
 };
 use serde::Deserialize;
 use sha2::Digest;
-use tauri::{Emitter, Manager};
-
 #[derive(Deserialize)]
 pub struct ListQuery {
     #[serde(default)]
@@ -25,10 +23,18 @@ pub struct ListQuery {
 
 // ─── Knowledge Base CRUD ──────────────────────────────────────────
 
-pub async fn list_knowledge_bases(State(shared): State<SharedState>) -> Response {
+pub async fn list_knowledge_bases(
+    State(shared): State<SharedState>,
+    access: Option<Extension<KnowledgeAccess>>,
+) -> Response {
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_all_kbs().await {
-        Ok(kbs) => Json(serde_json::json!({ "data": kbs })).into_response(),
+        Ok(mut kbs) => {
+            if let Some(Extension(access)) = access {
+                kbs.retain(|kb| kb.status == 1 && access.kb_ids.contains(&kb.id));
+            }
+            Json(serde_json::json!({ "data": kbs })).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("DB error: {}", e),
@@ -140,16 +146,31 @@ pub async fn upload_document(
     let file_type = super::parser::get_file_type(&input.filename);
     let file_size = content.len() as i64;
 
-    let app_data_dir = shared
-        .app
-        .path()
-        .app_data_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let kb_dir = app_data_dir.join("kb_files").join(&kb_id);
-    std::fs::create_dir_all(&kb_dir).ok();
+    // 落盘路径完全由服务端生成（uuid + 白名单扩展名），原始文件名仅入库展示；
+    // kb_id 先过白名单，杜绝路径穿越（FIX-02，见 upload 模块）
     let doc_id = uuid::Uuid::new_v4().to_string();
-    let file_path = kb_dir.join(format!("{}_{}", &doc_id, &input.filename));
-    std::fs::write(&file_path, &content).ok();
+    let file_path =
+        match super::upload::storage_path(&shared.state.data_dir, &kb_id, &doc_id, &input.filename)
+        {
+            Ok(path) => path,
+            Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        };
+    if let Some(parent) = file_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("创建库目录失败: {e}"),
+            )
+                .into_response();
+        }
+    }
+    if let Err(e) = std::fs::write(&file_path, &content) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("写入文件失败: {e}"),
+        )
+            .into_response();
+    }
     let file_path_str = file_path.to_string_lossy().to_string();
 
     let doc = match repo
@@ -185,22 +206,26 @@ pub async fn upload_document(
     };
 
     let pool = shared.state.db.pool.clone();
-    let app = shared.app.clone();
+    let events = shared.state.events.clone();
     let doc_id_clone = doc.id.clone();
     let filename_clone = input.filename.clone();
     let emb_model = kb.embedding_model.clone();
+    let settings = shared.state.settings.clone();
+    let data_dir = shared.state.data_dir.clone();
 
     tokio::spawn(async move {
         if let Err(e) = processor::process_document(
             &pool,
-            &app,
+            &events,
             &kb_id,
             &doc_id_clone,
             &filename_clone,
             &content,
             emb_model.as_deref(),
+            &settings,
+            &data_dir,
         )
-            .await
+        .await
         {
             tracing::error!("Document processing failed: {}", e);
         }
@@ -211,11 +236,12 @@ pub async fn upload_document(
 
 pub async fn get_document(
     State(shared): State<SharedState>,
-    Path((_kb_id, doc_id)): Path<(String, String)>,
+    Path((kb_id, doc_id)): Path<(String, String)>,
 ) -> Response {
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_document(&doc_id).await {
-        Ok(doc) => Json(doc).into_response(),
+        Ok(doc) if doc.kb_id == kb_id => Json(doc).into_response(),
+        Ok(_) => (StatusCode::NOT_FOUND, "Document not found").into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "Document not found").into_response(),
     }
 }
@@ -227,14 +253,43 @@ pub async fn delete_document(
     let repo = KbRepository::new(shared.state.db.pool.clone());
 
     if let Ok(doc) = repo.get_document(&doc_id).await {
-        if let Some(path) = &doc.file_path {
-            std::fs::remove_file(path).ok();
+        if let Err(e) = super::upload::remove_managed_file(
+            &shared.state.data_dir,
+            &doc.kb_id,
+            &doc.source_type,
+            doc.file_path.as_deref(),
+        ) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
+        // 级联删除 OCR 页级缓存（以内容哈希为键）
+        super::ocr::cache::remove_cache(&shared.state.data_dir, &doc.content_hash);
     }
 
     match repo.delete_document(&doc_id).await {
         Ok(_) => {
             repo.update_kb_counts(&kb_id).await.ok();
+            // 增量摘除该文档的索引向量（best-effort：失败仅日志，不阻断删除）。
+            // 此前删除文档完全不更新 HNSW 文件，死向量留存到下次全量重建。
+            {
+                let pool = shared.state.db.pool.clone();
+                let events = shared.state.events.clone();
+                let kb_id = kb_id.clone();
+                let doc_id = doc_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(async {
+                        if let Err(e) =
+                            super::retriever::index_delta(&pool, &kb_id, &doc_id, &events).await
+                        {
+                            tracing::warn!(
+                                "Failed to update HNSW index after doc delete ({}): {}",
+                                doc_id,
+                                e
+                            );
+                        }
+                    });
+                });
+            }
             (StatusCode::NO_CONTENT, "").into_response()
         }
         Err(e) => (
@@ -250,10 +305,14 @@ pub async fn reindex_document(
     Path((_kb_id, doc_id)): Path<(String, String)>,
 ) -> Response {
     let pool = shared.state.db.pool.clone();
-    let app = shared.app.clone();
+    let events = shared.state.events.clone();
+    let settings = shared.state.settings.clone();
+    let data_dir = shared.state.data_dir.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = processor::reindex_document(&pool, &app, &doc_id).await {
+        if let Err(e) =
+            processor::reindex_document(&pool, &events, &doc_id, &settings, &data_dir).await
+        {
             tracing::error!("Reindex failed: {}", e);
         }
     });
@@ -269,6 +328,15 @@ pub struct SearchQuery {
     pub kb_id: Option<String>,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
+    pub search_mode: Option<String>,
+    pub vector_weight: Option<f32>,
+    pub keyword_weight: Option<f32>,
+    #[serde(default)]
+    pub diagnostics: bool,
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub allow_keyword_fallback: bool,
+    pub candidate_k: Option<usize>,
 }
 
 fn default_top_k() -> usize {
@@ -278,43 +346,63 @@ fn default_top_k() -> usize {
 pub async fn search(
     State(shared): State<SharedState>,
     Query(query): Query<SearchQuery>,
+    access: Option<Extension<KnowledgeAccess>>,
 ) -> Response {
-    let repo = Repository::new(shared.state.db.pool.clone());
-
-    let emb_model = if let Some(kb_id) = &query.kb_id {
-        let kb_repo = KbRepository::new(shared.state.db.pool.clone());
-        kb_repo
-            .get_kb(kb_id)
-            .await
-            .ok()
-            .and_then(|kb| kb.embedding_model)
-            .unwrap_or_else(|| "text-embedding-3-small".to_string())
-    } else {
-        "text-embedding-3-small".to_string()
-    };
-
-    let embeddings = match embedder::embed(&[query.q.clone()], &emb_model, &repo).await {
-        Ok(e) => e,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Embedding failed: {}", e),
-            )
-                .into_response()
+    if let Some(Extension(access)) = access {
+        let request_id = access.headers.get("x-request-id").cloned();
+        let mut input: AskInput = serde_json::from_value(serde_json::json!({
+            "question": query.q, "kb_id": query.kb_id, "top_k": query.top_k,
+            "search_mode": query.search_mode.unwrap_or_else(|| "vector".into()),
+            "diagnostics": query.diagnostics, "timeout_ms": query.timeout_ms,
+            "allow_keyword_fallback": query.allow_keyword_fallback, "candidate_k": query.candidate_k,
+        })).expect("valid search input");
+        // 非有限权重必须保留到校验，不能被 JSON null 静默套用默认值。
+        input.vector_weight = query.vector_weight;
+        input.keyword_weight = query.keyword_weight;
+        let mut response =
+            match knowledge_access::search_with_details(&shared, &access, input, false).await {
+                Ok(results) => Json(results).into_response(),
+                Err(error) => error.into_response(),
+            };
+        if let Some(request_id) = request_id {
+            response.headers_mut().insert("x-request-id", request_id);
         }
-    };
-
-    if embeddings.is_empty() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to embed query").into_response();
+        return response;
     }
-
-    let query_emb = &embeddings[0];
-
-    let results = if let Some(kb_id) = &query.kb_id {
-        retriever::search(&shared.state.db.pool, kb_id, query_emb, query.top_k).await
-    } else {
-        retriever::search_all(&shared.state.db.pool, query_emb, query.top_k, false).await
-    };
+    // 管理端的无预算旧检索保持原入口；新参数复用同一通用检索与取消流程。
+    if query.timeout_ms.is_some()
+        || query.allow_keyword_fallback
+        || query.diagnostics
+        || query.candidate_k.is_some()
+    {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut response = match knowledge_access::run_request(
+            &request_id,
+            query.timeout_ms,
+            query.diagnostics,
+            Box::pin(search_internal(&shared, &query, &request_id)),
+        )
+        .await
+        {
+            Ok(results) => Json(results).into_response(),
+            Err(error) => error.into_response(),
+        };
+        response
+            .headers_mut()
+            .insert("x-request-id", request_id.parse().expect("UUID header"));
+        return response;
+    }
+    let results = retriever::search_query(
+        &shared.state.db.pool,
+        query.kb_id.as_deref(),
+        &query.q,
+        query.top_k,
+        query.search_mode.as_deref().unwrap_or("vector"),
+        query.vector_weight.unwrap_or(0.7),
+        query.keyword_weight.unwrap_or(0.3),
+        retriever::FusionMode::parse(&shared.state.settings.get_str("kb.fusion_mode", "rrf")),
+    )
+    .await;
 
     match results {
         Ok(results) => Json(serde_json::json!({ "data": results })).into_response(),
@@ -326,9 +414,141 @@ pub async fn search(
     }
 }
 
+async fn search_internal(
+    shared: &SharedState,
+    query: &SearchQuery,
+    request_id: &str,
+) -> Result<SearchResponse, super::model_client::QueryError> {
+    use super::model_client::{ModelClient, QueryError};
+    if query.diagnostics {
+        return Err(QueryError::new(
+            StatusCode::BAD_REQUEST,
+            "知识库健康检测需要使用普通 API Key",
+        )
+        .at_stage("permission", "diagnostics_requires_api_key"));
+    }
+    let mode = query.search_mode.as_deref().unwrap_or("vector");
+    let vw = query.vector_weight.unwrap_or(0.7);
+    let kw = query.keyword_weight.unwrap_or(0.3);
+    knowledge_access::validate_query(&query.q, query.top_k, mode, vw, kw)?;
+    rag::validate_candidate_k(query.top_k, query.candidate_k)?;
+    let kb_id = query.kb_id.as_deref().unwrap_or("");
+    // 跨库管理员检索沿用旧 search_query：任何请求模式都回退到跨库向量检索。
+    let effective_mode = if kb_id.is_empty() { "vector" } else { mode };
+    let embedding_model = if !kb_id.is_empty() {
+        KbRepository::new(shared.state.db.pool.clone())
+            .get_kb(kb_id)
+            .await
+            .map_err(|_| QueryError::new(StatusCode::NOT_FOUND, "Knowledge base not found"))?
+            .embedding_model
+            .unwrap_or_else(|| "text-embedding-3-small".into())
+    } else {
+        "text-embedding-3-small".into()
+    };
+    let client = ModelClient::Internal {
+        pool: &shared.state.db.pool,
+        settings: &shared.state.settings,
+        kb_id,
+    };
+    let retrieved = Box::pin(rag::retrieve_with_client(
+        &client,
+        &shared.state.db.pool,
+        kb_id,
+        &query.q,
+        &embedding_model,
+        query.candidate_k.unwrap_or(query.top_k),
+        false,
+        &shared.state.settings,
+        vw,
+        kw,
+        effective_mode,
+        false,
+        query.allow_keyword_fallback,
+        false,
+    ))
+    .await?;
+    let mut data: Vec<_> = retrieved
+        .scored_results
+        .into_iter()
+        .map(|result| result.result)
+        .collect();
+    data.truncate(query.top_k);
+    Ok(SearchResponse {
+        data,
+        request_id: Some(request_id.to_string()),
+        retrieval_mode: Some(retrieved.actual_mode),
+        degradation_reason: retrieved.degradation_reason,
+        diagnostics: None,
+    })
+}
+
 // ─── RAG Ask (with history + token fallback) ──────────────────────
 
-pub async fn ask(State(shared): State<SharedState>, Json(input): Json<AskInput>) -> Response {
+pub async fn ask(
+    State(shared): State<SharedState>,
+    access: Option<Extension<KnowledgeAccess>>,
+    Json(input): Json<AskInput>,
+) -> Response {
+    if let Some(Extension(access)) = access {
+        let request_id = access.headers.get("x-request-id").cloned();
+        let mut response = match knowledge_access::ask(&shared, &access, input, false).await {
+            Ok(answer) => Json(answer).into_response(),
+            Err(error) => error.into_response(),
+        };
+        if let Some(request_id) = request_id {
+            response.headers_mut().insert("x-request-id", request_id);
+        }
+        return response;
+    }
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let budget = input
+        .timeout_ms
+        .map(|ms| super::budget::Budget::new(ms, request_id.clone()));
+    let work = Box::pin(ask_internal(&shared, input));
+    let mut response = if let Some(budget) = &budget {
+        budget
+            .scope(async {
+                match tokio::time::timeout_at(budget.deadline(), work).await {
+                    Ok(response) => response,
+                    Err(_) => {
+                        budget.cancel();
+                        super::model_client::QueryError::new(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "RAG 总时间预算已耗尽",
+                        )
+                        .at_stage("rag", "rag_deadline_exceeded")
+                        .with_request_id(&request_id)
+                        .into_response()
+                    }
+                }
+            })
+            .await
+    } else {
+        work.await
+    };
+    response
+        .headers_mut()
+        .insert("x-request-id", request_id.parse().expect("UUID header"));
+    response
+}
+
+async fn ask_internal(shared: &SharedState, input: AskInput) -> Response {
+    if let Err(error) =
+        rag::validate_reasoning_request(input.reasoning_effort.as_deref(), input.deep_research)
+    {
+        return error.into_response();
+    }
+    if let Err(error) = rag::validate_candidate_k(input.top_k, input.candidate_k) {
+        return error.into_response();
+    }
+    if input.diagnostics {
+        return super::model_client::QueryError::new(
+            StatusCode::BAD_REQUEST,
+            "知识库健康检测需要使用普通 API Key，以覆盖真实权限、额度和安全审计",
+        )
+        .at_stage("permission", "diagnostics_requires_api_key")
+        .into_response();
+    }
     let kb_id = input.kb_id.clone().unwrap_or_default();
 
     let emb_model = if !kb_id.is_empty() {
@@ -353,9 +573,9 @@ pub async fn ask(State(shared): State<SharedState>, Json(input): Json<AskInput>)
             &input.model,
             input.top_k,
             input.max_rounds,
-            &shared.app,
+            &shared.state.settings,
         )
-            .await
+        .await
         {
             Ok(answer) => Json(answer).into_response(),
             Err(e) => (
@@ -371,7 +591,13 @@ pub async fn ask(State(shared): State<SharedState>, Json(input): Json<AskInput>)
         let keyword_weight = input.keyword_weight.unwrap_or(0.3);
         let search_mode = input.search_mode.as_deref().unwrap_or("hybrid");
 
-        match rag::ask_with_config(
+        let client = super::model_client::ModelClient::Internal {
+            pool: &shared.state.db.pool,
+            settings: &shared.state.settings,
+            kb_id: &kb_id,
+        };
+        match rag::ask_with_client(
+            &client,
             &shared.state.db.pool,
             &kb_id,
             &input.question,
@@ -380,14 +606,21 @@ pub async fn ask(State(shared): State<SharedState>, Json(input): Json<AskInput>)
             input.top_k,
             false,
             &history,
-            &shared.app,
+            &shared.state.settings,
             vector_weight,
             keyword_weight,
             search_mode,
+            false,
+            input.allow_keyword_fallback,
+            input.candidate_k,
+            input.reasoning_effort.as_deref(),
         )
-            .await
+        .await
         {
             Ok(answer) => Json(answer).into_response(),
+            Err(error) if input.timeout_ms.is_some() || input.allow_keyword_fallback => {
+                error.into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("RAG failed: {}", e),
@@ -426,7 +659,7 @@ pub async fn kb_stats(State(shared): State<SharedState>, Path(kb_id): Path<Strin
         },
         "index": index_meta,
     }))
-        .into_response()
+    .into_response()
 }
 
 // ════════════════════════════════════════════════════════
@@ -506,7 +739,7 @@ pub async fn import_source(
     Json(input): Json<ImportSourceInput>,
 ) -> Response {
     let pool = shared.state.db.pool.clone();
-    let app = shared.app.clone();
+    let events = shared.state.events.clone();
 
     let repo = KbRepository::new(pool.clone());
 
@@ -533,14 +766,25 @@ pub async fn import_source(
 
     let source_id = source.id.clone();
     let source_type = input.source_type.clone();
+    let settings = shared.state.settings.clone();
+    let data_dir = shared.state.data_dir.clone();
 
     tokio::spawn(async move {
         let result = if source_type == "git" {
-            super::importer::import_git_repo(&pool, &app, &kb_id, &source_id, &input).await
+            super::importer::import_git_repo(
+                &pool, &events, &kb_id, &source_id, &input, &settings, &data_dir,
+            )
+            .await
         } else if source_type == "url" {
-            super::importer::import_url(&pool, &app, &kb_id, &source_id, &input).await
+            super::importer::import_url(
+                &pool, &events, &kb_id, &source_id, &input, &settings, &data_dir,
+            )
+            .await
         } else if source_type == "local_dir" {
-            super::importer::import_local_dir(&pool, &app, &kb_id, &source_id, &input).await
+            super::importer::import_local_dir(
+                &pool, &events, &kb_id, &source_id, &input, &settings, &data_dir,
+            )
+            .await
         } else {
             Err(format!("Unknown source type: {}", source_type))
         };
@@ -584,7 +828,7 @@ pub async fn get_index_status(
 pub async fn build_index(State(shared): State<SharedState>, Path(kb_id): Path<String>) -> Response {
     let pool = shared.state.db.pool.clone();
     let kb_id_clone = kb_id.clone();
-    let app = shared.app.clone();
+    let events = shared.state.events.clone();
 
     // Update index status to building immediately
     let repo = KbRepository::new(pool.clone());
@@ -600,7 +844,7 @@ pub async fn build_index(State(shared): State<SharedState>, Path(kb_id): Path<St
 
         rt.block_on(async {
             // Emit progress: starting
-            let _ = app.emit(
+            events.emit(
                 "kb-index-progress",
                 serde_json::json!({
                     "kb_id": &kb_id,
@@ -609,10 +853,10 @@ pub async fn build_index(State(shared): State<SharedState>, Path(kb_id): Path<St
                 }),
             );
 
-            match retriever::build_index(&pool, &kb_id, &app).await {
+            match retriever::build_index(&pool, &kb_id, &events).await {
                 Ok(()) => {
                     tracing::info!("HNSW index built successfully for KB {}", kb_id);
-                    let _ = app.emit(
+                    events.emit(
                         "kb-index-progress",
                         serde_json::json!({
                             "kb_id": &kb_id,
@@ -625,7 +869,7 @@ pub async fn build_index(State(shared): State<SharedState>, Path(kb_id): Path<St
                     tracing::error!("Failed to build HNSW index for KB {}: {}", kb_id, e);
                     let repo = KbRepository::new(pool.clone());
                     repo.update_kb_index_status(&kb_id, "error").await.ok();
-                    let _ = app.emit(
+                    events.emit(
                         "kb-index-progress",
                         serde_json::json!({
                             "kb_id": &kb_id,

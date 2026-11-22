@@ -1,38 +1,7 @@
 //! Conversion report produced by every codec direction.
 
+use super::types::CodecId;
 use serde::Serialize;
-
-/// Stable, versioned identifier of the codec implementation.
-///
-/// The pair of functions (e.g. `chat_to_messages_v1`) share one codec version
-/// because the request encoder and the response decoder must be deployed
-/// together and always agree on semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub struct CodecVersion {
-    pub major: u32,
-    pub minor: u32,
-}
-
-impl CodecVersion {
-    pub const fn new(major: u32, minor: u32) -> Self {
-        Self { major, minor }
-    }
-    pub fn label(&self) -> String {
-        format!("{}.{}.0", self.major, self.minor)
-    }
-}
-
-/// Per-field audit status inside the report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FieldStatus {
-    /// The field was validated and mapped 1:1 with no information loss.
-    Preserved,
-    /// A lossless annotation was stripped (e.g. Anthropic `cache_control`).
-    Normalized,
-    /// The field was rejected with an error before any upstream access.
-    Rejected,
-}
 
 /// What the codec did to the request/response it converted.
 /// Token usage observed from a real upstream response.
@@ -58,7 +27,8 @@ pub struct ConversionReport {
     pub rejected: Vec<RejectedReportEntry>,
     /// Fields that were normalized (kept semantically, changed representation).
     pub normalized: Vec<String>,
-    pub codec_version: CodecVersion,
+    /// The exact directed codec selected for this conversion.
+    pub codec_id: CodecId,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,29 +38,22 @@ pub struct RejectedReportEntry {
 }
 
 impl ConversionReport {
-    pub fn new(rejected: Vec<RejectedReportEntry>, normalized: Vec<String>) -> Self {
+    pub fn for_codec(
+        codec_id: CodecId,
+        rejected: Vec<RejectedReportEntry>,
+        normalized: Vec<String>,
+    ) -> Self {
         Self {
             rejected,
             normalized,
-            codec_version: CodecVersion::new(1, 0),
+            codec_id,
         }
     }
-
-    pub fn ok() -> Self {
-        Self::new(vec![], vec![])
-    }
 }
 
-/// Result of a request conversion: the encoded upstream body plus the report.
-#[derive(Debug, Clone)]
-pub struct ConvertedRequest {
-    pub encoded_request: serde_json::Value,
-    pub context: ConversionContext,
-    pub report: ConversionReport,
-}
 /// Context handed to the response decoder so the response can be expressed in
 /// the downstream protocol (message ids, mapped upstream model, stream flag).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ConversionContext {
     /// Downstream request id (message id for the messages side, `chatcmpl-` for chat).
     pub request_id: String,
@@ -102,6 +65,10 @@ pub struct ConversionContext {
     /// transformed in a fail-open way during request encoding.  Populated by
     /// the encoder and surfaced through the [`ConversionReport`].
     pub normalized: Vec<String>,
+    /// Responses custom tools represented as Gemini function declarations.
+    /// Response decoders use this registry to restore custom-tool wire items
+    /// instead of exposing them as ordinary function calls.
+    pub custom_tool_names: Vec<String>,
 }
 
 impl ConversionContext {
@@ -115,6 +82,7 @@ impl ConversionContext {
             upstream_model: upstream_model.into(),
             stream,
             normalized: Vec::new(),
+            custom_tool_names: Vec::new(),
         }
     }
 }

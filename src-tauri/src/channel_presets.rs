@@ -45,6 +45,8 @@ pub enum ChannelProvider {
     #[serde(rename = "doubao_coding_plan")]
     DoubaoCodingPlan,
     Moonshot,
+    #[serde(rename = "stepfun")]
+    StepFun,
     Anthropic,
     Ollama,
     Custom,
@@ -61,6 +63,7 @@ impl ChannelProvider {
             ChannelProvider::Doubao => "doubao",
             ChannelProvider::DoubaoCodingPlan => "doubao_coding_plan",
             ChannelProvider::Moonshot => "moonshot",
+            ChannelProvider::StepFun => "stepfun",
             ChannelProvider::Anthropic => "anthropic",
             ChannelProvider::Ollama => "ollama",
             ChannelProvider::Custom => "custom",
@@ -202,6 +205,7 @@ const SRC_QWEN_RESPONSES: &str =
 const SRC_ZHIPU: &str = "https://open.bigmodel.cn/dev/api";
 const SRC_DOUBAO: &str = "https://www.volcengine.com/docs/82379/";
 const SRC_MOONSHOT: &str = "https://platform.moonshot.ai/docs/api/chat";
+const SRC_STEPFUN: &str = "https://platform.stepfun.com/docs/zh/api-reference/models/list.md";
 const SRC_ANTHROPIC: &str = "https://docs.anthropic.com/en/api/messages";
 
 /// 构建一个 preset 的便捷函数。
@@ -257,7 +261,11 @@ fn model(id: &str, verified_at: &str, source_url: &str) -> ModelSuggestion {
 fn custom_preset(protocol: ChannelProtocol) -> ChannelPreset {
     let (native_endpoints, default_checked, auth, strategy) = match protocol {
         ChannelProtocol::OpenAI => (
-            vec![NativeEndpoint::ChatCompletions, NativeEndpoint::Responses],
+            vec![
+                NativeEndpoint::ChatCompletions,
+                NativeEndpoint::Responses,
+                NativeEndpoint::Embeddings,
+            ],
             vec![NativeEndpoint::ChatCompletions],
             AuthScheme::Bearer,
             EndpointTestStrategy::ProbeFirstModel,
@@ -455,6 +463,40 @@ fn openai_presets() -> Vec<ChannelPreset> {
             ModelEnumStrategy::StaticPlusSync,
             EndpointTestStrategy::ProbeFirstModel,
         ),
+        preset(
+            ChannelProtocol::OpenAI,
+            ChannelProvider::StepFun,
+            "StepFun（阶跃星辰）",
+            RegionGroup::Domestic,
+            "阶跃星辰 StepFun 官方 OpenAI 接口。",
+            "stepfun",
+            "https://api.stepfun.com/v1",
+            "https://api.stepfun.com/v1",
+            "openai",
+            vec![NativeEndpoint::ChatCompletions],
+            vec![NativeEndpoint::ChatCompletions],
+            AuthScheme::Bearer,
+            // 5 条静态建议，顺序即预填/探测默认（旗舰在前）；verified_at 为调研
+            // 抓取日（2026-09-20），source_url 指向官方模型清单文档。
+            vec![
+                model("step-5-preview", "2026-09-20", SRC_STEPFUN),
+                model("step-3.7-flash", "2026-09-20", SRC_STEPFUN),
+                model("step-3.5-flash", "2026-09-20", SRC_STEPFUN),
+                model("step-3.5-flash-2603", "2026-09-20", SRC_STEPFUN),
+                model("step-1o-turbo-vision", "2026-09-20", SRC_STEPFUN),
+            ],
+            ModelEnumStrategy::StaticPlusSync,
+            EndpointTestStrategy::ProbeFirstModel,
+        ),
+        // StepFun 模型建议的排除项（依据 2026-09-20 官方文档调研）：
+        // - 音频族（stepaudio-* / step-1o-audio / step-audio-2 / step-audio-r1.5）：
+        //   走 chat completions 需厂商私有 modalities/audio 参数，网关不透传；
+        // - step-router-v1：仅 Step Plan 通道可用，标准通道 400；
+        // - TTS/ASR/Realtime 与生图/改图（step-2x-large、step-image-edit-2、
+        //   step-1x-edit，且后者 2026-10-10 下线）：非 chat completions 能力；
+        // - 2026-07-08 已下线型号（step-1-8k/32k、step-1v-8k/32k、step-2-mini、
+        //   step-1o-vision-32k、step-2-16k、step-3、step-1x-medium）。
+        // 上述均不预填，用户可经「同步上游模型」拉取 GET /v1/models 覆盖。
         preset(
             ChannelProtocol::OpenAI,
             ChannelProvider::Ollama,
@@ -717,6 +759,18 @@ mod tests {
     }
 
     #[test]
+    fn custom_openai_allows_embeddings_without_enabling_them_by_default() {
+        let preset = custom_preset(ChannelProtocol::OpenAI);
+        assert!(preset
+            .native_endpoints
+            .contains(&NativeEndpoint::Embeddings));
+        assert_eq!(
+            preset.default_checked_endpoints,
+            vec![NativeEndpoint::ChatCompletions]
+        );
+    }
+
+    #[test]
     fn deepseek_region_is_domestic() {
         for protocol in [ChannelProtocol::OpenAI, ChannelProtocol::Anthropic] {
             let p = presets_for_protocol(protocol)
@@ -724,6 +778,73 @@ mod tests {
                 .find(|p| p.provider == ChannelProvider::DeepSeek)
                 .expect("deepseek preset");
             assert_eq!(p.region, RegionGroup::Domestic);
+        }
+    }
+
+    /// StepFun（阶跃星辰）预设契约：协议/base_url/legacy 双写/端点/鉴权/策略/文案
+    /// 逐项锁定（spec.md「序列化契约」+ S01–S04 决议）。
+    #[test]
+    fn stepfun_openai_preset_matches_spec() {
+        let p = presets_for_protocol(ChannelProtocol::OpenAI)
+            .into_iter()
+            .find(|p| p.provider == ChannelProvider::StepFun)
+            .expect("openai stepfun preset");
+        assert_eq!(p.region, RegionGroup::Domestic);
+        assert_eq!(p.native_base_url, "https://api.stepfun.com/v1");
+        assert_eq!(p.legacy_base_url, "https://api.stepfun.com/v1");
+        // 旧适配器 type 必须是 openai：不得发明 "stepfun" 厂商名，否则旧二进制
+        // 兜底进 CustomAdaptor 丢能力（S02 决策）。
+        assert_eq!(p.legacy_type, "openai");
+        // 端点仅 Chat Completions：上游无 /v1/embeddings；/v1/responses 仅
+        // step-3.7-flash 支持，预设级声明会让其它模型被原生路由击中 400。
+        assert_eq!(p.native_endpoints, vec![NativeEndpoint::ChatCompletions]);
+        assert_eq!(
+            p.default_checked_endpoints,
+            vec![NativeEndpoint::ChatCompletions]
+        );
+        assert!(!p.native_endpoints.contains(&NativeEndpoint::Embeddings));
+        assert!(!p.native_endpoints.contains(&NativeEndpoint::Responses));
+        assert_eq!(p.auth_scheme, AuthScheme::Bearer);
+        assert_eq!(p.model_enum_strategy, ModelEnumStrategy::StaticPlusSync);
+        assert_eq!(
+            p.endpoint_test_strategy,
+            EndpointTestStrategy::ProbeFirstModel
+        );
+        assert_eq!(p.icon_key, "stepfun");
+        assert_eq!(p.display_name, "StepFun（阶跃星辰）");
+        assert_eq!(p.description, "阶跃星辰 StepFun 官方 OpenAI 接口。");
+        // 预设自身 revision 仍由构造函数统一填常量，不 bump
+        assert_eq!(p.preset_revision, PRESET_REVISION);
+        // 序列化契约之一（Rust 侧）：as_str 与 serde 字符串恒为 "stepfun"
+        assert_eq!(p.provider.as_str(), "stepfun");
+        assert_eq!(
+            serde_json::to_string(&p.provider).unwrap(),
+            "\"stepfun\"".to_string()
+        );
+    }
+
+    /// StepFun 模型建议：5 条、顺序即预填/探测默认（旗舰在前）、复核日期与溯源。
+    #[test]
+    fn stepfun_model_suggestions_match_spec() {
+        let p = presets_for_protocol(ChannelProtocol::OpenAI)
+            .into_iter()
+            .find(|p| p.provider == ChannelProvider::StepFun)
+            .expect("openai stepfun preset");
+        let ids: Vec<&str> = p.model_suggestions.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "step-5-preview",
+                "step-3.7-flash",
+                "step-3.5-flash",
+                "step-3.5-flash-2603",
+                "step-1o-turbo-vision",
+            ]
+        );
+        for m in &p.model_suggestions {
+            // verified_at = 调研抓取日（2026-09-20），不是全局 PRESET_REVISION
+            assert_eq!(m.verified_at, "2026-09-20", "{}", m.id);
+            assert_eq!(m.source_url, SRC_STEPFUN, "{}", m.id);
         }
     }
 
@@ -765,6 +886,7 @@ mod tests {
                 ChannelProvider::Zhipu,
                 ChannelProvider::Doubao,
                 ChannelProvider::Moonshot,
+                ChannelProvider::StepFun,
                 ChannelProvider::Ollama,
             ]
         );
@@ -933,6 +1055,19 @@ mod tests {
             join(&p.legacy_base_url, "chat/completions"),
             "https://api.openai.com/v1/chat/completions"
         );
+        // OpenAI / StepFun（阶跃星辰）
+        let p = f(ChannelProtocol::OpenAI, ChannelProvider::StepFun);
+        assert_eq!(p.native_base_url, "https://api.stepfun.com/v1");
+        assert_eq!(
+            join(&p.native_base_url, "chat/completions"),
+            "https://api.stepfun.com/v1/chat/completions"
+        );
+        assert_eq!(p.legacy_type, "openai");
+        assert_eq!(p.legacy_base_url, "https://api.stepfun.com/v1");
+        assert_eq!(
+            join(&p.legacy_base_url, "chat/completions"),
+            "https://api.stepfun.com/v1/chat/completions"
+        );
         // Anthropic / Anthropic
         let p = f(ChannelProtocol::Anthropic, ChannelProvider::Anthropic);
         assert_eq!(p.native_base_url, "https://api.anthropic.com/v1");
@@ -961,7 +1096,10 @@ mod tests {
         );
         // Anthropic / 智谱
         let p = f(ChannelProtocol::Anthropic, ChannelProvider::Zhipu);
-        assert_eq!(p.native_base_url, "https://open.bigmodel.cn/api/anthropic/v1");
+        assert_eq!(
+            p.native_base_url,
+            "https://open.bigmodel.cn/api/anthropic/v1"
+        );
         assert_eq!(
             join(&p.native_base_url, "messages"),
             "https://open.bigmodel.cn/api/anthropic/v1/messages"

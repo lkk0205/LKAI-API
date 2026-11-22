@@ -17,8 +17,6 @@ pub const CODEC_UNSUPPORTED_FEATURE: &str = "unsupported_feature";
 /// Error code used when a field is present but its *value* is not a
 /// representable media form (for example an invalid image source).
 pub const CODEC_UNSUPPORTED_MEDIA: &str = "unsupported_media";
-/// Error code for "rejected before upstream access" guard outcomes.
-pub const REJECTED_BEFORE_UPSTREAM: &str = "rejected_before_upstream";
 
 /// Machine class of a rejected feature, for routing and error reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -114,6 +112,9 @@ impl UnsupportedFeatures {
                     s.push_str("; ");
                 }
                 s.push_str(&format!("{} ({})", f.pointer, f.code));
+                if !f.message.is_empty() {
+                    s.push_str(&format!(": {}", f.message));
+                }
             }
             s
         };
@@ -218,3 +219,40 @@ impl fmt::Display for ResponseDecodeError {
 }
 
 impl std::error::Error for ResponseDecodeError {}
+
+/// Errors discovered while decoding an upstream response.
+///
+/// Preparation errors are deliberately kept separate: they describe caller
+/// input and are returned before any upstream request.  A decode failure
+/// instead describes an upstream protocol violation and must be classified by
+/// callers as a retryable upstream failure (until a stream is committed).
+pub type DecodeError = ResponseDecodeError;
+
+/// Errors returned while preparing an upstream request.
+///
+/// This alias preserves the stable unsupported-feature payload used by the
+/// existing HTTP boundary while making the phase distinction explicit at new
+/// codec call sites.
+pub type PrepareError = UnsupportedFeatures;
+
+impl ResponseDecodeError {
+    /// Convert a strict parser rejection into an upstream decode error without
+    /// exposing it as a caller-side unsupported-feature response.
+    pub fn from_unsupported(error: UnsupportedFeatures) -> Self {
+        Self {
+            code: "response_decode_error".to_string(),
+            pointer: error
+                .json_pointers
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "/".to_string()),
+            message: error.message,
+        }
+    }
+}
+
+impl From<UnsupportedFeatures> for ResponseDecodeError {
+    fn from(value: UnsupportedFeatures) -> Self {
+        Self::from_unsupported(value)
+    }
+}

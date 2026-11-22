@@ -1,13 +1,51 @@
 use crate::adaptor::{get_adaptor, ProxyRequest, TokenUsage};
+use crate::core::attempt::{upstream_failover_decision_with_body, FailoverDecision};
 use crate::core::dispatcher::Dispatcher;
 use crate::db::models::{Channel, RequestLog};
 use crate::db::repository::Repository;
 use crate::security;
+use crate::settings_store::SettingsStore;
 use crate::utils;
+use rand::Rng;
 use std::sync::Arc;
 use std::time::Instant;
-use tauri::AppHandle;
-use tauri_plugin_store::StoreExt;
+
+/// Multi-key load balancing for the legacy proxy path.  Selects a random
+/// enabled key from the channel's extra keys, weighted by `weight`.  The
+/// primary `api_key` participates with the channel-level `weight` unless it
+/// has been disabled (config `api_key_enabled = 0`).
+/// Returns `None` when the channel has no enabled credential at all (primary
+/// disabled/empty and no enabled extra keys) — the caller skips the channel.
+async fn select_key_for_channel(channel: &Channel, repo: &Arc<Repository>) -> Option<Channel> {
+    let extra_keys = match repo.get_channel_api_keys(&channel.id).await {
+        Ok(keys) => keys
+            .into_iter()
+            .filter(|k| k.status == 1)
+            .collect::<Vec<_>>(),
+        // DB 读取失败：保守降级为「无额外 Key」，主 Key 开关仍然生效。
+        Err(_) => Vec::new(),
+    };
+    let primary_ok = !channel.api_key.is_empty() && channel.primary_key_enabled();
+    if extra_keys.is_empty() && !primary_ok {
+        return None;
+    }
+    let mut pool: Vec<(String, i64)> = Vec::new();
+    if primary_ok {
+        pool.push((channel.api_key.clone(), channel.weight.max(1)));
+    }
+    for k in &extra_keys {
+        pool.push((k.api_key.clone(), k.weight.max(1)));
+    }
+    if pool.is_empty() {
+        return None;
+    }
+    // FIX-10：加权选择收敛为 core::weighted_key 单一实现（等权多 Key 均匀
+    // 分布；旧内联实现 `pick <= 0` 边界错误使第二个 Key 永远轮空，#34 根因）。
+    let chosen = crate::core::weighted_key::pick_weighted_key(&pool)?;
+    let mut ch = channel.clone();
+    ch.api_key = chosen;
+    Some(ch)
+}
 
 #[allow(dead_code)]
 pub struct ProxyResult {
@@ -20,7 +58,7 @@ pub struct ProxyResult {
 
 pub async fn handle_request(
     repo: &Arc<Repository>,
-    app: &AppHandle,
+    settings: &SettingsStore,
     api_key_id: &str,
     api_key_name: &str,
     body: serde_json::Value,
@@ -40,14 +78,21 @@ pub async fn handle_request(
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    let security_settings = security::get_security_settings(app);
+    let security_settings = security::get_security_settings(settings);
+    let custom_rules = if security_settings.enabled {
+        security::rules::CustomRuleRepository::get_enabled(repo.pool())
+            .await
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
     // The gate already audited the ORIGINAL protocol JSON at the handler.
     // Re-scanning the (possibly converted) Chat JSON here would be a redundant,
     // competing non-authoritative audit — only do that when the caller had no
     // gate (legacy RAG path).
     let mut security_result = match audit {
         Some(result) => result.clone(),
-        None => security::scan_request(&body, &security_settings),
+        None => security::scan_request(&body, &security_settings, &custom_rules),
     };
 
     // Real redaction: if redact mode is active, sanitize the request body before forwarding
@@ -125,7 +170,7 @@ pub async fn handle_request(
         return Err((503, format!("No channel available for model: {}", model)));
     }
 
-    let (retry_enabled, retry_times) = get_retry_settings(app);
+    let (retry_enabled, retry_times) = get_retry_settings(settings);
     let max_attempts = if retry_enabled {
         (retry_times.max(0) as usize + 1).min(selected_channels.len())
     } else {
@@ -135,6 +180,12 @@ pub async fn handle_request(
     let mut last_error = None;
 
     for (attempt, channel) in selected_channels.into_iter().take(max_attempts).enumerate() {
+        // Multi-key load balancing: select a key from extra keys if available.
+        // None = 主 Key 与全部额外 Key 均被停用：跳过该渠道，尝试下一个候选。
+        let channel = match select_key_for_channel(&channel, &repo).await {
+            Some(c) => c,
+            None => continue,
+        };
         let config = Dispatcher::channel_to_config(&channel);
         let adaptor = get_adaptor(&channel.channel_type);
         let attempt_start = Instant::now();
@@ -218,7 +269,26 @@ pub async fn handle_request(
                         eprintln!("[WARN] create_security_findings failed: {}", e);
                     }
                     last_error = Some(error_message);
-                    continue;
+                    // Terminal upstream status: the same request would fail
+                    // on every other channel too, so stop cycling and answer
+                    // with the decision's downstream status (an upstream
+                    // 401/403 is masked to 502 — the log above keeps the
+                    // real status).  FIX-25：带响应体判定，404 与新轨语义一致。
+                    match upstream_failover_decision_with_body(
+                        status,
+                        Some(resp_body.to_string().as_str()),
+                    ) {
+                        FailoverDecision::Failover => continue,
+                        FailoverDecision::Stop { downstream_status } => {
+                            return Ok(ProxyResult {
+                                status: downstream_status,
+                                body: resp_body,
+                                usage: None,
+                                channel,
+                                duration_ms: duration_ms as u64,
+                            });
+                        }
+                    }
                 }
 
                 // Extract and log choices
@@ -229,22 +299,46 @@ pub async fn handle_request(
                     // choices logging disabled
                 }
 
-                // Scan response for risks
-                let resp_security = security::scan_response(&resp_body, &security_settings);
-                let resp_findings_count = resp_security.findings.len();
-                if resp_findings_count > 0 {
-                    // Merge response findings into request findings for logging
-                    security_result.findings.extend(resp_security.findings);
-                    if resp_security.risk_level.rank() > security_result.risk_level.rank() {
-                        security_result.risk_level = resp_security.risk_level;
-                        security_result.risk_score =
-                            security_result.risk_score.max(resp_security.risk_score);
-                        security_result.summary = format!(
-                            "{} | 响应侧: {}",
-                            security_result.summary, resp_security.summary
+                // Scan response for risks and merge into the request audit
+                //（FIX-16：合并语义收敛到 security::scan_response_into 单一实现；
+                // custom_rules 随上游 PR #64 贯通响应侧）
+                security::scan_response_into(
+                    &mut security_result,
+                    &resp_body,
+                    &security_settings,
+                    &custom_rules,
+                );
+
+                let (prompt_tokens, completion_tokens, total_tokens) = {
+                    let (p, c, t) = (
+                        usage.as_ref().map(|u| u.prompt_tokens as i64).unwrap_or(0),
+                        usage
+                            .as_ref()
+                            .map(|u| u.completion_tokens as i64)
+                            .unwrap_or(0),
+                        usage.as_ref().map(|u| u.total_tokens as i64).unwrap_or(0),
+                    );
+                    // Fallback: estimate tokens when upstream didn't return usage.
+                    if t == 0 && p == 0 && c == 0 && status >= 200 && status < 300 {
+                        let req_body: serde_json::Value =
+                            serde_json::from_str(sanitized_request_body.as_deref().unwrap_or("{}"))
+                                .unwrap_or(serde_json::Value::Null);
+                        let resp_text = response_choices.as_deref().unwrap_or("");
+                        let (ep, ec, et) = crate::endpoint_executor::estimate_usage::estimate_usage(
+                            &req_body,
+                            Some(resp_text),
+                            &model,
                         );
+                        if et > 0 {
+                            eprintln!("[INFO] token usage estimated (proxy.rs): prompt={}, completion={}, total={}", ep, ec, et);
+                            (ep, ec, et)
+                        } else {
+                            (p, c, t)
+                        }
+                    } else {
+                        (p, c, t)
                     }
-                }
+                };
 
                 let log = RequestLog {
                     id: utils::id::new_id(),
@@ -257,12 +351,9 @@ pub async fn handle_request(
                     upstream_model: Some(upstream_model.clone()),
                     mode: "chat".to_string(),
                     status_code: status as i64,
-                    prompt_tokens: usage.as_ref().map(|u| u.prompt_tokens as i64).unwrap_or(0),
-                    completion_tokens: usage
-                        .as_ref()
-                        .map(|u| u.completion_tokens as i64)
-                        .unwrap_or(0),
-                    total_tokens: usage.as_ref().map(|u| u.total_tokens as i64).unwrap_or(0),
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
                     duration_ms: duration_ms as i64,
                     error_message: None,
                     is_stream: if is_stream { 1 } else { 0 },
@@ -298,14 +389,20 @@ pub async fn handle_request(
                     eprintln!("[WARN] create_security_findings failed: {}", e);
                 }
 
-                if let Some(ref u) = usage {
-                    if let Err(e) = repo
-                        .increment_quota(api_key_id, u.total_tokens as i64)
-                        .await
-                    {
-                        eprintln!("[WARN] increment_quota failed: {}", e);
+                // 两轨口径统一（C-01）：上游未回 usage 时沿用与日志同源的本地
+                // 估算计入配额（total_tokens 已在上方做过 2xx+缺失 usage 的估算
+                // 兜底），与 endpoint_executor 轨一致；估算也为 0 时不累加。
+                if total_tokens > 0 {
+                    if let Err(e) = repo.increment_quota(api_key_id, total_tokens).await {
+                        tracing::warn!("increment_quota failed: {}", e);
                     }
                 }
+
+                // 被动反哺（C-04）：真实请求成功 → 恢复该渠道的主动探测健康标记
+                // （best-effort，与日志/配额递增同级的旁路更新）。
+                // 必须 .await：mark_probe_ok 是 async fn，不 await 的 future 会被直接
+                // 丢弃、函数体一次都不执行（编译器报 unused_must_use）。
+                repo.mark_probe_ok(&channel.id).await;
 
                 return Ok(ProxyResult {
                     status,
@@ -381,17 +478,8 @@ pub async fn handle_request(
     ))
 }
 
-pub fn get_retry_settings(app: &AppHandle) -> (bool, i32) {
-    if let Ok(store) = app.store("settings.json") {
-        let enabled = store
-            .get("retry.enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        let times = store
-            .get("retry.times")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(2) as i32;
-        return (enabled, times);
-    }
-    (true, 2)
+pub fn get_retry_settings(settings: &SettingsStore) -> (bool, i32) {
+    let enabled = settings.get_bool("retry.enabled", true);
+    let times = settings.get_u64("retry.times", 2) as i32;
+    (enabled, times)
 }

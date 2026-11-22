@@ -1,10 +1,15 @@
-use crate::db::models::Channel;
+use crate::core::attempt::{AttemptFailure, AttemptResult, FailureClass};
+use crate::core::route_plan::{plan_internal_embeddings, EndpointKind, RouteCandidate};
 use crate::db::repository::Repository;
+use crate::endpoint_executor::driver::{
+    dispatch_channel_with_key_failover, record_channel_mode_outcome,
+};
+use crate::security::gate::{audit_envelope, DownstreamProtocol, RequestEnvelope};
+use rand::SeedableRng;
+use std::collections::HashMap;
 
-/// Call WaLiAPI's internal channel dispatch to get embeddings.
-/// Reuses existing channel config (base_url, api_key, model_mapping) but
-/// sends requests directly to the /embeddings endpoint instead of /chat/completions,
-/// because all adaptors hard-code the chat completions URL.
+/// 受信任的内部知识库身份调用 Embedding，不创建或借用外部 API Key。
+/// 与外部网关复用模型/端点路由及执行器；外部请求的权限、额度和审计仍由网关处理。
 pub async fn embed(
     texts: &[String],
     model: &str,
@@ -13,156 +18,191 @@ pub async fn embed(
     if texts.is_empty() {
         return Ok(vec![]);
     }
-
-    // Get enabled channels
-    let channels = repo
-        .get_enabled_channels()
-        .await
-        .map_err(|e| format!("Failed to get channels: {}", e))?;
-
-    // Select channels that support this model (same logic as dispatcher)
-    let selected = Dispatcher::select_channels(&channels, model);
-
-    let candidates = if selected.is_empty() {
-        // Fallback: try all enabled channels
-        channels.clone()
-    } else {
-        selected
-    };
-
-    for channel in &candidates {
-        match try_embed_with_channel(texts, model, channel).await {
-            Ok(embeddings) => {
-                // Log success and validate dimensions
-                if !embeddings.is_empty() {
-                    tracing::info!(
-                        "Embedding success: channel={}, model={}, texts={}, dim={}",
-                        channel.name,
-                        model,
-                        texts.len(),
-                        embeddings[0].len()
-                    );
-                }
-                return Ok(embeddings);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Embedding failed on channel {} (model={}): {} — trying next channel",
-                    channel.name,
-                    model,
-                    e
-                );
-                continue;
-            }
-        }
-    }
-
-    Err(format!(
-        "All channels failed for embedding model: {}. Make sure at least one channel supports embeddings.",
-        model
-    ))
-}
-
-async fn try_embed_with_channel(
-    texts: &[String],
-    model: &str,
-    channel: &Channel,
-) -> Result<Vec<Vec<f32>>, String> {
-    let base_url = channel.base_url.trim_end_matches('/');
-
-    // Apply model mapping if configured
-    let actual_model = apply_model_mapping(model, &channel.model_mapping);
-
-    let url = format!("{}/embeddings", base_url);
+    // 查询和文档统一修复 PDF 部首字形，覆盖 REST、MCP、管理命令入口。
+    let texts: Vec<String> = texts
+        .iter()
+        .map(|t| super::text::normalize_radicals(t))
+        .collect();
     let body = serde_json::json!({
-        "model": actual_model,
+        "model": model,
         "input": texts,
         "encoding_format": "float"
     });
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", channel.api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
+    let channels = repo
+        .get_enabled_channels_for_mode(
+            EndpointKind::Embeddings.as_str(),
+            false,
+            &crate::utils::time::now_iso(),
+        )
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "HTTP {}: {}",
-            status,
-            text.chars().take(300).collect::<String>()
-        ));
-    }
-
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Parse response failed: {}", e))?;
-
-    let data = json
-        .get("data")
-        .and_then(|d| d.as_array())
-        .ok_or("Invalid embedding response: missing data array")?;
-
-    let embeddings: Vec<Vec<f32>> = data
+        .map_err(|_| "读取 Embedding 渠道失败".to_string())?;
+    let plan = plan_internal_embeddings(
+        model,
+        &channels,
+        &body,
+        &mut rand::rngs::StdRng::from_os_rng(),
+    )
+    .map_err(|error| match error {
+        crate::core::route_plan::PlanError::NoEndpointSupported(..) => format!(
+            "Embedding 渠道未声明 embeddings 能力 (HTTP 501)，请检查模型 {model} 的渠道端点配置"
+        ),
+        _ => format!(
+            "Embedding 路由不可用 (HTTP {}): {}",
+            error.http_status(),
+            error.message()
+        ),
+    })?;
+    let lookup: HashMap<_, _> = plan
+        .groups
         .iter()
-        .filter_map(|item| {
-            item.get("embedding").and_then(|e| e.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_f64().map(|f| f as f32))
-                    .collect()
-            })
+        .flat_map(|group| &group.candidates)
+        .map(|candidate| {
+            (
+                candidate.candidate.id().to_string(),
+                candidate.candidate.clone(),
+            )
         })
         .collect();
-
-    if embeddings.len() != texts.len() {
+    // 内部文档处理没有外部 Key 的安全策略；使用 gate 构造规范 envelope，
+    // 保留原有内部审计语义，不把内部请求伪装成经过外部权限校验的请求。
+    let audited = audit_envelope(
+        RequestEnvelope {
+            downstream_protocol: DownstreamProtocol::Embeddings,
+            endpoint: "internal://knowledge/embeddings".to_string(),
+            original_json: body,
+            safe_forward_headers: vec![],
+            query: None,
+            model: model.to_string(),
+            stream: false,
+            trace_id: Some(format!("kb-internal_{}", uuid::Uuid::new_v4())),
+        },
+        &crate::security::SecuritySettings::default(),
+        None,
+        vec![],
+    )
+    .map_err(|_| "无法构造内部 Embedding 请求".to_string())?;
+    let expected_count = texts.len();
+    let execution = crate::core::plan_executor::execute_plan(
+        plan,
+        &audited,
+        rand::rngs::StdRng::from_os_rng(),
+        |attempt| {
+            let candidate = lookup.get(&attempt.channel_id).cloned();
+            let attempt = attempt.clone();
+            async move {
+                let Some(RouteCandidate::Channel { channel, identity }) = candidate else {
+                    return AttemptResult::Failure(AttemptFailure {
+                        failure_class: FailureClass::UpstreamProtocolError,
+                        message: "内部 Embedding 渠道不存在".to_string(),
+                        status_code: Some(502),
+                        retry_after: None,
+                    });
+                };
+                let mut result = dispatch_channel_with_key_failover(
+                    EndpointKind::Embeddings,
+                    &attempt,
+                    &channel,
+                    &identity,
+                    &[],
+                    None,
+                    repo,
+                )
+                .await;
+                // 只有整批向量有效才算成功；坏响应允许按网关预算换下一渠道。
+                if let AttemptResult::Success(success) = &result {
+                    if let Err(message) = parse_embedding_response(&success.body, expected_count) {
+                        result = AttemptResult::Failure(AttemptFailure {
+                            failure_class: FailureClass::UpstreamProtocolError,
+                            message,
+                            status_code: Some(502),
+                            retry_after: None,
+                        });
+                    }
+                }
+                record_channel_mode_outcome(
+                    repo,
+                    &channel.id,
+                    EndpointKind::Embeddings.as_str(),
+                    false,
+                    &result,
+                )
+                .await;
+                result
+            }
+        },
+    )
+    .await;
+    if execution.last_failure.is_some() || !(200..300).contains(&execution.status) {
+        // 上游错误正文可能包含凭据或用户文本，只反馈稳定类别与状态。
         return Err(format!(
-            "Embedding count mismatch: expected {}, got {}",
-            texts.len(),
-            embeddings.len()
+            "Embedding 请求失败 (HTTP {}, {})，请检查渠道配置或稍后重试",
+            execution.status,
+            execution
+                .last_failure
+                .as_ref()
+                .map(|failure| failure.failure_class.as_str())
+                .unwrap_or("upstream_error")
         ));
     }
-
-    // Validate all embeddings have same dimension
-    if !embeddings.is_empty() {
-        let dim = embeddings[0].len();
-        for (i, emb) in embeddings.iter().enumerate().skip(1) {
-            if emb.len() != dim {
-                return Err(format!(
-                    "Inconsistent embedding dimensions: item 0 has dim {}, item {} has dim {}",
-                    dim,
-                    i,
-                    emb.len()
-                ));
-            }
-        }
-        tracing::debug!(
-            "Embeddings validated: {} items, dim {}",
-            embeddings.len(),
-            dim
-        );
-    }
-
+    let embeddings = parse_embedding_response(&execution.body, expected_count)?;
+    tracing::info!(
+        caller = "knowledge_internal",
+        channel_id = execution.channel_id.as_deref().unwrap_or_default(),
+        model,
+        texts = expected_count,
+        dim = embeddings[0].len(),
+        "Embedding success"
+    );
     Ok(embeddings)
 }
 
-fn apply_model_mapping(model: &str, mapping_json: &str) -> String {
-    if mapping_json.is_empty() || mapping_json == "{}" {
-        return model.to_string();
+/// 按响应索引还原输入顺序，整批校验后才允许调用方写入文档切片。
+/// 兼容完全不提供 index 的旧渠道；一旦提供索引就必须完整且唯一。
+pub(crate) fn parse_embedding_response(
+    response: &serde_json::Value,
+    expected_count: usize,
+) -> Result<Vec<Vec<f32>>, String> {
+    let data = response
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("Invalid embedding response: missing data array")?;
+    if data.len() != expected_count {
+        return Err(format!(
+            "Embedding count mismatch: expected {}, got {}",
+            expected_count,
+            data.len()
+        ));
     }
-    let mapping: serde_json::Value = serde_json::from_str(mapping_json).unwrap_or_default();
-    if let Some(mapped) = mapping.get(model).and_then(|m| m.as_str()) {
-        return mapped.to_string();
-    }
-    model.to_string()
-}
 
-// Re-export Dispatcher for select_channels
-use crate::core::dispatcher::Dispatcher;
+    let indexed = data.iter().any(|item| item.get("index").is_some());
+    let mut embeddings = vec![Vec::new(); expected_count];
+    let mut dimension = None;
+    for (position, item) in data.iter().enumerate() {
+        let index = if indexed {
+            item.get("index")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+                .filter(|&index| index < expected_count)
+                .ok_or_else(|| format!("Invalid embedding index at item {position}"))?
+        } else {
+            position
+        };
+        if !embeddings[index].is_empty() {
+            return Err(format!("Duplicate embedding index: {index}"));
+        }
+        let embedding: Vec<f32> =
+            serde_json::from_value(item.get("embedding").cloned().unwrap_or_default())
+                .map_err(|_| format!("Embedding item {position} is not a float vector"))?;
+        if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
+            return Err(format!("Invalid embedding vector at item {position}"));
+        }
+        if dimension.is_some_and(|dim| dim != embedding.len()) {
+            return Err(format!(
+                "Inconsistent embedding dimensions at item {position}"
+            ));
+        }
+        dimension = Some(embedding.len());
+        embeddings[index] = embedding;
+    }
+    Ok(embeddings)
+}

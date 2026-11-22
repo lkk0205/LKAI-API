@@ -1,195 +1,261 @@
-//! Versioned, directed codec registry (T00 decision 8).
-//!
-//! A codec is a directed implementation of `(downstream_endpoint,
-//! upstream_endpoint, version)` returning `Result<Converted, UnsupportedFeatures>`.
-//! This first version registers only the four directions that pair
-//! `chat_completions` (OpenAI Chat Completions) and `messages` (Anthropic
-//! Messages) at version `chat_to_messages_v1` / `messages_to_chat_v1`.
-//!
-//! A request for a direction that has no codec is an error; the gateway never
-//! passes a raw payload through when no codec exists.
+//! Directed codec strategy registry.
 
-use super::error::{CodecError, UnsupportedFeatures};
+use super::direction::CodecDirection;
+use super::error::{CodecError, DecodeError, FeatureKind, PrepareError, UnsupportedFeatures};
+use super::identity::{CHAT_IDENTITY, MESSAGES_IDENTITY, RESPONSES_IDENTITY};
+use super::ports::{
+    DecodedResponse, NonStreamDecoder as FactoryNonStreamDecoder,
+    StreamDecoder as FactoryStreamDecoder,
+};
 use super::report::{ConversionContext, ConversionReport};
-use super::{chat, messages};
+use super::types::{CodecId, PreparedCodec, PreparedConversion, Protocol};
+use super::{chat, directions, gemini, messages, responses_codec};
+use serde_json::Value;
 
-/// Downstream endpoint protocol kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Downstream {
-    ChatCompletions,
-    Messages,
+type EncodeFn = fn(&Value, &str) -> Result<(Value, ConversionContext), PrepareError>;
+type NonStreamDecoderFn = fn(&ConversionContext) -> Box<dyn FactoryNonStreamDecoder + Send + Sync>;
+type StreamDecoderFn = fn(&ConversionContext) -> Box<dyn FactoryStreamDecoder + Send + Sync>;
+
+struct FnDirection {
+    id: CodecId,
+    downstream: Protocol,
+    upstream: Protocol,
+    encode: EncodeFn,
+    non_stream: NonStreamDecoderFn,
+    streaming: StreamDecoderFn,
 }
 
-/// Upstream endpoint protocol kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Upstream {
-    ChatCompletions,
-    Messages,
-}
-
-/// A codec version identifier for registry lookup.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Version(String);
-
-impl Version {
-    pub fn v1_0() -> Self {
-        Self("v1".to_string())
+impl CodecDirection for FnDirection {
+    fn id(&self) -> CodecId {
+        self.id
     }
-    pub fn as_str(&self) -> &str {
-        &self.0
+    fn downstream(&self) -> Protocol {
+        self.downstream
+    }
+    fn upstream(&self) -> Protocol {
+        self.upstream
+    }
+
+    fn encode_request(
+        &self,
+        request: &Value,
+        mapped_model: &str,
+    ) -> Result<(Value, super::report::ConversionContext), PrepareError> {
+        (self.encode)(request, mapped_model)
+    }
+
+    fn new_response_decoder(
+        &self,
+        context: &super::report::ConversionContext,
+    ) -> Box<dyn FactoryNonStreamDecoder + Send + Sync> {
+        (self.non_stream)(context)
+    }
+
+    fn new_stream_response_decoder(
+        &self,
+        context: &super::report::ConversionContext,
+    ) -> Box<dyn FactoryStreamDecoder + Send + Sync> {
+        (self.streaming)(context)
     }
 }
 
-/// Result of preparing a request through a codec direction, including the
-/// encoders/decoders the gateway needs.
-pub struct PreparedConversion {
-    /// Encoded upstream request body.
-    pub encoded_request: serde_json::Value,
-    /// Per-request context (request id, upstream model, stream).
-    pub context: ConversionContext,
-    /// What the codec rejected/normalized.
-    pub report: ConversionReport,
-    /// Non-stream response decoder for this direction.
-    pub non_stream: Box<dyn NonStreamDecoder + Send + Sync>,
-    /// Streaming response decoder for this direction.
-    pub streaming: Box<dyn StreamDecoder + Send + Sync>,
+static CHAT_TO_MESSAGES: FnDirection = FnDirection {
+    id: CodecId::ChatToMessagesV1,
+    downstream: Protocol::Chat,
+    upstream: Protocol::Messages,
+    encode: chat::encode_chat_to_messages,
+    // Upstream is Messages, so responses travel Messages -> Chat.
+    non_stream: messages::NonStreamResponseDecoder::boxed,
+    streaming: messages::MessagesStreamDecoder::boxed,
+};
+static MESSAGES_TO_CHAT: FnDirection = FnDirection {
+    id: CodecId::MessagesToChatV1,
+    downstream: Protocol::Messages,
+    upstream: Protocol::Chat,
+    encode: messages::encode_messages_to_chat,
+    // Upstream is Chat, so responses travel Chat -> Messages.
+    non_stream: chat::NonStreamResponseDecoder::boxed,
+    streaming: chat::ChatStreamDecoder::boxed,
+};
+static CHAT_TO_RESPONSES: FnDirection = FnDirection {
+    id: CodecId::ChatToResponsesV1,
+    downstream: Protocol::Chat,
+    upstream: Protocol::Responses,
+    encode: responses_codec::encode_chat_to_responses,
+    non_stream: responses_codec::ResponsesNonStreamDecoder::boxed,
+    streaming: responses_codec::ResponsesStreamDecoder::boxed,
+};
+static RESPONSES_TO_CHAT: FnDirection = FnDirection {
+    id: CodecId::ResponsesToChatV1,
+    downstream: Protocol::Responses,
+    upstream: Protocol::Chat,
+    encode: encode_responses_to_chat,
+    non_stream: ResponsesToChatNonStreamDecoder::boxed,
+    streaming: responses_codec::ChatToResponsesStreamDecoder::boxed,
+};
+
+/// Transitional single-hop Responses -> Chat request wrapper. The upstream
+/// response returns through the complementary Chat -> Responses decoders.
+fn encode_responses_to_chat(
+    request: &Value,
+    model: &str,
+) -> Result<(Value, super::report::ConversionContext), PrepareError> {
+    let mut encoded = crate::protocol::responses_to_openai(request)?;
+    encoded
+        .as_object_mut()
+        .ok_or_else(|| {
+            UnsupportedFeatures::single(
+                FeatureKind::UnsupportedField,
+                "/",
+                "Responses to Chat encoder produced a non-object request",
+            )
+        })?
+        .insert("model".to_owned(), Value::String(model.to_owned()));
+    let request_id = request
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("resp_{}", uuid::Uuid::new_v4().simple()));
+    let stream = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut context = super::report::ConversionContext::new(request_id, model, stream);
+    for field in [
+        "parallel_tool_calls",
+        "store",
+        "include",
+        "prompt_cache_key",
+        "prompt_cache_options",
+        "client_metadata",
+    ] {
+        if request.get(field).is_some() {
+            context.normalized.push(format!("/{field}"));
+        }
+    }
+    Ok((encoded, context))
 }
 
-/// Non-stream response decoder for a given direction.
-pub trait NonStreamDecoder: Send + Sync {
-    /// Decode an upstream non-stream response body into the downstream
-    /// protocol.  The body is supplied by the caller.
-    fn decode(&self, body: &serde_json::Value) -> Result<serde_json::Value, UnsupportedFeatures>;
+struct ResponsesToChatNonStreamDecoder {
+    context: super::report::ConversionContext,
 }
 
-/// Streaming response decoder for a given direction.
-pub trait StreamDecoder: Send + Sync {
-    /// Feed an arbitrary byte chunk (SSE bytes).  Returns downstream-protocol
-    /// event strings produced so far.  A first-frame validation failure is
-    /// returned as an error for pre-commit failover.
-    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures>;
-    /// Flush end-of-stream and return the exactly-once final sequence.
-    fn finish(&mut self) -> Result<Vec<String>, UnsupportedFeatures>;
-    /// The token usage observed so far, if the protocol reports any.
-    fn usage(&self) -> Option<super::report::Usage>;
+impl ResponsesToChatNonStreamDecoder {
+    fn boxed(
+        context: &super::report::ConversionContext,
+    ) -> Box<dyn FactoryNonStreamDecoder + Send + Sync> {
+        Box::new(Self {
+            context: context.clone(),
+        })
+    }
 }
 
-/// A registered direction implementation.
-struct Direction {
-    encode: fn(
-        &serde_json::Value,
-        &str,
-    ) -> Result<(serde_json::Value, ConversionContext), UnsupportedFeatures>,
-    non_stream: fn(&ConversionContext) -> Box<dyn NonStreamDecoder + Send + Sync>,
-    streaming: fn(&ConversionContext) -> Box<dyn StreamDecoder + Send + Sync>,
+impl FactoryNonStreamDecoder for ResponsesToChatNonStreamDecoder {
+    fn decode(&self, body: &Value) -> Result<DecodedResponse, DecodeError> {
+        // `openai_to_responses` is the established response representation
+        // helper. Validate the provider's Chat completion envelope first so a
+        // malformed upstream body cannot become a synthetic Responses success.
+        if body.pointer("/choices/0/message").is_none() {
+            return Err(DecodeError::new(
+                "/choices/0/message",
+                "Chat response missing choices[0].message",
+            ));
+        }
+        Ok(DecodedResponse {
+            body: crate::protocol::openai_to_responses(body, &self.context.upstream_model),
+            usage: super::identity::parse_usage(Protocol::Chat, body),
+        })
+    }
 }
 
-/// Simple registry over the two endpoints.  In this first version exactly one
-/// implementation is registered per supported direction; an unregistered
-/// direction is an error (never a raw passthrough).
+/// Lookup and prepare codec strategies. Registered strategies are stateless;
+/// the returned plan owns only request context and creates fresh decoder state.
 pub struct CodecRegistry;
 
 impl CodecRegistry {
-    /// The codec version this registry speaks.
-    pub fn version() -> Version {
-        Version::v1_0()
-    }
-
     fn direction(
-        downstream: Downstream,
-        upstream: Upstream,
-    ) -> Result<&'static Direction, CodecError> {
-        static V1: Direction = Direction {
-            encode: chat::encode_chat_to_messages,
-            non_stream: chat::NonStreamResponseDecoder::boxed,
-            streaming: chat::ChatStreamDecoder::boxed,
+        downstream: Protocol,
+        upstream: Protocol,
+    ) -> Result<&'static dyn CodecDirection, CodecError> {
+        let strategy: &'static dyn CodecDirection = match (downstream, upstream) {
+            (Protocol::Chat, Protocol::Chat) => &CHAT_IDENTITY,
+            (Protocol::Messages, Protocol::Messages) => &MESSAGES_IDENTITY,
+            (Protocol::Responses, Protocol::Responses) => &RESPONSES_IDENTITY,
+            (Protocol::Chat, Protocol::Messages) => &CHAT_TO_MESSAGES,
+            (Protocol::Messages, Protocol::Chat) => &MESSAGES_TO_CHAT,
+            (Protocol::Chat, Protocol::Responses) => &CHAT_TO_RESPONSES,
+            (Protocol::Responses, Protocol::Chat) => &RESPONSES_TO_CHAT,
+            (Protocol::Messages, Protocol::Responses) => &directions::MESSAGES_TO_RESPONSES_V2,
+            (Protocol::Responses, Protocol::Messages) => &directions::RESPONSES_TO_MESSAGES_V2,
+            (Protocol::Chat, Protocol::Gemini) => &gemini::CHAT_TO_GEMINI,
+            (Protocol::Messages, Protocol::Gemini) => &gemini::MESSAGES_TO_GEMINI,
+            (Protocol::Responses, Protocol::Gemini) => &gemini::RESPONSES_TO_GEMINI,
+            (Protocol::Gemini, _) => {
+                return Err(CodecError::new(
+                    "Gemini is an upstream-only protocol and cannot be used downstream",
+                ))
+            }
         };
-        static V2: Direction = Direction {
-            encode: messages::encode_messages_to_chat,
-            non_stream: messages::NonStreamResponseDecoder::boxed,
-            streaming: messages::MessagesStreamDecoder::boxed,
-        };
-        match (downstream, upstream) {
-            (Downstream::ChatCompletions, Upstream::Messages) => Ok(&V1),
-            (Downstream::Messages, Upstream::ChatCompletions) => Ok(&V2),
-            _ => Err(CodecError::new(format!(
-                "no codec registered for downstream {:?} -> upstream {:?}",
-                downstream, upstream
-            ))),
-        }
+        debug_assert_eq!(strategy.downstream(), downstream);
+        debug_assert_eq!(strategy.upstream(), upstream);
+        Ok(strategy)
     }
 
-    /// Prepare a directed conversion: encode the downstream request into the
-    /// upstream protocol (running full feature validation, which rejects
-    /// unsupported features before any upstream access) and wire the matching
-    /// response decoders.  `model` is the mapped upstream model passed in by
-    /// the caller — the codec never re-maps models.  Returns a `CodecError`
-    /// when no codec exists for the path (the gateway must then fail closed,
-    /// never pass through raw).
-    pub fn prepare(
-        downstream: Downstream,
-        upstream: Upstream,
-        _version: &Version,
+    /// Prepare a protocol-pair conversion using the current matrix strategy.
+    ///
+    /// This factory-native API makes both protocol sides explicit. The
+    /// five-argument [`Self::prepare`] remains available for legacy callers.
+    pub fn prepare_pair(
+        downstream: Protocol,
+        upstream: Protocol,
         model: &str,
-        request: &serde_json::Value,
-    ) -> Result<PreparedConversion, UnsupportedFeatures> {
-        let dir = Self::direction(downstream, upstream).map_err(|e| {
-            UnsupportedFeatures::single(
-                super::error::FeatureKind::UnsupportedField,
-                "/",
-                e.to_string(),
-            )
+        request: &Value,
+    ) -> Result<PreparedConversion, PrepareError> {
+        let strategy = Self::direction(downstream, upstream).map_err(|error| {
+            UnsupportedFeatures::single(FeatureKind::UnsupportedField, "/", error.to_string())
         })?;
-        let (encoded_request, context) = (dir.encode)(request, model)?;
-        // The encoder records fail-open drops/transforms on the context; fold
-        // them into the report so callers can observe what was normalized.
-        let report = ConversionReport::new(vec![], context.normalized.clone());
-        let non_stream = (dir.non_stream)(&context);
-        let streaming = (dir.streaming)(&context);
+        let (encoded_request, context) = strategy.encode_request(request, model)?;
+        let codec = PreparedCodec::new(strategy, context.clone());
+        let report = ConversionReport::for_codec(codec.id(), vec![], context.normalized.clone());
         Ok(PreparedConversion {
             encoded_request,
-            context,
             report,
-            non_stream,
-            streaming,
+            codec,
         })
     }
 
-    /// Convenience: prepare a Chat → Messages conversion (`chat_to_messages_v1`).
     pub fn chat_to_messages(
         model: &str,
-        request: &serde_json::Value,
-    ) -> Result<PreparedConversion, UnsupportedFeatures> {
-        Self::prepare(
-            Downstream::ChatCompletions,
-            Upstream::Messages,
-            &Self::version(),
-            model,
-            request,
-        )
+        request: &Value,
+    ) -> Result<PreparedConversion, PrepareError> {
+        Self::prepare_pair(Protocol::Chat, Protocol::Messages, model, request)
     }
 
-    /// Convenience: prepare a Messages → Chat conversion (`messages_to_chat_v1`).
     pub fn messages_to_chat(
         model: &str,
-        request: &serde_json::Value,
-    ) -> Result<PreparedConversion, UnsupportedFeatures> {
-        Self::prepare(
-            Downstream::Messages,
-            Upstream::ChatCompletions,
-            &Self::version(),
-            model,
-            request,
-        )
+        request: &Value,
+    ) -> Result<PreparedConversion, PrepareError> {
+        Self::prepare_pair(Protocol::Messages, Protocol::Chat, model, request)
     }
-}
 
-impl std::fmt::Debug for PreparedConversion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedConversion")
-            .field("encoded_request", &self.encoded_request)
-            .field("context", &self.context)
-            .field("report", &self.report)
-            .finish_non_exhaustive()
+    pub fn chat_to_responses(
+        model: &str,
+        request: &Value,
+    ) -> Result<PreparedConversion, PrepareError> {
+        Self::prepare_pair(Protocol::Chat, Protocol::Responses, model, request)
+    }
+
+    pub fn messages_to_responses(
+        model: &str,
+        request: &Value,
+    ) -> Result<PreparedConversion, PrepareError> {
+        Self::prepare_pair(Protocol::Messages, Protocol::Responses, model, request)
+    }
+
+    pub fn responses_to_messages(
+        model: &str,
+        request: &Value,
+    ) -> Result<PreparedConversion, PrepareError> {
+        Self::prepare_pair(Protocol::Responses, Protocol::Messages, model, request)
     }
 }

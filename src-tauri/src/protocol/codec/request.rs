@@ -36,12 +36,41 @@ pub fn finish(out: Vec<super::error::RejectedField>) -> Result<(), UnsupportedFe
     }
 }
 
+/// Validate a protocol field whose wire shape is an array of strings.
+///
+/// Checking only the container is insufficient: forwarding a number/object in
+/// a stop sequence makes the upstream reject the whole request much later.
+pub fn require_string_array(
+    value: &Value,
+    pointer: &str,
+    field: &str,
+) -> Result<(), UnsupportedFeatures> {
+    let Some(items) = value.as_array() else {
+        return Err(UnsupportedFeatures::single(
+            FeatureKind::UnsupportedField,
+            pointer,
+            format!("{field} must be an array of strings"),
+        ));
+    };
+    for (index, item) in items.iter().enumerate() {
+        if !item.is_string() {
+            return Err(UnsupportedFeatures::single(
+                FeatureKind::UnsupportedField,
+                format!("{pointer}/{index}"),
+                format!("{field} array elements must be strings"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a Chat Completions `tool_choice` field (OpenAI shape) and produce
 /// the Anthropic-equivalent Json value.  Only explicitly mappable forms are
 /// accepted:
 ///   - `"auto"`/`"none"` → string passthrough
 ///   - `"required"` → `{"type":"any"}`
 ///   - `{"type":"function","function":{"name":...}}` → `{"type":"tool","name":...}`
+///
 /// Anything else (including a named-function `"auto"` string, `"disable_parallel_tool_calls"`,
 /// `parallel_tool_calls` interplay, or an unknown object) is rejected.
 pub fn chat_tool_choice_to_anthropic(
@@ -287,18 +316,4 @@ pub fn anthropic_image_to_chat(block: &Value, pointer: &str) -> Result<Value, Un
             "image source missing type",
         )),
     }
-}
-
-/// True when a value is present and not the JSON `null`.
-pub fn present(v: &Option<&Value>) -> bool {
-    match v {
-        None => false,
-        Some(Value::Null) => false,
-        Some(_) => true,
-    }
-}
-
-/// Read an optional string field without allocating when absent.
-pub fn opt_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
-    v.get(key).and_then(Value::as_str)
 }

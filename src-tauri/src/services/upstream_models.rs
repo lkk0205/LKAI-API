@@ -71,19 +71,30 @@ pub async fn fetch_upstream_models(
         headers.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))?;
+    // 出站代理：草稿渠道的 config.proxy（global/direct/custom）与全局设置一致解析。
+    // 未填写 proxy 时也必须回退到全局代理；否则模型同步会意外直连，
+    // 在本机只能通过代理访问上游时会让所有同步请求失败。
+    let proxy_url = crate::adaptor::ProxySetting::from_extra(
+        input.config.as_ref().unwrap_or(&serde_json::Value::Null),
+    )
+    .map(|p| p.resolve())
+    .unwrap_or_else(crate::adaptor::global_proxy_url);
+    let client = crate::adaptor::with_proxy(
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(timeout_secs.max(1))),
+        proxy_url.as_deref(),
+    )
+    .build()
+    .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))?;
 
     let mut req = client.get(&url).header("content-type", "application/json");
     for (k, v) in &headers {
         req = req.header(k, v);
     }
 
-    let resp = req.send().await.map_err(|e| {
-        format!("连接上游失败（{url}）：{e}（不会覆盖已有模型列表）")
-    })?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("连接上游失败（{url}）：{e}（不会覆盖已有模型列表）"))?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         let body = resp.text().await.unwrap_or_default();
@@ -92,9 +103,10 @@ pub async fn fetch_upstream_models(
             concise_error(&body)
         ));
     }
-    let body: Value = resp.json().await.map_err(|e| {
-        format!("上游返回无法解析的 JSON（{url}）：{e}（不会覆盖已有模型列表）")
-    })?;
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("上游返回无法解析的 JSON（{url}）：{e}（不会覆盖已有模型列表）"))?;
 
     let models = parse(&body);
     if models.is_empty() {
@@ -175,6 +187,9 @@ mod tests {
 
     fn draft(protocol: &str, base_url: &str) -> DraftChannelTestInput {
         DraftChannelTestInput {
+            model_mapping_disabled: None,
+            // v0.3.3 为该结构体新增了自定义请求头字段，测试构造点需同步补齐。
+            request_headers: None,
             id: None,
             name: "t".to_string(),
             channel_type: match protocol {
@@ -186,6 +201,7 @@ mod tests {
             api_key: "k".to_string(),
             clear_api_key: None,
             models: vec![],
+            test_models: None,
             priority: None,
             weight: None,
             config: Some(json!({})),
@@ -243,7 +259,10 @@ mod tests {
         Mock { addr, received }
     }
 
-    async fn write_all_response(socket: &mut tokio::net::TcpStream, body: &[u8]) -> std::io::Result<()> {
+    async fn write_all_response(
+        socket: &mut tokio::net::TcpStream,
+        body: &[u8],
+    ) -> std::io::Result<()> {
         let head = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -255,7 +274,8 @@ mod tests {
 
     #[tokio::test]
     async fn openai_parses_data_ids_and_bearer() {
-        let m = start_mock(json!({"data": [{"id": "oc/gpt-5"}, {"id": "oc/deepseek-v4-flash"}]})).await;
+        let m =
+            start_mock(json!({"data": [{"id": "oc/gpt-5"}, {"id": "oc/deepseek-v4-flash"}]})).await;
         let input = draft("openai", &m.addr);
         let r = fetch_upstream_models(&input, "secret", 5).await.unwrap();
         assert_eq!(r.models, vec!["oc/gpt-5", "oc/deepseek-v4-flash"]);
@@ -267,21 +287,24 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_uses_models_path_and_x_api_key() {
-        // main 分支约定：Anthropic Base 自带 /v1，path 模板是 /models；
-        // 这里 mock base 是根，因此请求应为 GET /models（不再是 /v1/models）。
+        // #147 起的约定：anthropic native base 会自动补齐缺失的 /v1（修复
+        // 智谱等渠道少 /v1 导致的 404），path 模板仍是 /models；mock base
+        // 是根地址，因此请求应为 GET /v1/models。已带 /v1 的 base 不会被
+        // 二次追加。
         let m = start_mock(json!({"data": [{"id": "claude-sonnet-5"}]})).await;
         let input = draft("anthropic", &m.addr);
         let r = fetch_upstream_models(&input, "k2", 5).await.unwrap();
         assert_eq!(r.models, vec!["claude-sonnet-5"]);
         assert_eq!(r.protocol, "anthropic");
         let reqs = m.received.lock().await.clone();
-        assert!(reqs[0].0.contains("GET /models"));
+        assert!(reqs[0].0.contains("GET /v1/models"));
         assert!(reqs[0].2.contains("k2"), "should send x-api-key header");
     }
 
     #[tokio::test]
     async fn ollama_parses_tags_names() {
-        let m = start_mock(json!({"models": [{"name": "qwen3:32b"}, {"name": "llama3.3:70b"}]})).await;
+        let m =
+            start_mock(json!({"models": [{"name": "qwen3:32b"}, {"name": "llama3.3:70b"}]})).await;
         let input = draft("ollama", &m.addr);
         let r = fetch_upstream_models(&input, "", 5).await.unwrap();
         assert_eq!(r.models, vec!["qwen3:32b", "llama3.3:70b"]);

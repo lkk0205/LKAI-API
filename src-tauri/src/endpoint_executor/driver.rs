@@ -15,55 +15,464 @@
 //! emit a protocol-representable error, never a retry.
 
 use crate::core::attempt::{
-    build_prepared_attempt, AttemptFailure, AttemptFlow, FailureClass, FlowStep, PreparedAttempt,
+    build_prepared_attempt, AttemptFailure, AttemptFlow, FailureClass, FlowStep,
 };
 use crate::core::channel_identity::{resolve_channel_identity, ChannelIdentityRow};
-use crate::core::route_plan::RoutePlan;
+use crate::core::route_plan::{EndpointKind, RouteCandidate, RoutePlan};
 use crate::db::models::{ApiKey, Channel, RequestLog};
 use crate::db::repository::Repository;
-use crate::endpoint_executor::sse::{decoder_for, SseMode, StreamPumpCore};
+use crate::endpoint_executor::sse::StreamPumpCore;
 use crate::endpoint_executor::{
-    dispatch_executor, dispatch_stream_executor, StreamAttemptResult, UpstreamStream,
+    dispatch_auth_account_executor, dispatch_auth_account_stream_executor, dispatch_executor,
+    dispatch_stream_executor, next_upstream_item, StreamAttemptResult, UpstreamItem,
+    UpstreamStream,
 };
+use crate::security;
 use crate::security::gate::AuditedRequest;
+use crate::services::knowledge::budget::{self, BudgetElapsed};
 use crate::utils;
 use axum::body::Body;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use chrono::{self, DateTime, SecondsFormat, Utc};
 use futures_util::StreamExt;
+use rand::Rng;
 use rand::SeedableRng;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-/// Map an attempt to its streaming transform mode.
-///
-/// The label names the REQUEST encoding direction (`chat_to_messages_v1` =
-/// downstream Chat request encoded as an upstream Messages request), but the
-/// SSE mode names the RESPONSE decoding direction (what the upstream SSE must
-/// be transformed INTO for the downstream client).  The two are inverse, so the
-/// mapping is deliberately crossed:
-///   * `chat_to_messages_v1`  → upstream Messages SSE → downstream Chat SSE  (`MessagesToChat`)
-///   * `messages_to_chat_v1`  → upstream Chat SSE     → downstream Messages SSE (`ChatToMessages`)
-fn sse_mode_for(attempt: &PreparedAttempt) -> SseMode {
-    match attempt.codec_version.as_deref() {
-        Some("chat_to_messages_v1") => SseMode::MessagesToChat,
-        Some("messages_to_chat_v1") => SseMode::ChatToMessages,
-        Some("responses_via_chat_v1") => SseMode::ResponsesViaChat,
-        _ => SseMode::Native,
+/// Extract the client-requested reasoning effort from the ORIGINAL downstream
+/// request body, per downstream protocol:
+/// - Chat Completions: top-level `reasoning_effort` string.
+/// - Responses: `reasoning.effort` (fallback: top-level `reasoning_effort`).
+/// - Anthropic Messages: `thinking` config mapped to an effort level.
+/// Returns `None` when the client did not specify any reasoning preference.
+fn extract_reasoning_effort(audited: &AuditedRequest) -> Option<String> {
+    use crate::security::gate::DownstreamProtocol;
+    let body = &audited.envelope.original_json;
+    match audited.envelope.downstream_protocol {
+        DownstreamProtocol::ChatCompletions | DownstreamProtocol::Completions => body
+            .get("reasoning_effort")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        DownstreamProtocol::Responses => body
+            .get("reasoning")
+            .and_then(|r| r.get("effort"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                body.get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            }),
+        DownstreamProtocol::Messages => {
+            crate::protocol::codec::messages::anthropic_thinking_to_reasoning_effort(body)
+        }
+        _ => None,
     }
 }
 
-fn plan_error_response(status: u16, message: impl Into<String>) -> Response {
+/// Freeze the enabled credential slots for one request and order them by
+/// weighted sampling without replacement.  The returned `Channel` copies are
+/// intentionally request-local: credential values never enter PreparedAttempt,
+/// request logs, or tracing fields.
+/// The primary key participates only when enabled (config `api_key_enabled`,
+/// absent = enabled).  Returns an EMPTY vec when the channel has no enabled
+/// credential at all — the caller must skip / fail over the candidate.
+async fn channel_key_slots(channel: &Channel, repo: &Repository) -> Vec<Channel> {
+    let extra_keys = match repo.get_channel_api_keys(&channel.id).await {
+        Ok(keys) => keys
+            .into_iter()
+            .filter(|k| k.status == 1)
+            .collect::<Vec<_>>(),
+        // DB 读取失败：保守降级为「无额外 Key」，主 Key 开关仍然生效。
+        Err(_) => Vec::new(),
+    };
+    let primary_ok = !channel.api_key.is_empty() && channel.primary_key_enabled();
+    if extra_keys.is_empty() {
+        return if primary_ok { vec![channel.clone()] } else { Vec::new() };
+    }
+    // Build weighted pool: primary key (weight = channel.weight) + extras.
+    let mut pool: Vec<(String, i64)> = Vec::new();
+    if primary_ok {
+        pool.push((channel.api_key.clone(), channel.weight.max(1)));
+    }
+    for k in &extra_keys {
+        pool.push((k.api_key.clone(), k.weight.max(1)));
+    }
+    if pool.is_empty() {
+        // 主 Key 与全部额外 Key 均被停用（或 Key 全为空且主 Key 停用）：
+        // 渠道无可用凭证，返回空让调用方换下一个候选。
+        return Vec::new();
+    }
+    // Duplicate values are one credential slot, not two chances to send the
+    // same secret. Preserve the first configured weight for deterministic
+    // de-duplication without ever exposing the value outside this function.
+    let mut unique = Vec::new();
+    for item in pool {
+        if !unique.iter().any(|(key, _): &(String, i64)| key == &item.0) {
+            unique.push(item);
+        }
+    }
+    let mut slots = Vec::with_capacity(unique.len());
+    while !unique.is_empty() {
+        let chosen = crate::core::weighted_key::pick_weighted_key(&unique)
+            .unwrap_or_else(|| unique[0].0.clone());
+        if let Some(index) = unique.iter().position(|(key, _)| key == &chosen) {
+            unique.remove(index);
+        } else {
+            break;
+        }
+        let mut slot = channel.clone();
+        slot.api_key = chosen;
+        slots.push(slot);
+    }
+    slots
+}
+
+/// Try every frozen credential slot only while the failure is retryable.
+/// This makes capacity envelopes useful for a channel with multiple keys while
+/// retaining the route planner's terminal/auth boundaries.
+pub(crate) async fn dispatch_channel_with_key_failover(
+    endpoint: EndpointKind,
+    attempt: &crate::core::attempt::PreparedAttempt,
+    channel: &Channel,
+    identity: &crate::core::channel_identity::ChannelIdentity,
+    safe_headers: &[(String, String)],
+    query: Option<&str>,
+    repo: &Repository,
+) -> crate::core::attempt::AttemptResult {
+    let mut slots = channel_key_slots(channel, repo).await;
+    slots.truncate(3);
+    let slot_count = slots.len();
+    let mut last = None;
+    // Keep credential expansion bounded by the same conservative default as
+    // RoutePlan's per-group budget. The planner still owns cross-candidate and
+    // total-attempt limits; this cap prevents a channel with dozens of keys
+    // from bypassing those limits in one closure invocation.
+    for (slot_no, slot) in slots.into_iter().enumerate() {
+        if let Some(active) = budget::current() {
+            if let Err(elapsed) = active.check() {
+                return crate::core::attempt::AttemptResult::Failure(budget_failure(elapsed));
+            }
+        }
+        let mut trace =
+            PhysicalAttemptTrace::new(attempt, slot_no + 1, Some(identity.identity_revision));
+        let result = match budget::run(
+            Duration::from_secs(slot.timeout_secs.max(0) as u64),
+            Box::pin(dispatch_executor(
+                endpoint,
+                attempt,
+                &slot,
+                identity,
+                safe_headers,
+                query,
+            )),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(elapsed) => crate::core::attempt::AttemptResult::Failure(budget_failure(elapsed)),
+        };
+        trace.finish(&result);
+        match result {
+            crate::core::attempt::AttemptResult::Failure(ref failure)
+                if failure.failure_class == FailureClass::Retryable
+                    && !(budget::current().is_some()
+                        && (matches!(failure.status_code, Some(402 | 504 | 499))
+                            || local_failure_code(failure)
+                                .is_some_and(|code| code != "upstream_transport_failed"))) =>
+            {
+                // 可选 RAG 预算内的 Key 轮换也遵守 Retry-After；最后一个 Key
+                // 的等待由计划层负责，避免同一次失败等待两遍。
+                if budget::current().is_some() && slot_no + 1 < slot_count {
+                    if let Some(secs) = failure.retry_after {
+                        if let Err(elapsed) = budget::run(
+                            Duration::from_secs(120),
+                            tokio::time::sleep(Duration::from_secs(secs.min(120))),
+                        )
+                        .await
+                        {
+                            return crate::core::attempt::AttemptResult::Failure(budget_failure(
+                                elapsed,
+                            ));
+                        }
+                    }
+                }
+                last = Some(result)
+            }
+            _ => return result,
+        }
+    }
+    last.unwrap_or_else(|| {
+        crate::core::attempt::AttemptResult::Failure(AttemptFailure {
+            failure_class: FailureClass::Retryable,
+            message: "no enabled channel credential slot".to_string(),
+            status_code: Some(502),
+            retry_after: None,
+        })
+    })
+}
+
+pub(crate) fn budget_failure(elapsed: BudgetElapsed) -> AttemptFailure {
+    AttemptFailure {
+        failure_class: FailureClass::Retryable,
+        message: match elapsed {
+            BudgetElapsed::Deadline => "RAG absolute deadline exceeded",
+            BudgetElapsed::ChannelTimeout => "upstream channel timeout exceeded",
+            BudgetElapsed::Cancelled => "client cancelled RAG request",
+        }
+        .to_string(),
+        status_code: None,
+        retry_after: None,
+    }
+}
+
+/// None 表示尚未收到 HTTP 响应。只有本地构造函数可设置这些固定原因，
+/// 实际上游错误总携带 Some(status)，其自由正文不能冒充预算或传输失败。
+pub(crate) fn local_failure_code(failure: &AttemptFailure) -> Option<&'static str> {
+    if failure.status_code.is_some() {
+        return None;
+    }
+    match failure.message.as_str() {
+        "RAG absolute deadline exceeded" => Some("rag_deadline_exceeded"),
+        "upstream channel timeout exceeded" | "upstream transport timed out" => {
+            Some("model_timeout")
+        }
+        "client cancelled RAG request" => Some("client_cancelled"),
+        "upstream transport failed" => Some("upstream_transport_failed"),
+        _ => None,
+    }
+}
+
+fn failure_kind(failure: &AttemptFailure) -> &'static str {
+    if let Some(code) = local_failure_code(failure) {
+        return code;
+    }
+    match failure {
+        _ if failure.failure_class == FailureClass::ChannelAuthTerminal => "authentication_failed",
+        _ if failure.failure_class == FailureClass::UpstreamProtocolError => "protocol_failed",
+        _ if failure.status_code == Some(402)
+            || (failure.status_code == Some(429)
+                && failure.failure_class == FailureClass::CallerTerminal) =>
+        {
+            "quota_exceeded"
+        }
+        _ if failure.status_code == Some(429) => "rate_limited",
+        _ if failure.status_code == Some(504) => "upstream_timeout",
+        _ if failure.status_code.is_some_and(|status| status >= 500) => "upstream_http_5xx",
+        _ => "request_rejected",
+    }
+}
+
+pub(crate) fn local_failure_status(failure: &AttemptFailure) -> Option<u16> {
+    match local_failure_code(failure) {
+        Some("rag_deadline_exceeded" | "model_timeout") => Some(504),
+        Some("client_cancelled") => Some(499),
+        Some("upstream_transport_failed") => Some(502),
+        _ => None,
+    }
+}
+
+/// 一行对应一次真实出站尝试，只记录路由身份和 Key 序号，不记录凭据或正文。
+struct PhysicalAttemptTrace {
+    started: Instant,
+    channel_id: String,
+    upstream_model: String,
+    upstream_protocol: String,
+    identity_revision: Option<i64>,
+    attempt_no: usize,
+    key_slot: usize,
+    active: Option<budget::Budget>,
+    finished: bool,
+}
+
+impl PhysicalAttemptTrace {
+    fn new(
+        attempt: &crate::core::attempt::PreparedAttempt,
+        key_slot: usize,
+        identity_revision: Option<i64>,
+    ) -> Self {
+        let trace = Self {
+            started: Instant::now(),
+            channel_id: attempt.channel_id.clone(),
+            upstream_model: attempt.upstream_model.clone(),
+            upstream_protocol: attempt.upstream_protocol.clone(),
+            identity_revision,
+            attempt_no: attempt.attempt_no,
+            key_slot,
+            active: budget::current(),
+            finished: false,
+        };
+        tracing::info!(channel_id = %trace.channel_id, attempt_no = trace.attempt_no,
+            upstream_model = %trace.upstream_model, upstream_protocol = %trace.upstream_protocol, identity_revision = trace.identity_revision,
+            key_slot = trace.key_slot, request_id = trace.active.as_ref().map(|b| b.request_id()),
+            stage = trace.active.as_ref().map(|b| b.stage_name()), "上游物理尝试开始");
+        trace
+    }
+
+    fn finish(&mut self, result: &crate::core::attempt::AttemptResult) {
+        let (status, outcome) = match result {
+            crate::core::attempt::AttemptResult::Success(success) => (success.status, "success"),
+            crate::core::attempt::AttemptResult::Failure(failure) => (
+                local_failure_status(failure)
+                    .or(failure.status_code)
+                    .unwrap_or(502),
+                failure_kind(failure),
+            ),
+        };
+        self.record(status, outcome);
+        self.finished = true;
+    }
+
+    fn record(&self, status: u16, outcome: &str) {
+        tracing::info!(channel_id = %self.channel_id, attempt_no = self.attempt_no,
+            upstream_model = %self.upstream_model, upstream_protocol = %self.upstream_protocol, identity_revision = self.identity_revision,
+            key_slot = self.key_slot, request_id = self.active.as_ref().map(|b| b.request_id()),
+            stage = self.active.as_ref().map(|b| b.stage_name()), duration_ms = self.started.elapsed().as_millis() as u64,
+            status, outcome, "上游物理尝试终态");
+    }
+}
+
+impl Drop for PhysicalAttemptTrace {
+    fn drop(&mut self) {
+        if !self.finished {
+            let expired = self
+                .active
+                .as_ref()
+                .is_some_and(|b| b.remaining().is_zero());
+            self.record(
+                if expired { 504 } else { 499 },
+                if expired {
+                    "deadline_exceeded"
+                } else {
+                    "client_cancelled"
+                },
+            );
+        }
+    }
+}
+
+fn candidate_lookup(plan: &RoutePlan) -> HashMap<String, RouteCandidate> {
+    plan.groups
+        .iter()
+        .flat_map(|group| group.candidates.iter())
+        .map(|candidate| {
+            (
+                candidate.candidate.id().to_owned(),
+                candidate.candidate.clone(),
+            )
+        })
+        .collect()
+}
+
+fn missing_candidate_failure(candidate_id: &str) -> AttemptFailure {
+    AttemptFailure {
+        failure_class: FailureClass::CallerTerminal,
+        message: format!("route plan candidate lookup failed for {candidate_id}"),
+        status_code: Some(500),
+        retry_after: None,
+    }
+}
+
+const MODE_FAILURE_COOLDOWN_MINUTES: i64 = 5;
+
+/// Only transport/protocol failures demonstrate that a particular endpoint and
+/// transport mode is unhealthy. Caller errors, auth errors, and rate limits
+/// must never poison a channel's capability state.
+fn affects_mode_health(failure: &AttemptFailure) -> bool {
+    failure.failure_class == FailureClass::UpstreamProtocolError
+        && (failure
+            .message
+            .starts_with("upstream returned an undecodable body")
+            || failure
+                .message
+                .starts_with("upstream response could not be decoded:")
+            || failure
+                .message
+                .starts_with("upstream stream ended before a valid first SSE record")
+            || failure
+                .message
+                .starts_with("upstream first frame could not be converted"))
+}
+
+pub(crate) async fn record_channel_mode_outcome(
+    repo: &Repository,
+    channel_id: &str,
+    endpoint: &str,
+    is_stream: bool,
+    result: &crate::core::attempt::AttemptResult,
+) {
+    let outcome = match result {
+        crate::core::attempt::AttemptResult::Success(_) => {
+            // 被动反哺（C-04）：真实请求传输成功 → 立即恢复渠道的主动探测
+            // 健康标记（与 mode_health 的成功清除正交，各管各的表）。
+            // 必须 .await：mark_probe_ok 是 async fn，不 await 的 future 会被直接丢弃，
+            // 函数体一次都不执行（编译器已报 unused_must_use），等于这个反哺机制失效。
+            repo.mark_probe_ok(channel_id).await;
+            repo.record_channel_mode_success(channel_id, endpoint, is_stream)
+                .await
+        }
+        crate::core::attempt::AttemptResult::Failure(failure) if affects_mode_health(failure) => {
+            let now = crate::utils::time::now_iso();
+            let cooldown_until = (Utc::now()
+                + chrono::Duration::minutes(MODE_FAILURE_COOLDOWN_MINUTES))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+            repo.record_channel_mode_failure(
+                channel_id,
+                endpoint,
+                is_stream,
+                &now,
+                &cooldown_until,
+                &failure.message,
+            )
+            .await
+        }
+        _ => return,
+    };
+    if let Err(error) = outcome {
+        eprintln!("[WARN] channel mode health update failed: {error}");
+    }
+}
+
+fn plan_error_response(
+    status: u16,
+    message: impl Into<String>,
+    failure_class: Option<&'static str>,
+) -> Response {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-    (
-        code,
-        axum::Json(json!({
-            "error": { "message": message.into(), "type": "route_plan_error", "code": code.as_u16() }
-        })),
-    )
-        .into_response()
+    let mut error = json!({
+        "message": message.into(), "type": "route_plan_error", "code": code.as_u16()
+    });
+    if let Some(class) = failure_class {
+        error["failure_class"] = json!(class);
+    }
+    (code, axum::Json(json!({ "error": error }))).into_response()
+}
+
+/// Count Tokens is a planning probe rather than a billable/request-history
+/// event. All other routable endpoints retain normal observability logs.
+pub(crate) fn should_write_request_log(endpoint: EndpointKind) -> bool {
+    endpoint != EndpointKind::CountTokens
+}
+
+/// Candidate context retained for failures that exhaust a streaming plan before
+/// the downstream stream commits. `FlowStep::Halt` only carries the terminal
+/// error, so the driver must retain this separately for observability.
+#[derive(Clone)]
+struct StreamFailureMeta {
+    channel_id: String,
+    channel_name: String,
+    upstream_type: String,
+    route_group: String,
+    upstream_protocol: String,
+    upstream_endpoint: String,
+    upstream_model: String,
+    provider: String,
+    identity_revision: i64,
+    codec_version: Option<String>,
 }
 
 /// Run a NON-STREAM plan to a complete Response, writing RequestLog + quota.
@@ -84,61 +493,124 @@ pub async fn route_plan_response(
     sanitized_log_body: &str,
     trace_id: Option<String>,
 ) -> Response {
-    let lookup: HashMap<String, (Channel, crate::core::channel_identity::ChannelIdentity)> = plan
-        .groups
-        .iter()
-        .flat_map(|g| g.candidates.iter())
-        .map(|c| {
-            (
-                c.channel.id.clone(),
-                (c.channel.clone(), c.identity.clone()),
-            )
-        })
-        .collect();
+    let auth_service = Arc::new(crate::auth_provider::service::AuthService::new(
+        repo.clone(),
+        crate::auth_provider::ProviderRegistry::new(),
+    ));
+    route_plan_response_with_auth_service(
+        plan,
+        audited,
+        key,
+        safe_headers,
+        mode,
+        repo,
+        sanitized_log_body,
+        trace_id,
+        auth_service,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn route_plan_response_with_auth_service(
+    plan: RoutePlan,
+    audited: &AuditedRequest,
+    key: &ApiKey,
+    safe_headers: &[(String, String)],
+    mode: &str,
+    repo: &Arc<Repository>,
+    sanitized_log_body: &str,
+    trace_id: Option<String>,
+    auth_service: Arc<crate::auth_provider::service::AuthService>,
+) -> Response {
+    let lookup = candidate_lookup(&plan);
     let endpoint = plan.endpoint;
     let query = audited.envelope.query.clone();
+    let mode_health_repo = repo.clone();
     let started = Instant::now();
     let execution = crate::core::plan_executor::execute_plan(
         plan,
         audited,
         rand::rngs::StdRng::from_os_rng(),
         |attempt| {
-            let (channel, identity) = lookup
-                .get(&attempt.channel_id)
-                .cloned()
-                .expect("candidate present in plan");
             let safe = safe_headers.to_vec();
             let query = query.clone();
+            let candidate = lookup.get(&attempt.channel_id).cloned();
+            let auth_service = auth_service.clone();
+            let mode_health_repo = mode_health_repo.clone();
             // Clone the attempt so the returned future does not borrow it
             // (execute_plan requires a `'static`-capable executor future).
             let attempt = attempt.clone();
             async move {
-                dispatch_executor(
-                    endpoint,
-                    &attempt,
-                    &channel,
-                    &identity,
-                    &safe,
-                    query.as_deref(),
-                )
-                .await
+                match candidate {
+                    Some(RouteCandidate::Channel { channel, identity }) => {
+                        let result = dispatch_channel_with_key_failover(
+                            endpoint,
+                            &attempt,
+                            &channel,
+                            &identity,
+                            &safe,
+                            query.as_deref(),
+                            &mode_health_repo,
+                        )
+                        .await;
+                        record_channel_mode_outcome(
+                            &mode_health_repo,
+                            &channel.id,
+                            endpoint.as_str(),
+                            false,
+                            &result,
+                        )
+                        .await;
+                        result
+                    }
+                    Some(RouteCandidate::AuthAccount(_)) => {
+                        let mut trace = PhysicalAttemptTrace::new(&attempt, 1, None);
+                        let result = match budget::run(
+                            Duration::from_secs(120),
+                            dispatch_auth_account_executor(
+                                endpoint,
+                                &attempt,
+                                &auth_service,
+                                &safe,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(elapsed) => crate::core::attempt::AttemptResult::Failure(
+                                budget_failure(elapsed),
+                            ),
+                        };
+                        trace.finish(&result);
+                        result
+                    }
+                    None => crate::core::attempt::AttemptResult::Failure(
+                        missing_candidate_failure(&attempt.channel_id),
+                    ),
+                }
             }
         },
     )
     .await;
     let duration_ms = started.elapsed().as_millis() as u64;
 
-    write_non_stream_log(
-        repo,
-        key,
-        audited,
-        mode,
-        &execution,
-        duration_ms,
-        sanitized_log_body,
-        trace_id,
-    )
-    .await;
+    // Count Tokens is a context-planning probe, not model usage. Keep it out
+    // of request history (including route-plan failures) while preserving the
+    // actual routing and response behavior.
+    if should_write_request_log(endpoint) {
+        write_non_stream_log(
+            repo,
+            key,
+            audited,
+            mode,
+            &execution,
+            duration_ms,
+            sanitized_log_body,
+            trace_id,
+        )
+        .await;
+    }
 
     let code = StatusCode::from_u16(execution.status).unwrap_or(StatusCode::BAD_GATEWAY);
     // T06 M-2: forward safely-passthrough upstream response headers (e.g.
@@ -146,6 +618,40 @@ pub async fn route_plan_response(
     let mut builder = axum::response::Response::builder()
         .status(code)
         .header(header::CONTENT_TYPE, "application/json");
+    // 只使用执行器的类型化失败原因，不从上游正文/自定义错误码猜测超时。
+    // 耗尽预算后的 HTTP 仍由 AttemptFlow 决定（Retryable => 502）。
+    if let Some(failure) = &execution.last_failure {
+        let local_code = match failure {
+            _ if local_failure_code(failure).is_some() => local_failure_code(failure),
+            _ if failure.failure_class == FailureClass::ChannelAuthTerminal => {
+                Some("upstream_authentication_failed")
+            }
+            _ if failure.failure_class == FailureClass::Retryable
+                && failure.status_code == Some(504) =>
+            {
+                Some("model_timeout")
+            }
+            _ if budget::current().is_some() => match failure.status_code {
+                Some(429) if failure.failure_class == FailureClass::CallerTerminal => {
+                    Some("upstream_quota_exceeded")
+                }
+                Some(429) => Some("upstream_rate_limited"),
+                Some(402) => Some("upstream_quota_exceeded"),
+                _ if failure.failure_class == FailureClass::UpstreamProtocolError => {
+                    Some("upstream_protocol_error")
+                }
+                _ if failure.failure_class == FailureClass::Retryable => {
+                    Some("upstream_unavailable")
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(code) = local_code {
+            builder = builder
+                .extension(crate::services::knowledge::model_client::GatewayFailureCode(code));
+        }
+    }
     for (name, value) in &execution.response_headers {
         if name.eq_ignore_ascii_case("content-type")
             || name.eq_ignore_ascii_case("content-length")
@@ -169,6 +675,420 @@ pub async fn route_plan_response(
         })
 }
 
+#[cfg(test)]
+mod rag_budget_tests {
+    use super::*;
+    use crate::core::{feature_flags::FeatureFlags, route_plan::authorize_and_plan};
+    use crate::db::models::{ChannelApiKeyInput, CreateApiKeyInput, CreateChannelInput};
+    use crate::security::gate::{DownstreamProtocol, RequestEnvelope, RequestFeatures};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct SlowUpstream {
+        base: String,
+        calls: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for SlowUpstream {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl SlowUpstream {
+        async fn start(
+            status: u16,
+            delay_headers: bool,
+            delay: Duration,
+            extra_headers: &str,
+            body: &str,
+        ) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}/v1", listener.local_addr().unwrap());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let closed = Arc::new(AtomicUsize::new(0));
+            let (received, disconnected) = (calls.clone(), closed.clone());
+            let (extra_headers, body) = (extra_headers.to_string(), body.to_string());
+            let task = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let (received, disconnected) = (received.clone(), disconnected.clone());
+                    let (extra_headers, body) = (extra_headers.clone(), body.clone());
+                    tokio::spawn(async move {
+                        let mut buffer = Vec::new();
+                        let mut bytes = [0u8; 4096];
+                        loop {
+                            let count = socket.read(&mut bytes).await.unwrap_or(0);
+                            if count == 0 {
+                                return;
+                            }
+                            buffer.extend_from_slice(&bytes[..count]);
+                            let Some(end) = buffer.windows(4).position(|part| part == b"\r\n\r\n")
+                            else {
+                                continue;
+                            };
+                            let headers = String::from_utf8_lossy(&buffer[..end]);
+                            let content_length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if buffer.len() >= end + 4 + content_length {
+                                break;
+                            }
+                        }
+                        received.fetch_add(1, Ordering::SeqCst);
+                        let response_headers = format!("HTTP/1.1 {status} mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n", body.len());
+                        if !delay_headers
+                            && socket.write_all(response_headers.as_bytes()).await.is_err()
+                        {
+                            return;
+                        }
+                        if !delay.is_zero() {
+                            tokio::select! {
+                                _ = tokio::time::sleep(delay) => {},
+                                _ = socket.read(&mut bytes) => {
+                                    disconnected.fetch_add(1, Ordering::SeqCst);
+                                    return;
+                                },
+                            }
+                        }
+                        if delay_headers
+                            && socket.write_all(response_headers.as_bytes()).await.is_err()
+                        {
+                            return;
+                        }
+                        let _ = socket.write_all(body.as_bytes()).await;
+                    });
+                }
+            });
+            Self {
+                base,
+                calls,
+                closed,
+                task,
+            }
+        }
+    }
+
+    async fn setup(base: &str) -> (Arc<Repository>, ApiKey, RoutePlan, AuditedRequest) {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let repo = Arc::new(Repository::new(pool));
+        let key = repo
+            .create_api_key(&CreateApiKeyInput {
+                name: "budget-test".into(),
+                key: None,
+                allowed_models: None,
+                allowed_channels: None,
+                denied_models: None,
+                denied_channels: None,
+                quota_limit: None,
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        let mut channels = Vec::new();
+        for priority in [10, 5] {
+            channels.push(
+                repo.create_channel(&CreateChannelInput {
+                    name: format!("upstream-{priority}"),
+                    channel_type: "openai".into(),
+                    base_url: base.into(),
+                    api_key: "test-primary".into(),
+                    models: vec!["embedding-test".into()],
+                    priority: Some(priority),
+                    protocol: Some("openai".into()),
+                    provider: Some("custom".into()),
+                    native_base_url: Some(base.into()),
+                    native_endpoints: Some(vec!["embeddings".into()]),
+                    timeout_secs: Some(30),
+                    extra_keys: Some(vec![ChannelApiKeyInput {
+                        api_key: "test-secondary".into(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        let body = json!({"model":"embedding-test", "input":["query"], "encoding_format":"float"});
+        let plan = authorize_and_plan(
+            &key,
+            "embedding-test",
+            EndpointKind::Embeddings,
+            &channels,
+            &FeatureFlags::all_on(),
+            &body,
+            &mut rand::rngs::StdRng::seed_from_u64(7),
+        )
+        .unwrap();
+        let audit = AuditedRequest {
+            envelope: RequestEnvelope {
+                downstream_protocol: DownstreamProtocol::Embeddings,
+                endpoint: "/v1/embeddings".into(),
+                original_json: body.clone(),
+                safe_forward_headers: vec![],
+                query: None,
+                model: "embedding-test".into(),
+                stream: false,
+                trace_id: Some("budget-test".into()),
+            },
+            forward_json: body.clone(),
+            sanitized_log_json: body,
+            body_hash: "h".into(),
+            body_len: 0,
+            audit_result: security::SecurityScanResult::default(),
+            request_features: RequestFeatures::default(),
+            security_settings: security::SecuritySettings::default(),
+        };
+        (repo, key, plan, audit)
+    }
+
+    #[derive(Clone, Copy)]
+    struct RequestElapsed(Duration);
+
+    async fn request(mock: &SlowUpstream, timeout_ms: Option<u64>) -> Response {
+        let (repo, key, plan, audit) = setup(&mock.base).await;
+        let future = route_plan_response(
+            plan,
+            &audit,
+            &key,
+            &[],
+            "embedding",
+            &repo,
+            "{}",
+            Some("budget-test".into()),
+        );
+        // 仅测量预算建立后的请求；真实数据库迁移不属于请求预算。
+        let started = Instant::now();
+        let mut response = match timeout_ms {
+            Some(timeout) => {
+                budget::Budget::new(timeout, "budget-test")
+                    .scope(future)
+                    .await
+            }
+            None => future.await,
+        };
+        response
+            .extensions_mut()
+            .insert(RequestElapsed(started.elapsed()));
+        response
+    }
+
+    const VECTOR: &str = r#"{"data":[{"index":0,"embedding":[1.0,0.0]}],"usage":{"prompt_tokens":1,"total_tokens":1}}"#;
+
+    async fn warm_request_path() {
+        // 独立快速上游预热真实客户端；目标请求的 150ms 只测试已经可达的网络路径。
+        let warmup = SlowUpstream::start(200, false, Duration::ZERO, "", VECTOR).await;
+        assert_eq!(request(&warmup, None).await.status(), StatusCode::OK);
+        assert_eq!(warmup.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rag_deadline_covers_headers_and_body_without_key_or_channel_replay() {
+        warm_request_path().await;
+        for delay_headers in [true, false] {
+            let mock =
+                SlowUpstream::start(200, delay_headers, Duration::from_secs(2), "", VECTOR).await;
+            let response = request(&mock, Some(150)).await;
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            let elapsed = response.extensions().get::<RequestElapsed>().unwrap().0;
+            assert!(elapsed < Duration::from_secs(1), "请求耗时：{elapsed:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                mock.closed.load(Ordering::SeqCst),
+                1,
+                "deadline must drop the upstream TCP response"
+            );
+            assert_eq!(
+                response
+                    .extensions()
+                    .get::<crate::services::knowledge::model_client::GatewayFailureCode>()
+                    .unwrap()
+                    .0,
+                "rag_deadline_exceeded"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rag_retry_after_shares_the_same_deadline_for_rate_limits_and_server_errors() {
+        warm_request_path().await;
+        for status in [429, 503] {
+            let mock = SlowUpstream::start(
+                status,
+                false,
+                Duration::ZERO,
+                "Retry-After: 10\r\n",
+                r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+            )
+            .await;
+            let response = request(&mock, Some(150)).await;
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            let elapsed = response.extensions().get::<RequestElapsed>().unwrap().0;
+            assert!(elapsed < Duration::from_secs(1), "请求耗时：{elapsed:?}");
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn rag_auth_and_structured_quota_rejections_are_terminal() {
+        for (status, body, expected_code) in [
+            (
+                200,
+                r#"{"error":{"code":"insufficient_quota"}}"#,
+                "upstream_quota_exceeded",
+            ),
+            (
+                401,
+                r#"{"error":{"message":"untrusted secret"}}"#,
+                "upstream_authentication_failed",
+            ),
+            (403, "{}", "upstream_authentication_failed"),
+            (402, "{}", "upstream_quota_exceeded"),
+            (
+                429,
+                r#"{"error":{"code":"insufficient_quota"}}"#,
+                "upstream_quota_exceeded",
+            ),
+        ] {
+            let mock = SlowUpstream::start(status, false, Duration::ZERO, "", body).await;
+            let response = request(&mock, Some(1_000)).await;
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                response
+                    .extensions()
+                    .get::<crate::services::knowledge::model_client::GatewayFailureCode>()
+                    .unwrap()
+                    .0,
+                expected_code
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_rag_future_closes_the_upstream_and_never_replays() {
+        let mock = SlowUpstream::start(200, false, Duration::from_secs(2), "", VECTOR).await;
+        let (repo, key, plan, audit) = setup(&mock.base).await;
+        let task = tokio::spawn(async move {
+            budget::Budget::new(1_000, "budget-test")
+                .scope(route_plan_response(
+                    plan,
+                    &audit,
+                    &key,
+                    &[],
+                    "embedding",
+                    &repo,
+                    "{}",
+                    Some("budget-test".into()),
+                ))
+                .await
+        });
+        for _ in 0..100 {
+            if mock.calls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn channel_cap_is_distinct_from_the_longer_rag_deadline() {
+        let mock = SlowUpstream::start(200, false, Duration::from_secs(3), "", VECTOR).await;
+        let (repo, key, mut plan, audit) = setup(&mock.base).await;
+        for group in &mut plan.groups {
+            for candidate in &mut group.candidates {
+                if let RouteCandidate::Channel { channel, .. } = &mut candidate.candidate {
+                    channel.timeout_secs = 1;
+                }
+            }
+        }
+        let response = budget::Budget::new(2_000, "budget-test")
+            .scope(route_plan_response(
+                plan,
+                &audit,
+                &key,
+                &[],
+                "embedding",
+                &repo,
+                "{}",
+                Some("budget-test".into()),
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<crate::services::knowledge::model_client::GatewayFailureCode>()
+                .unwrap()
+                .0,
+            "model_timeout"
+        );
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn upstream_messages_cannot_spoof_local_failure_or_quota_classification() {
+        budget::Budget::new(1_000, "test")
+            .scope(async {
+                for message in [
+                    "RAG absolute deadline exceeded",
+                    "upstream transport timed out",
+                    "upstream transport failed",
+                ] {
+                    let body = json!({"error":{"message":message}}).to_string();
+                    let failure = crate::endpoint_executor::failure_from_upstream(502, &body, None);
+                    assert_eq!(local_failure_code(&failure), None);
+                }
+                let failure = crate::endpoint_executor::failure_from_upstream(
+                    429,
+                    r#"{"error":{"message":"insufficient_quota"}}"#,
+                    None,
+                );
+                assert_eq!(failure.failure_class, FailureClass::Retryable);
+                assert_eq!(
+                    local_failure_code(&budget_failure(BudgetElapsed::Deadline)),
+                    Some("rag_deadline_exceeded")
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn historical_requests_keep_success_and_existing_key_failover() {
+        let mock = SlowUpstream::start(200, false, Duration::from_millis(40), "", VECTOR).await;
+        assert_eq!(request(&mock, None).await.status(), StatusCode::OK);
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+        let rate_limited = SlowUpstream::start(429, false, Duration::ZERO, "", "{}").await;
+        assert_eq!(
+            request(&rate_limited, None).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            rate_limited.calls.load(Ordering::SeqCst),
+            4,
+            "two Keys on two channels retain legacy failover"
+        );
+    }
+}
+
 /// Write the RequestLog + quota for a non-stream facade execution.
 #[allow(clippy::too_many_arguments)]
 async fn write_non_stream_log(
@@ -186,11 +1106,91 @@ async fn write_non_stream_log(
             u.prompt_tokens as i64,
             u.completion_tokens as i64,
             u.total_tokens as i64,
+            u.cached_tokens as i64,
         )
     });
-    let (prompt, completion, total) = usage.unwrap_or((0, 0, 0));
+    let (mut prompt, mut completion, mut total, cached_tokens) = usage.unwrap_or((0, 0, 0, 0));
+
+    // Fallback: estimate tokens locally when upstream didn't return usage.
+    // Only estimate for successful (2xx) responses — errors have no real content.
+    if total == 0
+        && prompt == 0
+        && completion == 0
+        && execution.status >= 200
+        && execution.status < 300
+    {
+        let req_body: serde_json::Value =
+            serde_json::from_str(sanitized_log_body).unwrap_or(serde_json::Value::Null);
+        let resp_text = super::estimate_usage::extract_response_text(&execution.body);
+        let (p, c, t) = super::estimate_usage::estimate_usage(
+            &req_body,
+            Some(&resp_text),
+            &audited.envelope.model,
+        );
+        prompt = p;
+        completion = c;
+        total = t;
+        if total > 0 {
+            eprintln!("[INFO] token usage estimated (upstream didn't return usage): prompt={}, completion={}, total={}", prompt, completion, total);
+        }
+    }
+
     let is_retry = execution.attempts > 1;
     let last_failure = execution.last_failure.as_ref();
+
+    // Extract response_choices from the upstream response body for audit log display.
+    let response_choices = if execution.status >= 200 && execution.status < 300 {
+        // OpenAI Chat Completions: extract `choices` array
+        if let Some(choices) = execution.body.get("choices") {
+            serde_json::to_string(choices).ok()
+        }
+        // Anthropic Messages: synthesize a choices-like structure
+        else if execution.body.get("content").is_some() {
+            let msg = serde_json::json!({
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": execution.body.get("content"),
+                },
+                "finish_reason": execution.body.get("stop_reason").unwrap_or(&serde_json::Value::Null),
+            });
+            serde_json::to_string(&vec![msg]).ok()
+        }
+        // OpenAI Responses API: synthesize from `output`
+        else if let Some(output) = execution.body.get("output").and_then(|o| o.as_array()) {
+            let choices: Vec<serde_json::Value> = output
+                .iter()
+                .map(|item| {
+                    serde_json::json!({
+                        "index": item.get("index").unwrap_or(&serde_json::json!(0)),
+                        "message": {
+                            "role": "assistant",
+                            "content": item.get("content"),
+                        },
+                        "finish_reason": "stop",
+                    })
+                })
+                .collect();
+            serde_json::to_string(&choices).ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // FIX-16：响应侧扫描（尽力而为）——2xx 响应体过扫描，发现并入审计
+    // 结果后落账；扫描异常不阻断响应（scan_response 内部自降级）。
+    let mut audit_for_log = audited.audit_result.clone();
+    if execution.status >= 200 && execution.status < 300 {
+        security::scan_response_into(
+            &mut audit_for_log,
+            &execution.body,
+            &audited.security_settings,
+            &[],
+        );
+    }
+
     let log = RequestLog {
         id: utils::id::new_id(),
         seq: None,
@@ -205,20 +1205,22 @@ async fn write_non_stream_log(
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
+        cached_tokens: cached_tokens,
         duration_ms: duration_ms as i64,
         error_message: last_failure.map(|f| f.message.clone()),
         is_stream: 0,
         is_retry: i64::from(is_retry),
         created_at: utils::time::now_iso(),
         request_body: Some(sanitized_log_body.to_string()),
-        response_choices: None,
-        risk_level: audited.audit_result.risk_level.as_str().to_string(),
-        risk_score: audited.audit_result.risk_score as i64,
-        risk_summary: Some(audited.audit_result.summary.clone()),
-        security_action: audited.audit_result.action.as_str().to_string(),
-        sanitized: i64::from(audited.audit_result.sanitized),
-        blocked_reason: audited.audit_result.blocked_reason.clone(),
+        response_choices,
+        risk_level: audit_for_log.risk_level.as_str().to_string(),
+        risk_score: audit_for_log.risk_score as i64,
+        risk_summary: Some(audit_for_log.summary.clone()),
+        security_action: audit_for_log.action.as_str().to_string(),
+        sanitized: i64::from(audit_for_log.sanitized),
+        blocked_reason: audit_for_log.blocked_reason.clone(),
         trace_id: trace_id.clone(),
+        reasoning_effort: extract_reasoning_effort(&audited),
         // T09 observability fields we have on the facade path.  provider /
         // identity_revision / codec_version come from `PlanExecution`, which
         // the executor captures from the SAME PreparedAttempt + ChannelIdentity
@@ -234,6 +1236,10 @@ async fn write_non_stream_log(
         identity_revision: execution.identity_revision,
         client_cancelled: Some(0),
         stream_committed: Some(0),
+        upstream_type: execution
+            .upstream_type
+            .clone()
+            .unwrap_or_else(|| "channel".to_string()),
     };
     let log_id = log.id.clone();
     if let Err(e) = repo.create_log(&log).await {
@@ -242,8 +1248,8 @@ async fn write_non_stream_log(
     if let Err(e) = repo
         .create_security_findings(
             &log_id,
-            &audited.audit_result.findings,
-            audited.audit_result.action.as_str(),
+            &audit_for_log.findings,
+            audit_for_log.action.as_str(),
         )
         .await
     {
@@ -273,20 +1279,49 @@ pub async fn write_stream_precommit_failure_log(
     sanitized_log_body: &str,
     trace_id: Option<&str>,
 ) {
+    write_stream_precommit_failure_log_with_meta(
+        repo,
+        key,
+        audited,
+        mode,
+        is_stream,
+        status,
+        message,
+        sanitized_log_body,
+        trace_id,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_stream_precommit_failure_log_with_meta(
+    repo: &Arc<Repository>,
+    key: &ApiKey,
+    audited: &AuditedRequest,
+    mode: &str,
+    is_stream: bool,
+    status: u16,
+    message: &str,
+    sanitized_log_body: &str,
+    trace_id: Option<&str>,
+    last_attempt: Option<&StreamFailureMeta>,
+) {
     let log = RequestLog {
         id: utils::id::new_id(),
         seq: None,
         api_key_id: Some(key.id.clone()),
         api_key_name: Some(key.name.clone()),
-        channel_id: None,
-        channel_name: None,
+        channel_id: last_attempt.map(|meta| meta.channel_id.clone()),
+        channel_name: last_attempt.map(|meta| meta.channel_name.clone()),
         model: audited.envelope.model.clone(),
-        upstream_model: None,
+        upstream_model: last_attempt.map(|meta| meta.upstream_model.clone()),
         mode: mode.to_string(),
         status_code: status as i64,
         prompt_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0,
+        cached_tokens: 0,
         duration_ms: 0,
         error_message: Some(message.to_string()),
         is_stream: i64::from(is_stream),
@@ -301,19 +1336,24 @@ pub async fn write_stream_precommit_failure_log(
         sanitized: i64::from(audited.audit_result.sanitized),
         blocked_reason: audited.audit_result.blocked_reason.clone(),
         trace_id: trace_id.map(|s| s.to_string()),
-        // T09 observability fields (no route/upstream context on a pre-commit
-        // rejection).
+        reasoning_effort: extract_reasoning_effort(&audited),
+        // A planning rejection has no candidate context. Once a candidate was
+        // selected, retain it so exhausted Auth Accounts are not logged as
+        // legacy channels.
         downstream_protocol: Some(audited.envelope.downstream_protocol.as_str().to_string()),
         downstream_endpoint: Some(audited.envelope.endpoint.clone()),
-        route_group: None,
-        upstream_protocol: None,
-        upstream_endpoint: None,
-        provider: None,
-        codec_version: None,
+        route_group: last_attempt.map(|meta| meta.route_group.clone()),
+        upstream_protocol: last_attempt.map(|meta| meta.upstream_protocol.clone()),
+        upstream_endpoint: last_attempt.map(|meta| meta.upstream_endpoint.clone()),
+        provider: last_attempt.map(|meta| meta.provider.clone()),
+        codec_version: last_attempt.and_then(|meta| meta.codec_version.clone()),
         failure_class: None,
-        identity_revision: None,
+        identity_revision: last_attempt.map(|meta| meta.identity_revision),
         client_cancelled: Some(0),
         stream_committed: Some(0),
+        upstream_type: last_attempt
+            .map(|meta| meta.upstream_type.clone())
+            .unwrap_or_else(|| "channel".to_string()),
     };
     let log_id = log.id.clone();
     if let Err(e) = repo.create_log(&log).await {
@@ -351,19 +1391,43 @@ pub async fn route_stream_plan(
     sanitized_log_body: &str,
     trace_id: Option<String>,
 ) -> Response {
-    let lookup: HashMap<String, (Channel, crate::core::channel_identity::ChannelIdentity)> = plan
-        .groups
-        .iter()
-        .flat_map(|g| g.candidates.iter())
-        .map(|c| {
-            (
-                c.channel.id.clone(),
-                (c.channel.clone(), c.identity.clone()),
-            )
-        })
-        .collect();
+    let auth_service = Arc::new(crate::auth_provider::service::AuthService::new(
+        repo.clone(),
+        crate::auth_provider::ProviderRegistry::new(),
+    ));
+    route_stream_plan_with_auth_service(
+        plan,
+        audited,
+        key,
+        safe_headers,
+        mode,
+        repo,
+        sanitized_log_body,
+        trace_id,
+        auth_service,
+        // 无设置上下文的入口（测试/嵌入式调用）用缺省超时。
+        StreamTimeouts::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn route_stream_plan_with_auth_service(
+    plan: RoutePlan,
+    audited: &AuditedRequest,
+    key: &ApiKey,
+    safe_headers: &[(String, String)],
+    mode: &str,
+    repo: &Arc<Repository>,
+    sanitized_log_body: &str,
+    trace_id: Option<String>,
+    auth_service: Arc<crate::auth_provider::service::AuthService>,
+    timeouts: StreamTimeouts,
+) -> Response {
+    let lookup = candidate_lookup(&plan);
     let endpoint = plan.endpoint;
     let mut flow = AttemptFlow::new(plan);
+    let mut last_attempt_meta: Option<StreamFailureMeta> = None;
 
     loop {
         match flow.next_step() {
@@ -376,6 +1440,21 @@ pub async fn route_stream_plan(
                     let plan = flow.plan();
                     let group = &plan.groups[group_idx];
                     let candidate = &group.candidates[candidate_idx];
+                    last_attempt_meta = Some(StreamFailureMeta {
+                        channel_id: candidate.candidate.id().to_string(),
+                        channel_name: candidate.candidate.name().to_string(),
+                        upstream_type: candidate.candidate.upstream_type().to_string(),
+                        route_group: group.id.clone(),
+                        upstream_protocol: candidate.upstream_protocol.as_str().to_string(),
+                        upstream_endpoint: candidate.upstream_endpoint.clone(),
+                        // A failed construction has no PreparedAttempt yet;
+                        // use the requested model until a built attempt supplies
+                        // its mapped upstream model below.
+                        upstream_model: audited.envelope.model.clone(),
+                        provider: candidate.candidate.provider(),
+                        identity_revision: candidate.candidate.identity_revision(),
+                        codec_version: None,
+                    });
                     build_prepared_attempt(
                         audited,
                         group,
@@ -393,7 +1472,8 @@ pub async fn route_stream_plan(
                         {
                             // I-3: terminal pre-commit outcome must be logged.
                             let status = f.status_code.unwrap_or(400);
-                            write_stream_precommit_failure_log(
+                            let failure_class = f.failure_class;
+                            write_stream_precommit_failure_log_with_meta(
                                 repo,
                                 key,
                                 audited,
@@ -403,38 +1483,107 @@ pub async fn route_stream_plan(
                                 &f.message,
                                 sanitized_log_body,
                                 trace_id.as_deref(),
+                                last_attempt_meta.as_ref(),
                             )
                             .await;
-                            return plan_error_response(status, f.message);
+                            return plan_error_response(
+                                status,
+                                f.message,
+                                Some(failure_class.as_str()),
+                            );
                         }
                         continue;
                     }
                     Ok(a) => a,
                 };
-                let (channel, identity) = lookup
-                    .get(&attempt.channel_id)
-                    .cloned()
-                    .expect("candidate present in plan");
+                if let Some(meta) = last_attempt_meta.as_mut() {
+                    meta.upstream_model = attempt.upstream_model.clone();
+                    meta.codec_version = attempt.codec_version.clone();
+                }
+                let candidate = lookup.get(&attempt.channel_id).cloned();
                 let query = audited.envelope.query.clone();
+                let health_channel_id = candidate.as_ref().and_then(|candidate| match candidate {
+                    RouteCandidate::Channel { channel, .. } => Some(channel.id.clone()),
+                    RouteCandidate::AuthAccount(_) => None,
+                });
 
-                match dispatch_stream_executor(
-                    endpoint,
-                    &attempt,
-                    &channel,
-                    &identity,
-                    safe_headers,
-                    query.as_deref(),
-                )
-                .await
-                {
+                let dispatched = match candidate {
+                    Some(RouteCandidate::Channel { channel, identity }) => {
+                        // 流式 pre-commit 多 Key failover：遍历该渠道所有启用的
+                        // Key slot，pre-commit 失败（尚未向下游提交任何字节）换
+                        // 下一把 Key 重试；一旦 Connected 进入提交屏障，后续错误
+                        // 不再换 Key。CallerTerminal / CommittedStreamError 换 Key
+                        // 无意义，直接终止。
+                        let mut dispatched: Option<StreamAttemptResult> = None;
+                        let mut last_failure: Option<AttemptFailure> = None;
+                        for slot in channel_key_slots(&channel, repo).await {
+                            let result = dispatch_stream_executor(
+                                endpoint,
+                                &attempt,
+                                &slot,
+                                &identity,
+                                safe_headers,
+                                query.as_deref(),
+                            )
+                            .await;
+                            match result {
+                                StreamAttemptResult::Connected(_) => {
+                                    dispatched = Some(result);
+                                    break;
+                                }
+                                StreamAttemptResult::Failure(f) => {
+                                    if f.failure_class == FailureClass::CallerTerminal
+                                        || f.failure_class == FailureClass::CommittedStreamError
+                                    {
+                                        dispatched = Some(StreamAttemptResult::Failure(f));
+                                        break;
+                                    }
+                                    last_failure = Some(f);
+                                }
+                            }
+                        }
+                        dispatched.unwrap_or_else(|| {
+                            // 主 Key 与全部额外 Key 均被停用：该候选无可用
+                            // 凭证，按可重试失败换下一个候选渠道。
+                            StreamAttemptResult::Failure(last_failure.unwrap_or_else(|| {
+                                AttemptFailure {
+                                    failure_class: FailureClass::Retryable,
+                                    message: "no enabled channel credential slot".to_string(),
+                                    status_code: Some(502),
+                                    retry_after: None,
+                                }
+                            }))
+                        })
+                    }
+                    Some(RouteCandidate::AuthAccount(_)) => {
+                        dispatch_auth_account_stream_executor(&attempt, &auth_service, safe_headers)
+                            .await
+                    }
+                    None => {
+                        StreamAttemptResult::Failure(missing_candidate_failure(&attempt.channel_id))
+                    }
+                };
+
+                match dispatched {
                     StreamAttemptResult::Failure(f) => {
+                        if let Some(channel_id) = health_channel_id.as_deref() {
+                            record_channel_mode_outcome(
+                                repo,
+                                channel_id,
+                                endpoint.as_str(),
+                                true,
+                                &crate::core::attempt::AttemptResult::Failure(f.clone()),
+                            )
+                            .await;
+                        }
                         flow.record_failure(&f);
                         if f.failure_class == FailureClass::CallerTerminal
                             || f.failure_class == FailureClass::CommittedStreamError
                         {
                             // I-3: terminal pre-commit outcome must be logged.
                             let status = f.status_code.unwrap_or(400);
-                            write_stream_precommit_failure_log(
+                            let failure_class = f.failure_class;
+                            write_stream_precommit_failure_log_with_meta(
                                 repo,
                                 key,
                                 audited,
@@ -444,29 +1593,90 @@ pub async fn route_stream_plan(
                                 &f.message,
                                 sanitized_log_body,
                                 trace_id.as_deref(),
+                                last_attempt_meta.as_ref(),
                             )
                             .await;
-                            return plan_error_response(status, f.message);
+                            return plan_error_response(
+                                status,
+                                f.message,
+                                Some(failure_class.as_str()),
+                            );
+                        }
+                        // Honor upstream Retry-After before the next attempt.
+                        if let Some(secs) = f.retry_after {
+                            tokio::time::sleep(Duration::from_secs(secs)).await;
                         }
                         continue;
                     }
                     StreamAttemptResult::Connected(mut upstream) => {
                         // --- first-frame validation (commit barrier) ---
-                        let (first_frame, carry) = match buffer_first_record(&mut upstream).await {
-                            Some(x) => x,
-                            None => {
-                                // Empty / undecodable upstream: pre-commit failover.
-                                flow.record_failure(&AttemptFailure {
+                        // 首帧超时（FIX-08，提交前阶段）：半死连接的首记录
+                        // 等待限时，超时按可重试失败换候选渠道。0 = 禁用。
+                        let first_frame_result = if timeouts.first_frame.is_zero() {
+                            buffer_first_record(&mut upstream).await
+                        } else {
+                            match tokio::time::timeout(
+                                timeouts.first_frame,
+                                buffer_first_record(&mut upstream),
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err(format!(
+                                    "first frame timed out after {:?} waiting for a valid SSE record",
+                                    timeouts.first_frame
+                                )),
+                            }
+                        };
+                        let (first_frame, carry) = match first_frame_result {
+                            Ok(x) => x,
+                            Err(diagnostic) => {
+                                // Empty / timed-out / undecodable upstream: pre-commit failover.
+                                // The diagnostic suffix (bytes received + sanitized
+                                // preview, or the FIX-08 timeout note) keeps the stable
+                                // message prefix intact for `affects_mode_health` while
+                                // making the audit log reveal WHAT actually happened.
+                                let failure = AttemptFailure {
                                     failure_class: FailureClass::UpstreamProtocolError,
-                                    message:
-                                        "upstream stream ended before a valid first SSE record"
-                                            .to_string(),
+                                    message: format!(
+                                        "upstream stream ended before a valid first SSE record ({diagnostic})"
+                                    ),
                                     status_code: Some(502),
                                     retry_after: None,
-                                });
+                                };
+                                if let Some(channel_id) = health_channel_id.as_deref() {
+                                    record_channel_mode_outcome(
+                                        repo,
+                                        channel_id,
+                                        endpoint.as_str(),
+                                        true,
+                                        &crate::core::attempt::AttemptResult::Failure(
+                                            failure.clone(),
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                flow.record_failure(&failure);
                                 continue;
                             }
                         };
+                        if let Some(failure) = crate::endpoint_executor::semantic_stream_failure(
+                            &attempt.upstream_protocol,
+                            &first_frame,
+                        ) {
+                            if let Some(channel_id) = health_channel_id.as_deref() {
+                                record_channel_mode_outcome(
+                                    repo,
+                                    channel_id,
+                                    endpoint.as_str(),
+                                    true,
+                                    &crate::core::attempt::AttemptResult::Failure(failure.clone()),
+                                )
+                                .await;
+                            }
+                            flow.record_failure(&failure);
+                            continue;
+                        }
 
                         let mut supervisor =
                             crate::core::stream_supervisor::StreamSupervisor::new();
@@ -479,40 +1689,82 @@ pub async fn route_stream_plan(
                         if supervisor.on_first_frame_validated().is_err() {
                             unreachable!()
                         }
-
-                        let sse_mode = sse_mode_for(&attempt);
-                        let decoder = decoder_for(sse_mode, &attempt.upstream_model, "");
-                        // C-1: conversion modes encode the first record AND the
-                        // carry (records 2..N of the same upstream chunk) through
-                        // the decoder BEFORE commit; a codec rejection of any
-                        // first-chunk record is a pre-commit failover (never
-                        // committed, never raw).
+                        let Some(codec) = attempt.prepared_codec.as_ref() else {
+                            let failure = AttemptFailure {
+                                failure_class: FailureClass::CallerTerminal,
+                                message:
+                                    "three-protocol streaming attempt is missing its prepared codec"
+                                        .to_string(),
+                                status_code: Some(500),
+                                retry_after: None,
+                            };
+                            flow.record_failure(&failure);
+                            continue;
+                        };
+                        let codec_label = codec.label();
+                        let is_identity = codec.is_identity();
+                        // A fresh decoder is created for this particular
+                        // attempt/retry and receives the same context that
+                        // encoded its request. No string label is reinterpreted.
                         let pump = match StreamPumpCore::new(
                             supervisor,
-                            sse_mode,
-                            decoder,
+                            codec.new_stream_decoder(),
                             first_frame.clone(),
                             carry.clone(),
-                            attempt.upstream_model.clone(),
                         ) {
                             Ok(p) => p,
                             Err(e) => {
-                                flow.record_failure(&AttemptFailure {
+                                let failure = AttemptFailure {
                                     failure_class: FailureClass::UpstreamProtocolError,
                                     message: format!(
                                         "upstream first frame could not be converted ({}): {}",
-                                        sse_mode.as_str(),
+                                        codec_label,
                                         e.message()
                                     ),
                                     status_code: Some(502),
                                     retry_after: None,
-                                });
+                                };
+                                if let Some(channel_id) = health_channel_id.as_deref() {
+                                    record_channel_mode_outcome(
+                                        repo,
+                                        channel_id,
+                                        endpoint.as_str(),
+                                        true,
+                                        &crate::core::attempt::AttemptResult::Failure(
+                                            failure.clone(),
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                flow.record_failure(&failure);
                                 continue;
                             }
                         };
+                        if let Some(channel_id) = health_channel_id.as_deref() {
+                            // A first record which has passed both SSE and codec
+                            // validation proves this channel's stream mode is
+                            // healthy, even if the client later disconnects.
+                            record_channel_mode_outcome(
+                                repo,
+                                channel_id,
+                                endpoint.as_str(),
+                                true,
+                                &crate::core::attempt::AttemptResult::Success(
+                                    crate::core::attempt::AttemptSuccess {
+                                        status: 200,
+                                        body: serde_json::Value::Null,
+                                        usage: None,
+                                        downstream_events: None,
+                                        upstream_model: None,
+                                        response_headers: vec![],
+                                    },
+                                ),
+                            )
+                            .await;
+                        }
 
-                        let channel_id = channel.id.clone();
-                        let channel_name = channel.name.clone();
+                        let channel_id = attempt.channel_id.clone();
+                        let channel_name = attempt.channel_name.clone();
                         let key = key.clone();
                         let audited = audited.clone();
                         let repo = repo.clone();
@@ -528,12 +1780,18 @@ pub async fn route_stream_plan(
                         // T09 (design 11.4): the observability context comes from
                         // the SAME PreparedAttempt + ChannelIdentity that produced
                         // the request body (single source of truth).
-                        let identity_provider = identity.provider.clone();
-                        let identity_revision = identity.identity_revision;
+                        let (identity_provider, identity_revision) =
+                            match lookup.get(&attempt.channel_id) {
+                                Some(candidate) => {
+                                    (candidate.provider(), candidate.identity_revision())
+                                }
+                                None => ("unknown".to_string(), 0),
+                            };
                         let route_group = attempt.route_group.clone();
                         let codec_version = attempt.codec_version.clone();
                         let upstream_protocol = attempt.upstream_protocol.clone();
                         let upstream_endpoint = attempt.upstream_endpoint.clone();
+                        let upstream_type = attempt.upstream_type.clone();
 
                         // Forward the upstream content-type + safe response
                         // headers (native passthrough fidelity; design 11.1).
@@ -560,10 +1818,19 @@ pub async fn route_stream_plan(
                             codec_version,
                             upstream_protocol,
                             upstream_endpoint,
+                            upstream_type,
+                            timeouts,
                         );
                         let mut builder = Response::builder()
                             .status(StatusCode::OK)
-                            .header(header::CONTENT_TYPE, upstream_content_type)
+                            .header(
+                                header::CONTENT_TYPE,
+                                if is_identity {
+                                    upstream_content_type
+                                } else {
+                                    "text/event-stream".to_string()
+                                },
+                            )
                             .header(header::CACHE_CONTROL, "no-cache")
                             .header(header::CONNECTION, "keep-alive");
                         for (name, value) in upstream_safe_headers {
@@ -582,7 +1849,8 @@ pub async fn route_stream_plan(
             }
             FlowStep::Halt { status, message } => {
                 // I-3: streaming pre-commit terminal outcome must be logged.
-                write_stream_precommit_failure_log(
+                let failure_class = flow.last_failure().map(|f| f.failure_class.as_str());
+                write_stream_precommit_failure_log_with_meta(
                     repo,
                     key,
                     audited,
@@ -592,36 +1860,101 @@ pub async fn route_stream_plan(
                     &message,
                     sanitized_log_body,
                     trace_id.as_deref(),
+                    last_attempt_meta.as_ref(),
                 )
                 .await;
-                return plan_error_response(status, message);
+                return plan_error_response(status, message, failure_class);
             }
         }
     }
 }
 
+/// Bounded, single-line preview of raw upstream bytes for diagnostics.
+const FIRST_RECORD_SNIPPET_BYTES: usize = 240;
+const MAX_FIRST_RECORD_BYTES: usize = 4 * 1024 * 1024;
+
+fn upstream_snippet(bytes: &[u8], max_bytes: usize) -> String {
+    let truncated = if bytes.len() > max_bytes {
+        &bytes[..max_bytes]
+    } else {
+        bytes
+    };
+    let text = String::from_utf8_lossy(truncated);
+    // Collapse to a single line and drop control characters for log readability.
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\r' | '\n' | '\t' => out.push(' '),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {}
+            c => out.push(c),
+        }
+    }
+    if bytes.len() > max_bytes {
+        out.push_str("…");
+    }
+    out
+}
+
 /// Read + validate the first complete SSE record.  Returns `(first_frame,
 /// carry)` where `carry` are the bytes read beyond the first record.
-async fn buffer_first_record(upstream: &mut UpstreamStream) -> Option<(Vec<u8>, Vec<u8>)> {
+///
+/// On failure the `Err` carries a bounded diagnostic suffix — bytes received,
+/// upstream content-type (when not SSE), and a sanitized preview of what was
+/// actually read — that the driver appends to the stable
+/// "upstream stream ended before a valid first SSE record" message prefix.
+async fn buffer_first_record(upstream: &mut UpstreamStream) -> Result<(Vec<u8>, Vec<u8>), String> {
     let mut buffer = Vec::new();
+    let ct_note = if upstream
+        .content_type
+        .to_ascii_lowercase()
+        .contains("event-stream")
+    {
+        String::new()
+    } else {
+        format!("; upstream content-type: {}", upstream.content_type)
+    };
     loop {
         // Bound the first-frame buffer (a malicious upstream must not OOM us).
-        if buffer.len() > 256 * 1024 {
-            return None;
+        if buffer.len() > MAX_FIRST_RECORD_BYTES {
+            return Err(format!(
+                "received {} bytes with no SSE record terminator{ct_note}; preview: \"{}\"",
+                buffer.len(),
+                upstream_snippet(&buffer, FIRST_RECORD_SNIPPET_BYTES),
+            ));
         }
         if let Some(end) = crate::endpoint_executor::sse::record_end(&buffer) {
             let record = buffer[..end].to_vec();
             if crate::endpoint_executor::sse::validate_native_first_record(&record).is_ok() {
                 let carry = buffer[end..].to_vec();
-                return Some((record, carry));
+                return Ok((record, carry));
             }
             // A full record failed validation → pre-commit failover.
-            return None;
+            return Err(format!(
+                "first SSE record failed validation{ct_note}; preview: \"{}\"",
+                upstream_snippet(&record, FIRST_RECORD_SNIPPET_BYTES),
+            ));
         }
         match upstream.body.next().await {
             Some(Ok(bytes)) => buffer.extend_from_slice(&bytes),
-            Some(Err(_)) => return None,
-            None => return None,
+            Some(Err(error)) => {
+                return Err(format!(
+                    "stream error after {} bytes ({error}){ct_note}; preview: \"{}\"",
+                    buffer.len(),
+                    upstream_snippet(&buffer, FIRST_RECORD_SNIPPET_BYTES),
+                ));
+            }
+            None => {
+                if buffer.is_empty() {
+                    return Err(format!(
+                        "received 0 bytes; upstream closed the response without sending a body{ct_note}"
+                    ));
+                }
+                return Err(format!(
+                    "received {} bytes before the stream closed with no complete SSE record{ct_note}; preview: \"{}\"",
+                    buffer.len(),
+                    upstream_snippet(&buffer, FIRST_RECORD_SNIPPET_BYTES),
+                ));
+            }
         }
     }
 }
@@ -632,9 +1965,47 @@ async fn buffer_first_record(upstream: &mut UpstreamStream) -> Option<(Vec<u8>, 
 /// client disconnects mid-stream the async-stream is dropped, this guard's
 /// `Drop` runs, and a spawned task records a `client_cancelled` log.  The
 /// `client_cancelled` marker is therefore written exactly once per request.
+/// 流式落账快照：生成器在每帧后更新，客户端中途取消（Drop 路径）时
+/// finalizer 读取——取消行记录已产生的真实用量与响应内容，而不是硬编码
+/// 零值（issue #57：取消/断开导致已产生的计费数据整体丢失）。
+#[derive(Default, Clone)]
+struct StreamSnapshot {
+    /// (prompt, completion, total, cached)，每帧更新。
+    usage: (i64, i64, i64, i64),
+    /// 已累积的响应文本（终止时或内容显著增长时重建，控制 O(n) 复制成本）。
+    content: String,
+    /// 终止后构建的完整 response_choices JSON。
+    response_choices: Option<String>,
+    terminal: bool,
+}
+
+/// 每帧后同步落账快照：用量恒新；响应内容/choices 首个非空内容立即快照
+/// （短流取消时才有正文可折算 completion），之后仅在协议终止或内容较上次
+/// 快照增长 ≥16KB 时重建——每帧重建会把流式复制放大成 O(n²)。
+fn update_stream_snapshot(
+    snapshot: &std::sync::Arc<std::sync::Mutex<StreamSnapshot>>,
+    pump: &StreamPumpCore,
+) {
+    let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+    s.usage = pump.usage();
+    let content = pump.accumulated_content();
+    let grew = content.len().saturating_sub(s.content.len());
+    if pump.terminated() {
+        s.terminal = true;
+        s.content = content.to_string();
+        s.response_choices = pump.build_response_choices();
+    } else if s.content.is_empty() || grew >= 16 * 1024 {
+        s.content = content.to_string();
+        s.response_choices = pump.build_response_choices();
+    }
+}
+
 #[derive(Clone)]
 struct StreamLogFinalizer {
     repo: Arc<Repository>,
+    /// 预生成的日志行 id：Responses 逐帧持久化在流开始前就用它写段表，
+    /// 落账行必须与段表同一个 id（续传回放按它关联完成状态）。
+    log_id: String,
     key: ApiKey,
     audited: AuditedRequest,
     model: String,
@@ -651,8 +2022,11 @@ struct StreamLogFinalizer {
     codec_version: Option<String>,
     upstream_protocol: String,
     upstream_endpoint: String,
+    upstream_type: String,
     started: Instant,
     completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 与流泵共享的落账快照（issue #57）：取消路径读取，见 [`StreamSnapshot`]。
+    snapshot: std::sync::Arc<std::sync::Mutex<StreamSnapshot>>,
 }
 
 impl StreamLogFinalizer {
@@ -664,10 +2038,28 @@ impl StreamLogFinalizer {
         usage_prompt: i64,
         usage_completion: i64,
         usage_total: i64,
+        usage_cached: i64,
+        response_choices: Option<String>,
     ) {
+        // FIX-16：响应侧扫描（尽力而为）——扫描流泵累积的响应文本，发现
+        // 并入审计结果后落账。取消/中断行同样覆盖：半程内容同样有泄露面。
+        // 快照内容在协议终止或每增长 ≥16KB 时刷新，扫描到最近一次快照为止。
+        let snapshot_content = {
+            let snap = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+            snap.content.clone()
+        };
+        let mut audit_for_log = self.audited.audit_result.clone();
+        if !snapshot_content.is_empty() {
+            security::scan_response_into(
+                &mut audit_for_log,
+                &json!({ "content": snapshot_content }),
+                &self.audited.security_settings,
+                &[],
+            );
+        }
         let duration_ms = self.started.elapsed().as_millis() as i64;
         let log = RequestLog {
-            id: utils::id::new_id(),
+            id: self.log_id.clone(),
             seq: None,
             api_key_id: Some(self.key.id.clone()),
             api_key_name: Some(self.key.name.clone()),
@@ -688,20 +2080,22 @@ impl StreamLogFinalizer {
             prompt_tokens: usage_prompt,
             completion_tokens: usage_completion,
             total_tokens: usage_total,
+            cached_tokens: usage_cached,
             duration_ms,
             error_message: error_message.map(|s| s.to_string()),
             is_stream: 1,
             is_retry: i64::from(self.is_retry),
             created_at: utils::time::now_iso(),
             request_body: Some(self.sanitized_log_body.clone()),
-            response_choices: None,
-            risk_level: self.audited.audit_result.risk_level.as_str().to_string(),
-            risk_score: self.audited.audit_result.risk_score as i64,
-            risk_summary: Some(self.audited.audit_result.summary.clone()),
-            security_action: self.audited.audit_result.action.as_str().to_string(),
-            sanitized: i64::from(self.audited.audit_result.sanitized),
-            blocked_reason: self.audited.audit_result.blocked_reason.clone(),
+            response_choices,
+            risk_level: audit_for_log.risk_level.as_str().to_string(),
+            risk_score: audit_for_log.risk_score as i64,
+            risk_summary: Some(audit_for_log.summary.clone()),
+            security_action: audit_for_log.action.as_str().to_string(),
+            sanitized: i64::from(audit_for_log.sanitized),
+            blocked_reason: audit_for_log.blocked_reason.clone(),
             trace_id: self.trace_id.clone(),
+            reasoning_effort: extract_reasoning_effort(&self.audited),
             // T09 observability fields (single source: PreparedAttempt + identity).
             downstream_protocol: Some(
                 self.audited
@@ -720,6 +2114,7 @@ impl StreamLogFinalizer {
             identity_revision: Some(self.identity_revision),
             client_cancelled: Some(i64::from(client_cancelled)),
             stream_committed: Some(1),
+            upstream_type: self.upstream_type.clone(),
         };
         let log_id = log.id.clone();
         if let Err(e) = self.repo.create_log(&log).await {
@@ -729,8 +2124,8 @@ impl StreamLogFinalizer {
             .repo
             .create_security_findings(
                 &log_id,
-                &self.audited.audit_result.findings,
-                self.audited.audit_result.action.as_str(),
+                &audit_for_log.findings,
+                audit_for_log.action.as_str(),
             )
             .await
         {
@@ -756,14 +2151,78 @@ impl Drop for StreamLogFinalizer {
         // `completed == false` and spawns ANOTHER task, recursively — an
         // unbounded chain of duplicate 499 rows (and eventual stack overflow /
         // process abort).  Setting the flag first makes the write exactly-once.
+        //
+        // #57: the cancelled row keeps what the stream already produced —
+        // the pump snapshot's real usage (fallback: local estimate) and the
+        // accumulated response so far — instead of hardcoded zeros.
         if !self.completed.load(std::sync::atomic::Ordering::SeqCst) {
             self.completed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             let f = self.clone();
-            tokio::spawn(async move {
-                f.write(true, false, Some("client_cancelled"), 0, 0, 0)
-                    .await;
-            });
+            // FIX-26：Drop 可能在 runtime 已关停（应用退出中）时执行，
+            // 裸 tokio::spawn 会 panic；守卫后优雅跳过该条落账。
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move { write_cancelled_row(&f).await });
+            }
+        }
+    }
+}
+
+/// 取消行的实际写入（从 Drop 中拆出便于复用与测试）。
+async fn write_cancelled_row(f: &StreamLogFinalizer) {
+    let snap = f.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (mut p, mut c, mut t, cached) = snap.usage;
+    let choices = snap.response_choices;
+    // 兜底：上游未回报 usage 时按请求体 + 已收到内容本地估算，
+    // 取消行的计费统计不再恒为 0。
+    if t == 0 && p == 0 && c == 0 {
+        let req_body: serde_json::Value =
+            serde_json::from_str(&f.sanitized_log_body).unwrap_or(serde_json::Value::Null);
+        let (ep, ec, et) =
+            super::estimate_usage::estimate_usage(&req_body, Some(snap.content.as_str()), &f.model);
+        p = ep;
+        c = ec;
+        t = et;
+    }
+    f.write(
+        true,
+        false,
+        Some("client_cancelled"),
+        p,
+        c,
+        t,
+        cached,
+        choices,
+    )
+    .await;
+}
+
+/// 流式超时配置（FIX-08）：首帧等待与帧间空闲分别限时，0 表示禁用该项。
+/// 缺省 60s/120s，可经设置 `stream.first_frame_timeout_secs` /
+/// `stream.idle_timeout_secs` 覆盖（SettingsStore 任意键读取，无需 schema）。
+#[derive(Debug, Clone, Copy)]
+pub struct StreamTimeouts {
+    pub first_frame: std::time::Duration,
+    pub idle: std::time::Duration,
+}
+
+impl Default for StreamTimeouts {
+    fn default() -> Self {
+        Self {
+            first_frame: std::time::Duration::from_secs(60),
+            idle: std::time::Duration::from_secs(120),
+        }
+    }
+}
+
+impl StreamTimeouts {
+    pub fn from_settings(settings: &crate::settings_store::SettingsStore) -> Self {
+        let secs = |key: &str, default: u64| {
+            std::time::Duration::from_secs(settings.get_u64(key, default))
+        };
+        Self {
+            first_frame: secs("stream.first_frame_timeout_secs", 60),
+            idle: secs("stream.idle_timeout_secs", 120),
         }
     }
 }
@@ -790,10 +2249,22 @@ fn stream_response_body(
     codec_version: Option<String>,
     upstream_protocol: String,
     upstream_endpoint: String,
+    upstream_type: String,
+    timeouts: StreamTimeouts,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     let mode_for_error = mode.clone();
+    let snapshot = std::sync::Arc::new(std::sync::Mutex::new(StreamSnapshot::default()));
+    // Responses 逐帧持久化（续传锚点）：非 basic 策略下，下游每帧 SSE 字节
+    // 顺序落段表（seq 递增，response.id 从 response.created 帧提取）。
+    // 客户端中途断开时已生成帧自然保留——「丢了」变成「可回放」。
+    // brief 只裁请求消息列表，响应侧的续传能力必须与 detailed 一致。
+    let resume_frames_enabled = mode_for_error == "responses"
+        && crate::audit_log::current_policy().detail_level
+            != crate::audit_log::LogDetailLevel::Basic;
+    let resume_log_id = utils::id::new_id();
     let finalizer = StreamLogFinalizer {
-        repo,
+        repo: repo.clone(),
+        log_id: resume_log_id.clone(),
         key,
         audited,
         model,
@@ -810,14 +2281,21 @@ fn stream_response_body(
         codec_version,
         upstream_protocol,
         upstream_endpoint,
+        upstream_type,
         started: Instant::now(),
         completed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        snapshot: snapshot.clone(),
     };
     let completed = finalizer.completed.clone();
 
     async_stream::stream! {
         let mut had_error = false;
         let mut error_message: Option<String> = None;
+        // 终止帧 / 错误帧交给下游之前就已经落库时为 true，函数末尾不再重复写日志。
+        let mut finalized = false;
+        // Responses 逐帧持久化状态：帧序号 + 续传锚点（response.created 提取）
+        let mut frame_seq: i64 = 0;
+        let mut anchor_response_id: Option<String> = None;
 
         let upstream_bytes = upstream.body;
         tokio::pin!(upstream_bytes);
@@ -828,7 +2306,32 @@ fn stream_response_body(
         // bytes, never raw upstream bytes.  Native passthrough preserves raw.
         match pump.start() {
             Ok(first) => {
+                // 极短响应：首帧/伴随帧（carry）就含全部内容甚至终止标记，
+                // 此时 while 循环一次都不进——这里同步一次落账快照，
+                // 否则取消行丢内容、FIX-16 响应扫描拿到空快照。
+                update_stream_snapshot(&snapshot, &pump);
                 if !first.is_empty() {
+                    if resume_frames_enabled {
+                        persist_resume_frame(
+                            &repo,
+                            &resume_log_id,
+                            &mut frame_seq,
+                            &mut anchor_response_id,
+                            &first,
+                        )
+                        .await;
+                    }
+                    if !finalized && downstream_terminal_frame(&mode_for_error, &first) {
+                        finalized = true;
+                        write_stream_log(
+                            &finalizer,
+                            &completed,
+                            false,
+                            None,
+                            StreamLogSnapshot::take(&pump),
+                        )
+                        .await;
+                    }
                     yield Ok::<_, std::io::Error>(bytes::Bytes::from(first));
                 }
             }
@@ -838,11 +2341,56 @@ fn stream_response_body(
             }
         }
 
-        while !had_error {
-            match upstream_bytes.next().await {
+        // 协议终止事件已到即视为流完成（#57）：不等上游 TCP EOF——部分上游
+        // （如 ModelScope）发完数据后延迟关连接，期间客户端断开会把本已
+        // 成功的调用记成 499 零用量行。终止后跳出循环走正常落账路径。
+        // 首帧/伴随帧就含终止标记（极短响应）的情形由 pump 内部登记覆盖。
+        while !had_error && !pump.terminated() {
+            // 帧间空闲超时（FIX-08，提交后阶段）：上游挂死时不再无限等待，
+            // 超时按流错误收尾（下发结构化错误事件 + 502 落账）。0 = 禁用。
+            let next = if timeouts.idle.is_zero() {
+                upstream_bytes.next().await
+            } else {
+                match next_upstream_item(&mut upstream_bytes, timeouts.idle).await {
+                    UpstreamItem::Chunk(item) => item,
+                    UpstreamItem::IdleTimeout => {
+                        pump.mark_idle_timeout();
+                        had_error = true;
+                        error_message = Some(format!(
+                            "upstream idle timeout: no frame for {:?}",
+                            timeouts.idle
+                        ));
+                        break;
+                    }
+                }
+            };
+            match next {
                 Some(Ok(bytes)) => match pump.push(&bytes) {
                     Ok(out) => {
+                        // 每帧后同步取消路径要用的落账快照（#57）。
+                        update_stream_snapshot(&snapshot, &pump);
                         if !out.is_empty() {
+                            if resume_frames_enabled {
+                                persist_resume_frame(
+                                    &repo,
+                                    &resume_log_id,
+                                    &mut frame_seq,
+                                    &mut anchor_response_id,
+                                    &out,
+                                )
+                                .await;
+                            }
+                            if !finalized && downstream_terminal_frame(&mode_for_error, &out) {
+                                finalized = true;
+                                write_stream_log(
+                                    &finalizer,
+                                    &completed,
+                                    false,
+                                    None,
+                                    StreamLogSnapshot::take(&pump),
+                                )
+                                .await;
+                            }
                             yield Ok::<_, std::io::Error>(bytes::Bytes::from(out));
                         }
                     }
@@ -854,7 +2402,16 @@ fn stream_response_body(
                 },
                 Some(Err(e)) => {
                     had_error = true;
-                    error_message = Some(format!("stream interrupted: {e}"));
+                    // The upstream body failed mid-stream.  `error decoding
+                    // response body` (reqwest Kind::Decode) hides the real cause
+                    // behind a generic message, so walk the source chain to
+                    // surface whether it was a corrupt content encoding (gzip
+                    // frame cut short) or a dropped connection (hyper reset).
+                    error_message = Some(format!(
+                        "stream interrupted: {} (root: {})",
+                        e,
+                        error_chain_root(&e)
+                    ));
                     break;
                 }
                 None => break,
@@ -865,7 +2422,20 @@ fn stream_response_body(
         if !had_error {
             match pump.finish() {
                 Ok(out) => {
+                    // 终止收尾后再同步一次快照：finish 可能补齐终止标记内容。
+                    update_stream_snapshot(&snapshot, &pump);
                     if !out.is_empty() {
+                        if !finalized && downstream_terminal_frame(&mode_for_error, &out) {
+                            finalized = true;
+                            write_stream_log(
+                                &finalizer,
+                                &completed,
+                                false,
+                                None,
+                                StreamLogSnapshot::take(&pump),
+                            )
+                            .await;
+                        }
                         yield Ok::<_, std::io::Error>(bytes::Bytes::from(out));
                     }
                 }
@@ -879,40 +2449,230 @@ fn stream_response_body(
         // A downstream error before/after commit must produce a protocol
         // error event (never a retry, never a fake success).
         if had_error {
+            // 与终止帧同理：错误帧发出去后客户端也可能立刻关闭连接，日志必须先落库，
+            // 否则这条 502 会被 Drop 里的 client_cancelled 覆盖成 499。
+            if !finalized {
+                finalized = true;
+                write_stream_log(
+                    &finalizer,
+                    &completed,
+                    true,
+                    error_message.as_deref(),
+                    StreamLogSnapshot::take(&pump),
+                )
+                .await;
+            }
             let msg = error_message.clone().unwrap_or_else(|| "stream error".to_string());
             let ev = format_stream_error(&mode_for_error, &msg);
             yield Ok::<_, std::io::Error>(bytes::Bytes::from(ev));
         }
 
-        let (usage_prompt, usage_completion, usage_total) = pump.usage();
-        // Mark the request completed so the Drop finalizer does NOT write a
-        // duplicate client_cancelled row, then write the normal log inline.
-        completed.store(true, std::sync::atomic::Ordering::SeqCst);
-        finalizer
-            .write(false, had_error, error_message.as_deref(), usage_prompt, usage_completion, usage_total)
+        // 兜底：上游自然结束、终止帧没被单独识别出来（例如只发到 finish_reason 就 EOF）
+        // 时仍在这里写日志。已经落过库的请求不再重复写。
+        if !finalized {
+            write_stream_log(
+                &finalizer,
+                &completed,
+                had_error,
+                error_message.as_deref(),
+                StreamLogSnapshot::take(&pump),
+            )
             .await;
+        }
     }
+}
+
+/// 落库所需的 pump 侧快照。
+///
+/// 必须在 `await` 之前同步取好：`stream_response_body` 是 `async_stream` 生成器，
+/// 把 `&mut pump` 带过 `await` 会让生成器自引用。调用方只交出这个 owned 结构体，
+/// 跨 `await` 存活的只有 `&finalizer` / `&completed`（与改动前的收尾代码同形）。
+struct StreamLogSnapshot {
+    usage: (i64, i64, i64, i64),
+    response_choices: Option<String>,
+    accumulated_content: String,
+}
+
+impl StreamLogSnapshot {
+    fn take(pump: &StreamPumpCore) -> Self {
+        Self {
+            usage: pump.usage(),
+            response_choices: pump.build_response_choices(),
+            accumulated_content: pump.accumulated_content().to_string(),
+        }
+    }
+}
+
+/// 把一次流式请求的结果写成一条审计日志（成功，或已提交之后的流错误）。
+///
+/// 关键约束：**必须在终止帧交给下游之前调用**。终止帧一旦送达，客户端（Codex /
+/// Claude Code / Node undici 等 Agent）就会立刻关闭连接，hyper 不再轮询本流，
+/// 生成器直接被 drop；此时若日志还没写，`StreamLogFinalizer::drop` 会把一条完整
+/// 成功的流误记成 `499 / client_cancelled / 0 token / 空响应`。
+async fn write_stream_log(
+    finalizer: &StreamLogFinalizer,
+    completed: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    had_error: bool,
+    error_message: Option<&str>,
+    snapshot: StreamLogSnapshot,
+) {
+    let (mut usage_prompt, mut usage_completion, mut usage_total, usage_cached) = snapshot.usage;
+
+    // Fallback: estimate tokens locally when upstream didn't return usage.
+    // Only estimate for successful streams (no error).
+    if usage_total == 0 && usage_prompt == 0 && usage_completion == 0 && !had_error {
+        let req_body: serde_json::Value =
+            serde_json::from_str(&finalizer.sanitized_log_body).unwrap_or(serde_json::Value::Null);
+        let (p, c, t) = super::estimate_usage::estimate_usage(
+            &req_body,
+            Some(snapshot.accumulated_content.as_str()),
+            &finalizer.model,
+        );
+        usage_prompt = p;
+        usage_completion = c;
+        usage_total = t;
+        if usage_total > 0 {
+            eprintln!("[INFO] stream token usage estimated (upstream didn't return usage): prompt={}, completion={}, total={}", usage_prompt, usage_completion, usage_total);
+        }
+    }
+
+    // Mark the request completed so the Drop finalizer does NOT write a
+    // duplicate client_cancelled row, then write the log.
+    completed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let response_choices = if had_error {
+        None
+    } else {
+        snapshot.response_choices
+    };
+    finalizer
+        .write(
+            false,
+            had_error,
+            error_message,
+            usage_prompt,
+            usage_completion,
+            usage_total,
+            usage_cached,
+            response_choices,
+        )
+        .await;
+}
+
+/// 判断这段下游字节里是否已经出现该协议的终止帧。
+///
+/// 出现即代表响应体已完整交给下游，之后下游怎么关连接都不影响本次请求的成功性。
+/// 逐行精确匹配而不是子串搜索：SSE 的 JSON 载荷里换行一定是 `\n` 转义，正文内容
+/// 不可能伪造出一个行首的终止帧。
+fn downstream_terminal_frame(mode: &str, out: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(out) else {
+        return false;
+    };
+    // 与 `format_stream_error` 使用同一套下游协议判定。
+    let terminal_event = match mode {
+        "anthropic" | "anthropic_count_tokens" => Some("message_stop"),
+        "responses" => Some("response.completed"),
+        _ => None,
+    };
+    text.lines().any(|line| {
+        let line = line.trim_end_matches('\r');
+        if let Some(name) = terminal_event {
+            line.strip_prefix("event:")
+                .is_some_and(|value| value.trim() == name)
+        } else {
+            line.strip_prefix("data:")
+                .is_some_and(|payload| payload.trim() == "[DONE]")
+        }
+    })
+}
+
+/// 从下游 SSE 帧字节中提取续传锚点（response.created 事件里的 response.id）。
+/// 纯函数：只认 `data:` 行的 JSON，`type == "response.created"` 时取 `response.id`。
+fn extract_response_id(frame: &str) -> Option<String> {
+    for line in frame.lines() {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload.trim()) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) == Some("response.created") {
+            if let Some(id) = value
+                .get("response")
+                .and_then(|r| r.get("id"))
+                .and_then(|id| id.as_str())
+            {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Responses 逐帧持久化：一帧下游 SSE 字节顺序写入段表（best-effort）。
+/// 首次见到 response.created 帧时提取锚点；此前已写入的帧锚点为 NULL
+/// （实际首帧即 response.created，NULL 帧仅出现在上游乱序的病态场景）。
+async fn persist_resume_frame(
+    repo: &Repository,
+    log_id: &str,
+    seq: &mut i64,
+    anchor: &mut Option<String>,
+    frame: &[u8],
+) {
+    let text = String::from_utf8_lossy(frame);
+    if anchor.is_none() {
+        *anchor = extract_response_id(&text);
+    }
+    *seq += 1;
+    repo.append_stream_frame(
+        log_id,
+        *seq,
+        anchor.as_deref(),
+        &text,
+        &crate::utils::time::now_iso(),
+    )
+    .await;
+}
+
+/// Walk an error's `source()` chain to its root and return it as a string.
+/// Used when a generic transport message (e.g. reqwest `Kind::Decode`'s
+/// "error decoding response body") hides the actual failure cause.
+fn error_chain_root(err: &dyn std::error::Error) -> String {
+    let mut deepest: &dyn std::error::Error = err;
+    while let Some(source) = deepest.source() {
+        deepest = source;
+    }
+    deepest.to_string()
 }
 
 /// Format a post-commit stream error event in the DOWNSTREAM protocol (I-2).
 /// `mode` is the downstream mode ("chat" / "anthropic" / "responses" /
 /// "embedding" / "anthropic_count_tokens"), NOT the SSE transform mode.
-fn format_stream_error(mode: &str, message: &str) -> String {
-    let msg = message.replace('"', "\\\"");
+///
+/// FIX-20：data 载荷一律经 serde_json 构造——错误消息含引号/换行/反斜杠时
+/// 手写转义拼接会产生非法 JSON 帧导致 SDK 断流。
+pub(crate) fn format_stream_error(mode: &str, message: &str) -> String {
     if mode == "responses" {
         format!(
-            "event: response.failed\ndata: {{\"type\":\"response.failed\",\"error\":{{\"message\":\"{}\"}}}}\n\n",
-            msg
+            "event: response.failed\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "response.failed",
+                "error": {"message": message}
+            })
         )
     } else if mode == "anthropic" || mode == "anthropic_count_tokens" {
         format!(
-            "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":\"{}\"}}}}\n\n",
-            msg
+            "event: error\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": message}
+            })
         )
     } else {
         format!(
-            "data: {{\"error\":{{\"message\":\"{}\",\"type\":\"server_error\"}}}}\n\ndata: [DONE]\n\n",
-            msg
+            "data: {}\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "error": {"message": message, "type": "server_error"}
+            })
         )
     }
 }
@@ -941,8 +2701,178 @@ mod tests {
     use super::*;
     use crate::db::models::Channel;
 
+    fn upstream_from_chunks(chunks: Vec<&[u8]>) -> UpstreamStream {
+        let body = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<_, std::io::Error>(bytes::Bytes::from(c.to_vec())))
+                .collect::<Vec<_>>(),
+        )
+        .boxed();
+        UpstreamStream {
+            content_type: "text/event-stream".to_string(),
+            headers: vec![],
+            body,
+        }
+    }
+
+    /// First-frame barrier diagnostics: empty upstream body must surface
+    /// "0 bytes" so audit logs distinguish silent drops from content errors.
+    #[tokio::test]
+    async fn buffer_first_record_empty_stream_reports_zero_bytes() {
+        let mut upstream = upstream_from_chunks(vec![]);
+        let diagnostic = buffer_first_record(&mut upstream).await.unwrap_err();
+        assert!(diagnostic.contains("received 0 bytes"), "{diagnostic}");
+    }
+
+    /// Codex/OpenAI-style failure: HTTP 200 + JSON error body with no SSE
+    /// framing at all. The diagnostic must carry the body preview so the
+    /// audit log reveals the actual upstream error.
+    #[tokio::test]
+    async fn buffer_first_record_non_sse_json_body_is_surfaced() {
+        let mut upstream = upstream_from_chunks(vec![
+            b"{\"error\":{\"message\":\"quota exceeded for account\"}}".as_slice(),
+        ]);
+        let diagnostic = buffer_first_record(&mut upstream).await.unwrap_err();
+        assert!(diagnostic.contains("quota exceeded"), "{diagnostic}");
+    }
+
+    /// A complete SSE-shaped record that fails first-record validation (no
+    /// `event:` line, `data:` payload is not valid JSON) must surface its
+    /// content.  Note: records with no `data:` line at all are valid SSE
+    /// keep-alives and pass validation by design.
+    #[tokio::test]
+    async fn buffer_first_record_invalid_record_is_surfaced() {
+        let mut upstream = upstream_from_chunks(vec![b"data: not valid json\n\n"]);
+        let diagnostic = buffer_first_record(&mut upstream).await.unwrap_err();
+        assert!(diagnostic.contains("failed validation"), "{diagnostic}");
+        assert!(diagnostic.contains("not valid json"), "{diagnostic}");
+    }
+
+    /// ChatGPT Codex can emit a very large first `response.created` event
+    /// because the response object echoes request metadata/tools.  The commit
+    /// barrier must wait for the real SSE terminator instead of treating a
+    /// >256 KiB but otherwise valid first record as a protocol failure.
+    #[tokio::test]
+    async fn buffer_first_record_accepts_large_codex_created_event() {
+        let large_metadata = "x".repeat(300 * 1024);
+        let record = format!(
+            "event: response.created\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "response.created",
+                "response": {
+                    "id": "resp_test",
+                    "object": "response",
+                    "status": "in_progress",
+                    "metadata": { "large": large_metadata }
+                },
+                "sequence_number": 0
+            })
+        );
+        let mut upstream = upstream_from_chunks(vec![record.as_bytes()]);
+
+        let (first_frame, carry) = buffer_first_record(&mut upstream).await.unwrap();
+
+        assert_eq!(first_frame, record.as_bytes());
+        assert!(carry.is_empty());
+    }
+
+    /// Non-SSE content-type must be called out in the diagnostic.
+    #[tokio::test]
+    async fn buffer_first_record_surfaces_content_type() {
+        let mut upstream = upstream_from_chunks(vec![b"<html>blocked</html>"]);
+        upstream.content_type = "text/html".to_string();
+        let diagnostic = buffer_first_record(&mut upstream).await.unwrap_err();
+        assert!(diagnostic.contains("text/html"), "{diagnostic}");
+    }
+
+    /// Mid-stream idle timeout: after the first frame is committed, if the
+    /// upstream stalls (no more data), the pump must emit a protocol error
+    /// event containing "idle timeout" instead of hanging forever.
+    #[tokio::test]
+    async fn stream_response_body_idle_timeout_emits_error_event() {
+        let pool = fresh_db().await;
+        let repo = Arc::new(Repository::new(pool));
+
+        // First chunk: one valid Anthropic record (gets through the barrier).
+        let first_chunk = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"up-model\",\"content\":[]}}\n\n";
+        // Second chunk: NEVER ARRIVES — the stream ends after the first record
+        // but we simulate a stall by providing only the first chunk and then
+        // ending the stream.  To test idle timeout specifically, we use a
+        // stream that yields one chunk then hangs (pending forever).
+        let first_chunk = first_chunk.to_vec();
+        let body = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(bytes::Bytes::from(
+            first_chunk,
+        ))])
+        .chain(futures_util::stream::pending())
+        .boxed();
+
+        let mut upstream = UpstreamStream {
+            content_type: "text/event-stream".to_string(),
+            headers: vec![],
+            body,
+        };
+        let (first_frame, carry) = buffer_first_record(&mut upstream).await.unwrap();
+        assert!(carry.is_empty(), "single record, no carry");
+
+        let mut sup = crate::core::stream_supervisor::StreamSupervisor::new();
+        sup.begin_connect().unwrap();
+        sup.on_upstream_headers().unwrap();
+        sup.on_first_frame_validated().unwrap();
+        let prepared = crate::protocol::codec::CodecRegistry::prepare_pair(
+            crate::protocol::codec::Protocol::Chat,
+            crate::protocol::codec::Protocol::Messages,
+            "up-model",
+            &json!({"model":"up-model", "messages":[{"role":"user","content":"hi"}]}),
+        )
+        .unwrap();
+        let pump =
+            StreamPumpCore::new(sup, prepared.codec.new_stream_decoder(), first_frame, carry)
+                .unwrap();
+
+        let stream = stream_response_body(
+            pump,
+            upstream,
+            repo,
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "chat".to_string(),
+            false,
+            "{}".to_string(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "anthropic".to_string(),
+            1,
+            "messages_g1_native".to_string(),
+            None,
+            "anthropic".to_string(),
+            "messages".to_string(),
+            "channel".to_string(),
+            // Very short idle timeout for testing.
+            StreamTimeouts {
+                first_frame: Duration::ZERO,
+                idle: Duration::from_millis(50),
+            },
+        );
+
+        let mut bytes = Vec::new();
+        tokio::pin!(stream);
+        while let Some(item) = stream.next().await {
+            bytes.extend_from_slice(&item.unwrap());
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("idle timeout"),
+            "downstream must receive idle timeout error event: {text}"
+        );
+    }
+
     fn channel(protocol: Option<&str>, endpoints: &[&str]) -> Channel {
         Channel {
+            model_mapping_disabled: "[]".into(),
             id: "ch-1".into(),
             name: "t".into(),
             channel_type: "claude".into(),
@@ -966,6 +2896,10 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_test_at: None,
             last_test_ok: None,
+            last_probe_at: None,
+            last_probe_ok: None,
+            probe_latency_ms: None,
+            api_key_enabled: Some(1),
         }
     }
 
@@ -993,6 +2927,14 @@ mod tests {
         assert!(supports_count_tokens(&with));
         let without = channel(Some("anthropic"), &["messages"]);
         assert!(!supports_count_tokens(&without));
+    }
+
+    #[test]
+    fn count_tokens_is_excluded_from_request_logs() {
+        assert!(!should_write_request_log(EndpointKind::CountTokens));
+        assert!(should_write_request_log(EndpointKind::Messages));
+        assert!(should_write_request_log(EndpointKind::ChatCompletions));
+        assert!(should_write_request_log(EndpointKind::Responses));
     }
 
     /// T06 I-4 (leader adjudication): a legacy revision-0 `type == "claude"`
@@ -1054,15 +2996,18 @@ mod tests {
         sup.begin_connect().unwrap();
         sup.on_upstream_headers().unwrap();
         sup.on_first_frame_validated().unwrap();
-        let mode = SseMode::MessagesToChat;
-        let decoder = decoder_for(mode, "up-model", "");
+        let prepared = crate::protocol::codec::CodecRegistry::prepare_pair(
+            crate::protocol::codec::Protocol::Chat,
+            crate::protocol::codec::Protocol::Messages,
+            "up-model",
+            &json!({"model":"up-model", "messages":[{"role":"user","content":"hi"}]}),
+        )
+        .unwrap();
         let mut pump = StreamPumpCore::new(
             sup,
-            mode,
-            decoder,
+            prepared.codec.new_stream_decoder(),
             first_frame.clone(),
             carry.clone(),
-            "up-model".to_string(),
         )
         .unwrap();
 
@@ -1127,6 +3072,49 @@ mod tests {
         assert!(!format_stream_error("chat", "x").contains("chat_to_messages_v1"));
     }
 
+    /// FIX-20：错误消息含引号/换行/反斜杠时 data 帧必须是合法 JSON
+    /// （手写转义拼接会产生断流帧）。三种下游协议逐一断言可解析。
+    #[test]
+    fn stream_error_events_are_always_valid_json() {
+        for mode in ["chat", "anthropic", "responses"] {
+            let event = format_stream_error(mode, "quote \" backslash \\ newline \n tab \t");
+            for line in event.lines() {
+                if let Some(payload) = line.strip_prefix("data: ") {
+                    if payload == "[DONE]" {
+                        continue;
+                    }
+                    let parsed: serde_json::Value = serde_json::from_str(payload)
+                        .unwrap_or_else(|e| panic!("{mode}: invalid JSON frame {payload:?}: {e}"));
+                    // 消息原样往返（合法转义，不丢失字符）。
+                    let msg = if mode == "responses" {
+                        parsed.pointer("/error/message")
+                    } else {
+                        parsed.pointer("/error/message")
+                    };
+                    assert_eq!(
+                        msg.and_then(|m| m.as_str()),
+                        Some("quote \" backslash \\ newline \n tab \t")
+                    );
+                }
+            }
+        }
+    }
+
+    /// The root-cause walk must surface the innermost error even when a generic
+    /// transport message (reqwest `Kind::Decode`) wraps it.
+    #[test]
+    fn error_chain_root_walks_to_deepest_cause() {
+        // io::Error with no source → itself.
+        let plain = std::io::Error::other("boom");
+        assert_eq!(error_chain_root(&plain), "boom");
+
+        // io::Error wraps an inner error via .source(); chain to the root.
+        let root = std::io::Error::other("unexpected end of gzip file");
+        let nested = std::io::Error::new(std::io::ErrorKind::Other, root);
+        let chained = std::io::Error::new(std::io::ErrorKind::Other, nested);
+        assert_eq!(error_chain_root(&chained), "unexpected end of gzip file");
+    }
+
     fn now() -> String {
         crate::utils::time::now_iso()
     }
@@ -1139,6 +3127,63 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn channel_mode_health_cools_down_only_the_failing_transport_mode() {
+        use crate::db::models::CreateChannelInput;
+
+        let repo = Repository::new(fresh_db().await);
+        let channel = repo
+            .create_channel(&CreateChannelInput {
+                name: "mode-health".into(),
+                channel_type: "openai".into(),
+                base_url: "https://example.test/v1".into(),
+                api_key: "sk-test".into(),
+                models: vec!["gpt-4o".into()],
+                protocol: Some("openai".into()),
+                provider: Some("custom".into()),
+                native_base_url: Some("https://example.test/v1".into()),
+                native_endpoints: Some(vec!["chat_completions".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let failure_at = "2026-08-11T00:00:00.000Z";
+        let cooldown_until = "2099-08-11T00:00:00.000Z";
+
+        for _ in 0..2 {
+            repo.record_channel_mode_failure(
+                &channel.id,
+                "chat_completions",
+                false,
+                failure_at,
+                cooldown_until,
+                "upstream returned an undecodable body (HTTP 200, 0 bytes)",
+            )
+            .await
+            .unwrap();
+        }
+
+        let available_non_stream = repo
+            .get_enabled_channels_for_mode("chat_completions", false, failure_at)
+            .await
+            .unwrap();
+        let available_stream = repo
+            .get_enabled_channels_for_mode("chat_completions", true, failure_at)
+            .await
+            .unwrap();
+        assert!(available_non_stream.is_empty());
+        assert_eq!(available_stream.len(), 1);
+
+        repo.record_channel_mode_success(&channel.id, "chat_completions", false)
+            .await
+            .unwrap();
+        let recovered = repo
+            .get_enabled_channels_for_mode("chat_completions", false, failure_at)
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
     }
 
     fn audited_request() -> AuditedRequest {
@@ -1161,6 +3206,7 @@ mod tests {
             body_len: 0,
             audit_result: SecurityScanResult::default(),
             request_features: RequestFeatures::default(),
+            security_settings: crate::security::SecuritySettings::default(),
         }
     }
 
@@ -1172,12 +3218,259 @@ mod tests {
             status: 1,
             allowed_models: "[]".into(),
             allowed_channels: "[]".into(),
+            denied_models: "[]".into(),
+            denied_channels: "[]".into(),
             quota_limit: 0,
             quota_used: 0,
             expires_at: None,
             created_at: now(),
             updated_at: now(),
         }
+    }
+
+    // ─── C-03 第二档：Responses 逐帧持久化（续传锚点）────────────────────
+
+    fn responses_upstream(terminated: bool) -> UpstreamStream {
+        let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![Ok(
+            bytes::Bytes::from_static(
+                b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_test_42\",\"status\":\"in_progress\"}}\n\n",
+            ),
+        )];
+        let mut second = String::from(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n\n",
+        );
+        if terminated {
+            second.push_str("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test_42\",\"status\":\"completed\"}}\n\n");
+        }
+        chunks.push(Ok(bytes::Bytes::from(second)));
+        let body = futures_util::stream::iter(chunks)
+            .chain(futures_util::stream::pending::<
+                Result<bytes::Bytes, std::io::Error>,
+            >())
+            .boxed();
+        UpstreamStream {
+            content_type: "text/event-stream".to_string(),
+            headers: vec![],
+            body,
+        }
+    }
+
+    async fn pump_for_responses(upstream: &mut UpstreamStream) -> StreamPumpCore {
+        let (first_frame, carry) = buffer_first_record(upstream).await.unwrap();
+        let mut sup = crate::core::stream_supervisor::StreamSupervisor::new();
+        sup.begin_connect().unwrap();
+        sup.on_upstream_headers().unwrap();
+        sup.on_first_frame_validated().unwrap();
+        let prepared = crate::protocol::codec::CodecRegistry::prepare_pair(
+            crate::protocol::codec::Protocol::Responses,
+            crate::protocol::codec::Protocol::Responses,
+            "up-model",
+            &json!({"model":"up-model", "input":"hi"}),
+        )
+        .unwrap();
+        StreamPumpCore::new(sup, prepared.codec.new_stream_decoder(), first_frame, carry).unwrap()
+    }
+
+    /// 正常完成的 Responses 流：全部帧按序落段，锚点（response.id）可反查，
+    /// 段表 log_id 与落账行 id 一致（续传回放据此判定完成状态）。
+    #[tokio::test]
+    async fn responses_stream_persists_frames_progressively() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let mut upstream = responses_upstream(true);
+        let pump = pump_for_responses(&mut upstream).await;
+
+        let mut stream = Box::pin(stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "responses".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "openai".to_string(),
+            1,
+            "responses_g1_native".to_string(),
+            None,
+            "responses".to_string(),
+            "responses".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        ));
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+
+        let frames = repo
+            .get_stream_frames_after("resp_test_42", 0)
+            .await
+            .unwrap();
+        assert!(!frames.is_empty(), "完成流应落全部帧");
+        let joined: String = frames.iter().map(|(_, f)| f.as_str()).collect();
+        assert!(joined.contains("response.created"));
+        assert!(joined.contains("response.output_text.delta"));
+        assert!(joined.contains("response.completed"), "终止帧应已持久化");
+
+        // 锚点反查 → 段表 log_id == 落账行 id
+        let (anchor_log_id, _) = repo
+            .find_stream_anchor("resp_test_42")
+            .await
+            .unwrap()
+            .expect("锚点应可反查");
+        let logs = repo.get_logs(10, 0).await.unwrap();
+        let row = logs.first().expect("完成流应有落账行");
+        assert_eq!(row.id, anchor_log_id, "段表与落账行必须同一 log_id");
+
+        // offset 语义：跳过 seq<=1 的帧
+        let tail = repo
+            .get_stream_frames_after("resp_test_42", 1)
+            .await
+            .unwrap();
+        assert!(!tail.iter().any(|(_, f)| f.contains("response.created")));
+    }
+
+    /// 客户端中断的 Responses 流：已生成帧保留（回放可用），无终止帧，
+    /// 499 取消行照常落账（既有取消语义不变）。
+    #[tokio::test]
+    async fn responses_cancel_keeps_persisted_frames_for_replay() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let mut upstream = responses_upstream(false);
+        let pump = pump_for_responses(&mut upstream).await;
+
+        let mut stream = Box::pin(stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "responses".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "openai".to_string(),
+            1,
+            "responses_g1_native".to_string(),
+            None,
+            "responses".to_string(),
+            "responses".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        ));
+        stream.next().await.unwrap().unwrap();
+        stream.next().await.unwrap().unwrap();
+        drop(stream);
+
+        // 499 取消行（Drop spawn 异步写）
+        let mut cancelled = false;
+        for _ in 0..100 {
+            let logs = repo.get_logs(10, 0).await.unwrap();
+            if logs.first().is_some_and(|row| row.status_code == 499) {
+                cancelled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(cancelled, "取消行必须照常落账");
+
+        let frames = repo
+            .get_stream_frames_after("resp_test_42", 0)
+            .await
+            .unwrap();
+        let joined: String = frames.iter().map(|(_, f)| f.as_str()).collect();
+        assert!(
+            joined.contains("response.output_text.delta"),
+            "中断前帧应保留"
+        );
+        assert!(
+            !joined.contains("response.completed"),
+            "中断流不应有终止帧（回放端点据此合成 incomplete 收尾）"
+        );
+    }
+
+    /// 第一档端到端（真实路径）：chat SSE 流（带终止帧、有累计内容）完整走完
+    /// stream_response_body → 落账行 → create_log 漏斗 → 段表出现内容段。
+    /// 此前段测试直接构造 log 调漏斗，未覆盖 driver 真实累计内容到段的链路。
+    #[tokio::test]
+    async fn chat_stream_accumulated_content_reaches_segments() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let mut upstream = hanging_after_terminal_upstream(true, true);
+        let pump = pump_for(&mut upstream).await;
+
+        let mut stream = Box::pin(stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "chat".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "anthropic".to_string(),
+            1,
+            "messages_g1_native".to_string(),
+            None,
+            "anthropic".to_string(),
+            "messages".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        ));
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+
+        // 落账行存在且为流式
+        let row = repo
+            .get_logs(10, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("完成流应落账");
+        assert_eq!(row.is_stream, 1);
+
+        // 段表出现该 log_id 的内容段（detailed 默认策略 + 流式 + 有累计内容）
+        let segments = repo.get_stream_segments(&row.id).await.unwrap();
+        assert!(
+            !segments.is_empty(),
+            "chat SSE 累计内容应经漏斗落段（log {}）",
+            row.id
+        );
+        let joined: String = segments.into_iter().map(|(_, c)| c).collect();
+        assert!(
+            joined.contains("hi"),
+            "段内容应来自真实累计（含上游 delta 文本），实际: {joined}"
+        );
+    }
+
+    #[test]
+    fn extract_response_id_parses_created_event_only() {
+        let created =
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_x\",\"status\":\"in_progress\"}}\n\n";
+        assert_eq!(extract_response_id(created), Some("resp_x".to_string()));
+        // 非 created 事件不提取；data 无空格前缀可解析；坏 JSON 跳过
+        let delta = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"x\",\"response\":{\"id\":\"resp_y\"}}\n\n";
+        assert_eq!(extract_response_id(delta), None);
+        assert_eq!(extract_response_id("data: not-json\n\n"), None);
+        assert_eq!(
+            extract_response_id(
+                "event: response.created\ndata: {\"type\":\"response.created\"}\n\n"
+            ),
+            None
+        );
     }
 
     /// C-1: the FULL `stream_response_body` emission seam.  The first upstream
@@ -1212,16 +3505,16 @@ mod tests {
         sup.begin_connect().unwrap();
         sup.on_upstream_headers().unwrap();
         sup.on_first_frame_validated().unwrap();
-        let mode = SseMode::MessagesToChat;
-        let pump = StreamPumpCore::new(
-            sup,
-            mode,
-            decoder_for(mode, "up-model", ""),
-            first_frame,
-            carry,
-            "up-model".to_string(),
+        let prepared = crate::protocol::codec::CodecRegistry::prepare_pair(
+            crate::protocol::codec::Protocol::Chat,
+            crate::protocol::codec::Protocol::Messages,
+            "up-model",
+            &json!({"model":"up-model", "messages":[{"role":"user","content":"hi"}]}),
         )
         .unwrap();
+        let pump =
+            StreamPumpCore::new(sup, prepared.codec.new_stream_decoder(), first_frame, carry)
+                .unwrap();
 
         let stream = stream_response_body(
             pump,
@@ -1243,6 +3536,8 @@ mod tests {
             None,
             "anthropic".to_string(),
             "messages".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
         );
 
         let mut bytes = Vec::new();
@@ -1259,5 +3554,446 @@ mod tests {
             text.contains("\"content\":\"carried\""),
             "the carry record must be decoded and emitted by stream_response_body: {text}"
         );
+    }
+
+    // ─── #57：流式落账语义（终止早退 / 取消保留用量） ─────────────────────
+
+    /// 构造「首记录 + 内容/用量块 + 终止标记，随后挂死」的上游体：
+    /// 协议终止事件之后上游流永远不结束（模拟 ModelScope 发完数据延迟关
+    /// 连接甚至不关连接的行为），用于验证终止早退。
+    fn hanging_after_terminal_upstream(with_stop: bool, with_usage: bool) -> UpstreamStream {
+        let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![Ok(bytes::Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"up-model\",\"content\":[]}}\n\n",
+        ))];
+        let mut second = String::new();
+        second.push_str("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n");
+        if with_usage {
+            second.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n");
+        }
+        if with_stop {
+            second.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        }
+        chunks.push(Ok(bytes::Bytes::from(second)));
+        let body = futures_util::stream::iter(chunks)
+            .chain(futures_util::stream::pending::<
+                Result<bytes::Bytes, std::io::Error>,
+            >())
+            .boxed();
+        UpstreamStream {
+            content_type: "text/event-stream".to_string(),
+            headers: vec![],
+            body,
+        }
+    }
+
+    async fn pump_for(upstream: &mut UpstreamStream) -> StreamPumpCore {
+        let (first_frame, carry) = buffer_first_record(upstream).await.unwrap();
+        let mut sup = crate::core::stream_supervisor::StreamSupervisor::new();
+        sup.begin_connect().unwrap();
+        sup.on_upstream_headers().unwrap();
+        sup.on_first_frame_validated().unwrap();
+        let prepared = crate::protocol::codec::CodecRegistry::prepare_pair(
+            crate::protocol::codec::Protocol::Chat,
+            crate::protocol::codec::Protocol::Messages,
+            "up-model",
+            &json!({"model":"up-model", "messages":[{"role":"user","content":"hi"}]}),
+        )
+        .unwrap();
+        StreamPumpCore::new(sup, prepared.codec.new_stream_decoder(), first_frame, carry).unwrap()
+    }
+
+    fn full_request_body() -> String {
+        serde_json::json!({
+            "model": "m",
+            "messages": [{"role":"user","content":"请帮我总结这段足够长的提示词内容，确保本地 token 估算明显大于零，用于验证取消路径的兜底估算逻辑。"}]
+        })
+        .to_string()
+    }
+
+    // ─── FIX-16：响应侧扫描接入主路径（可观察测试） ────────────────────────
+
+    fn audited_request_with_response_scan() -> AuditedRequest {
+        let mut audited = audited_request();
+        audited.security_settings = crate::security::SecuritySettings {
+            enabled: true,
+            scan_response: true,
+            ..Default::default()
+        };
+        audited
+    }
+
+    /// 非流式 facade：响应体含凭证 → 落账行风险升级、摘要拼「响应侧」、
+    /// response 阶段发现入库。
+    #[tokio::test]
+    async fn non_stream_response_scan_records_findings() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let audited = audited_request_with_response_scan();
+        let execution = crate::core::plan_executor::PlanExecution {
+            status: 200,
+            body: json!({
+                "choices": [{"message": {"role": "assistant",
+                    "content": "token sk-abcdefghijklmnopqrstuvwx123456 end"}}]
+            }),
+            usage: None,
+            channel_id: Some("ch-1".into()),
+            channel_name: Some("ch".into()),
+            upstream_type: Some("channel".into()),
+            route_group: Some("chat_g1_native".into()),
+            upstream_protocol: Some("openai".into()),
+            upstream_endpoint: Some("chat_completions".into()),
+            upstream_model: Some("up-model".into()),
+            provider: Some("openai".into()),
+            identity_revision: Some(1),
+            codec_version: None,
+            response_headers: vec![],
+            attempts: 1,
+            duration_ms: 5,
+            last_failure: None,
+        };
+        write_non_stream_log(
+            &repo,
+            &api_key(),
+            &audited,
+            "chat",
+            &execution,
+            5,
+            "{}",
+            None,
+        )
+        .await;
+
+        let logs = repo.get_logs(10, 0).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        let row = &logs[0];
+        assert_ne!(
+            row.risk_level, "clean",
+            "响应凭证必须升级风险等级: {}",
+            row.risk_level
+        );
+        assert!(
+            row.risk_summary.as_deref().unwrap_or("").contains("响应侧"),
+            "summary: {:?}",
+            row.risk_summary
+        );
+        let findings = repo.get_security_findings(&row.id).await.unwrap();
+        assert!(
+            findings.iter().any(|f| f.phase == "response"),
+            "response 发现必须入库: {findings:?}"
+        );
+    }
+
+    /// 流式 facade：累积内容含凭证 → 完成行的审计同样并入响应侧发现。
+    #[tokio::test]
+    async fn stream_response_scan_records_findings() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let secret_delta = "leak sk-abcdefghijklmnopqrstuvwx123456 now";
+        let body = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(bytes::Bytes::from(
+            format!(
+                "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"up-model\",\"content\":[]}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{secret_delta}\"}}}}\n\n\
+                 event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n\
+                 event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            ),
+        ))])
+        .boxed();
+        let mut upstream = UpstreamStream {
+            content_type: "text/event-stream".to_string(),
+            headers: vec![],
+            body,
+        };
+        let pump = pump_for(&mut upstream).await;
+
+        let stream = stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request_with_response_scan(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "chat".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "anthropic".to_string(),
+            1,
+            "messages_g1_native".to_string(),
+            None,
+            "anthropic".to_string(),
+            "messages".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        );
+        let mut bytes = Vec::new();
+        tokio::pin!(stream);
+        while let Some(item) = stream.next().await {
+            bytes.extend_from_slice(&item.unwrap());
+        }
+
+        let logs = repo.get_logs(10, 0).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        let row = &logs[0];
+        assert_eq!(row.status_code, 200);
+        assert_ne!(
+            row.risk_level, "clean",
+            "流式响应凭证必须升级风险等级: {}",
+            row.risk_level
+        );
+        let findings = repo.get_security_findings(&row.id).await.unwrap();
+        assert!(
+            findings.iter().any(|f| f.phase == "response"),
+            "response 发现必须入库: {findings:?}"
+        );
+    }
+
+    /// #57 主场景：协议终止事件已到、上游不关连接（EOF 永远不来）时，
+    /// 流必须正常完成并落 200 行（带真实 usage 与响应内容），而不是挂到
+    /// 客户端超时取消再落 499 零用量行。
+    #[tokio::test]
+    async fn stream_completes_on_protocol_terminal_without_upstream_eof() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let mut upstream = hanging_after_terminal_upstream(true, true);
+        let pump = pump_for(&mut upstream).await;
+
+        let stream = stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "chat".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "anthropic".to_string(),
+            1,
+            "messages_g1_native".to_string(),
+            None,
+            "anthropic".to_string(),
+            "messages".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        );
+
+        // 上游挂死时若实现退化回「等 EOF」，这里 10s 超时直接失败。
+        let mut bytes = Vec::new();
+        tokio::pin!(stream);
+        let consumed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(item) = stream.next().await {
+                bytes.extend_from_slice(&item.unwrap());
+            }
+        })
+        .await;
+        assert!(
+            consumed.is_ok(),
+            "stream must complete on protocol terminal without upstream EOF"
+        );
+
+        let logs = repo.get_logs(10, 0).await.unwrap();
+        assert_eq!(logs.len(), 1, "exactly one row after terminal completion");
+        let row = &logs[0];
+        assert_eq!(
+            row.status_code, 200,
+            "protocol-complete stream is a success, not 499: {row:?}"
+        );
+        assert_eq!(
+            row.completion_tokens, 5,
+            "upstream-reported usage must be recorded"
+        );
+        assert!(row.client_cancelled.unwrap_or(0) == 0);
+        let choices = row.response_choices.as_deref().unwrap_or_default();
+        assert!(
+            choices.contains("hi"),
+            "accumulated content must be recorded: {choices}"
+        );
+    }
+
+    /// #57 取消路径：客户端中途断开（流被 drop）时，499 行记录流泵快照里
+    /// 已解析的真实 usage，而不是硬编码 0。
+    #[tokio::test]
+    async fn client_cancel_records_pump_usage_snapshot() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        // 无 message_stop：流未终止，客户端在收到第二帧输出后断开。
+        let mut upstream = hanging_after_terminal_upstream(false, true);
+        let pump = pump_for(&mut upstream).await;
+
+        let mut stream = Box::pin(stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "chat".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "anthropic".to_string(),
+            1,
+            "messages_g1_native".to_string(),
+            None,
+            "anthropic".to_string(),
+            "messages".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        ));
+
+        // 消费两帧输出（首帧 + 含 usage 的第二帧），确保快照已更新。
+        stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(!second.is_empty());
+
+        // 客户端断开：drop 生成器 → finalizer Drop → 后台写 499 行。
+        drop(stream);
+
+        // Drop 的 spawn 是异步任务，轮询等待 499 行出现（上限 5s）。
+        let mut row = None;
+        for _ in 0..100 {
+            let logs = repo.get_logs(10, 0).await.unwrap();
+            if let Some(first) = logs.first() {
+                row = Some(first.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let row = row.expect("499 row must be written after client cancel");
+        assert_eq!(row.status_code, 499);
+        assert_eq!(row.client_cancelled.unwrap_or(0), 1);
+        assert_eq!(
+            row.completion_tokens, 5,
+            "cancelled row must keep the pump snapshot usage, not zeros"
+        );
+    }
+
+    /// #57 兜底：上游从未回报 usage 且客户端取消时，499 行走本地估算
+    /// （请求体 + 已收内容），计费统计不恒为 0。
+    #[tokio::test]
+    async fn client_cancel_estimates_usage_when_upstream_silent() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        let mut upstream = hanging_after_terminal_upstream(false, false);
+        let pump = pump_for(&mut upstream).await;
+
+        let mut stream = Box::pin(stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "chat".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "anthropic".to_string(),
+            1,
+            "messages_g1_native".to_string(),
+            None,
+            "anthropic".to_string(),
+            "messages".to_string(),
+            "channel".to_string(),
+            StreamTimeouts::default(),
+        ));
+
+        stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(!second.is_empty());
+        drop(stream);
+
+        let mut row = None;
+        for _ in 0..100 {
+            let logs = repo.get_logs(10, 0).await.unwrap();
+            if let Some(first) = logs.first() {
+                row = Some(first.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let row = row.expect("499 row must be written after client cancel");
+        assert_eq!(row.status_code, 499);
+        assert!(
+            row.total_tokens > 0,
+            "cancelled row must fall back to a local usage estimate: {row:?}"
+        );
+    }
+
+    /// FIX-08：帧间空闲超时——上游挂死（发帧后既无终止标记也关连接）时，
+    /// 流在 idle 超时后以结构化错误事件收尾并落 502 行，不再无限等待。
+    #[tokio::test]
+    async fn stream_idle_timeout_ends_hung_upstream_with_error_event() {
+        let repo = Arc::new(Repository::new(fresh_db().await));
+        // 无 message_stop、无 EOF：第二帧输出后上游永久挂起。
+        let mut upstream = hanging_after_terminal_upstream(false, false);
+        let pump = pump_for(&mut upstream).await;
+
+        let timeouts = StreamTimeouts {
+            first_frame: std::time::Duration::from_secs(30),
+            idle: std::time::Duration::from_millis(300),
+        };
+        let stream = stream_response_body(
+            pump,
+            upstream,
+            repo.clone(),
+            api_key(),
+            audited_request(),
+            "m".to_string(),
+            "up-model".to_string(),
+            "chat".to_string(),
+            false,
+            full_request_body(),
+            None,
+            "ch-1".to_string(),
+            "ch".to_string(),
+            "anthropic".to_string(),
+            1,
+            "messages_g1_native".to_string(),
+            None,
+            "anthropic".to_string(),
+            "messages".to_string(),
+            "channel".to_string(),
+            timeouts,
+        );
+
+        let mut bytes = Vec::new();
+        tokio::pin!(stream);
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(item) = stream.next().await {
+                bytes.extend_from_slice(&item.unwrap());
+            }
+        })
+        .await;
+        assert!(finished.is_ok(), "idle timeout must end the hung stream");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("upstream idle timeout"),
+            "structured error event must carry the timeout reason: {text}"
+        );
+
+        // 提交后超时 = 流错误：落 502 行（非 499、非成功 200）。
+        let logs = repo.get_logs(10, 0).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].status_code, 502,
+            "idle timeout is a stream error: {logs:?}"
+        );
+    }
+
+    /// FIX-08：StreamTimeouts 缺省值——首帧 60s、空闲 120s。
+    #[test]
+    fn stream_timeouts_defaults_are_sane() {
+        let t = StreamTimeouts::default();
+        assert_eq!(t.first_frame, std::time::Duration::from_secs(60));
+        assert_eq!(t.idle, std::time::Duration::from_secs(120));
     }
 }

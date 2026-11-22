@@ -867,10 +867,12 @@ async fn rollback_write_then_reupgrade_live_infers() {
 
     // "Rolled-back" old binary UPDATEs the legacy base_url -> trigger clears.
     // main 约定：deepseek anthropic 兼容 base 带 /v1。
-    sqlx::query("UPDATE channels SET base_url='https://api.deepseek.com/anthropic/v1' WHERE id='r1'")
-        .execute(&pool)
-        .await
-        .expect("rollback write");
+    sqlx::query(
+        "UPDATE channels SET base_url='https://api.deepseek.com/anthropic/v1' WHERE id='r1'",
+    )
+    .execute(&pool)
+    .await
+    .expect("rollback write");
     let row = get_row(&pool, "r1").await;
     assert_eq!(row.identity_revision, 0);
     assert!(row.provider.is_none());
@@ -1079,5 +1081,33 @@ async fn preset_url_fixtures_new_and_legacy() {
     assert_eq!(
         join(&row.base_url, "chat/completions"),
         "https://api.openai.com/v1/chat/completions"
+    );
+
+    // 8) OpenAI / StepFun（阶跃星辰）：原生 URL 与 legacy 双写 URL 的最终拼接
+    //    结果均为官方地址，旧 type 双写为 openai（不是新造的 "stepfun"）。
+    let row = repo
+        .create_channel(&models::CreateChannelInput {
+            name: "fx-stepfun".into(),
+            channel_type: "".into(),
+            base_url: "".into(),
+            api_key: "sk".into(),
+            models: vec![],
+            protocol: Some("openai".into()),
+            provider: Some("stepfun".into()),
+            native_base_url: Some("https://api.stepfun.com/v1".into()),
+            native_endpoints: Some(vec!["chat_completions".into()]),
+            ..Default::default()
+        })
+        .await
+        .expect("create stepfun");
+    assert_eq!(row.channel_type, "openai");
+    assert_eq!(
+        join(row.native_base_url.as_deref().unwrap(), "chat/completions"),
+        "https://api.stepfun.com/v1/chat/completions"
+    );
+    assert_eq!(row.base_url, "https://api.stepfun.com/v1");
+    assert_eq!(
+        join(&row.base_url, "chat/completions"),
+        "https://api.stepfun.com/v1/chat/completions"
     );
 }

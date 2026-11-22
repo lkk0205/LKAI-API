@@ -15,6 +15,7 @@ use crate::core::attempt::{
 };
 use crate::core::route_plan::RoutePlan;
 use crate::security::gate::AuditedRequest;
+use crate::services::knowledge::budget;
 use rand::Rng;
 use serde::Serialize;
 use std::future::Future;
@@ -34,6 +35,7 @@ pub struct PlanExecution {
     pub usage: Option<TokenUsage>,
     pub channel_id: Option<String>,
     pub channel_name: Option<String>,
+    pub upstream_type: Option<String>,
     pub route_group: Option<String>,
     pub upstream_protocol: Option<String>,
     pub upstream_endpoint: Option<String>,
@@ -55,13 +57,15 @@ pub struct PlanExecution {
 
 /// Lightweight copy of the group/candidate routing metadata captured before the
 /// attempt is handed to the executor (so the borrow on `flow` can be released).
+#[derive(Clone)]
 struct AttemptMeta {
     channel_id: String,
     channel_name: String,
+    upstream_type: String,
     route_group: String,
     upstream_protocol: String,
     upstream_endpoint: String,
-    /// T09: from `candidate.identity` (provider + identity_revision).
+    /// Candidate metadata is generic: Auth accounts do not have a ChannelIdentity.
     provider: String,
     identity_revision: i64,
 }
@@ -84,6 +88,10 @@ where
 {
     let started = Instant::now();
     let mut flow = AttemptFlow::new(plan);
+    // `FlowStep::Halt` only carries the terminal status/message. Retain the
+    // last selected candidate so an exhausted plan preserves log metadata.
+    let mut last_attempt_meta: Option<AttemptMeta> = None;
+    let mut last_attempt_codec_version: Option<String> = None;
     loop {
         match flow.next_step() {
             FlowStep::Execute {
@@ -96,16 +104,17 @@ where
                     let group = &plan.groups[group_idx];
                     let candidate = &group.candidates[candidate_idx];
                     let meta = AttemptMeta {
-                        channel_id: candidate.channel.id.clone(),
-                        channel_name: candidate.channel.name.clone(),
+                        channel_id: candidate.candidate.id().to_string(),
+                        channel_name: candidate.candidate.name().to_string(),
+                        upstream_type: candidate.candidate.upstream_type().to_string(),
                         route_group: group.id.clone(),
                         // Candidate-level protocol/endpoint (a native group may
                         // hold mixed upstream protocols when ollama_native is on;
                         // group-level mirrors only the first candidate).
                         upstream_protocol: candidate.upstream_protocol.as_str().to_string(),
                         upstream_endpoint: candidate.upstream_endpoint.clone(),
-                        provider: candidate.identity.provider.clone(),
-                        identity_revision: candidate.identity.identity_revision,
+                        provider: candidate.candidate.provider(),
+                        identity_revision: candidate.candidate.identity_revision(),
                     };
                     (
                         build_prepared_attempt(audit, group, candidate, &mut rng, attempt_no),
@@ -118,7 +127,9 @@ where
                     Ok(attempt) => attempt.codec_version.clone(),
                     Err(_) => None,
                 };
-                let result = match built {
+                last_attempt_meta = Some(meta.clone());
+                last_attempt_codec_version = codec_version.clone();
+                let mut result = match built {
                     // A construction failure (codec rejection) is already a
                     // full AttemptFailure carrying the rejected feature reason.
                     Err(failure) => failure,
@@ -135,6 +146,7 @@ where
                                     usage: s.usage,
                                     channel_id: Some(meta.channel_id),
                                     channel_name: Some(meta.channel_name),
+                                    upstream_type: Some(meta.upstream_type),
                                     route_group: Some(meta.route_group),
                                     upstream_protocol: Some(meta.upstream_protocol),
                                     upstream_endpoint: Some(meta.upstream_endpoint),
@@ -152,20 +164,59 @@ where
                         }
                     }
                 };
+                // 预算请求的超时、鉴权和额度失败直接终止，避免重复请求同一
+                // 慢上游；历史聊天和入库保持原来的候选/协议组切换规则。
+                let budget_terminal = |failure: &AttemptFailure| {
+                    budget::current().is_some()
+                        && (failure.failure_class == FailureClass::ChannelAuthTerminal
+                            || matches!(failure.status_code, Some(402 | 504 | 499))
+                            || crate::endpoint_executor::driver::local_failure_code(failure)
+                                .is_some_and(|code| code != "upstream_transport_failed"))
+                };
+                if !budget_terminal(&result)
+                    && !matches!(
+                        result.failure_class,
+                        FailureClass::CallerTerminal | FailureClass::CommittedStreamError
+                    )
+                {
+                    if let Some(secs) = result.retry_after {
+                        let secs = if budget::current().is_some() {
+                            secs.min(120)
+                        } else {
+                            secs
+                        };
+                        if let Err(elapsed) = budget::run(
+                            std::time::Duration::from_secs(120),
+                            tokio::time::sleep(std::time::Duration::from_secs(secs)),
+                        )
+                        .await
+                        {
+                            result = crate::endpoint_executor::driver::budget_failure(elapsed);
+                        }
+                    }
+                }
                 flow.record_failure(&result);
                 if result.failure_class == FailureClass::CallerTerminal
                     || result.failure_class == FailureClass::CommittedStreamError
+                    || budget_terminal(&result)
                 {
                     // Honor an explicit status_code (e.g. the T06 stub's 501);
                     // fall back to the class's canonical terminal status (400
                     // for a real caller-terminal codec rejection).
-                    let status = result.status_code.unwrap_or(terminal_status_of(&result));
+                    let status = if result.failure_class == FailureClass::ChannelAuthTerminal {
+                        terminal_status_of(&result)
+                    } else {
+                        crate::endpoint_executor::driver::local_failure_status(&result)
+                            .or(result.status_code)
+                            .unwrap_or(terminal_status_of(&result))
+                    };
                     return PlanExecution {
                         status,
-                        body: serde_json::json!({ "error": { "message": result.message } }),
+                        body: serde_json::json!({ "error": { "message": result.message, "failure_class": result.failure_class.as_str() } }),
                         usage: None,
                         channel_id: Some(meta.channel_id),
                         channel_name: Some(meta.channel_name),
+                        upstream_type: Some(meta.upstream_type),
                         route_group: Some(meta.route_group),
                         upstream_protocol: Some(meta.upstream_protocol),
                         upstream_endpoint: Some(meta.upstream_endpoint),
@@ -182,23 +233,32 @@ where
                 // Otherwise loop; `flow.next_step()` applies group transition / budget.
             }
             FlowStep::Halt { status, message } => {
+                let meta = last_attempt_meta;
+                let last_failure = flow.last_failure().cloned();
+                let body = match &last_failure {
+                    Some(f) => {
+                        serde_json::json!({ "error": { "message": message, "failure_class": f.failure_class.as_str() } })
+                    }
+                    None => serde_json::json!({ "error": { "message": message } }),
+                };
                 return PlanExecution {
                     status,
-                    body: serde_json::json!({ "error": { "message": message } }),
+                    body,
                     usage: None,
-                    channel_id: None,
-                    channel_name: None,
-                    route_group: None,
-                    upstream_protocol: None,
-                    upstream_endpoint: None,
+                    channel_id: meta.as_ref().map(|meta| meta.channel_id.clone()),
+                    channel_name: meta.as_ref().map(|meta| meta.channel_name.clone()),
+                    upstream_type: meta.as_ref().map(|meta| meta.upstream_type.clone()),
+                    route_group: meta.as_ref().map(|meta| meta.route_group.clone()),
+                    upstream_protocol: meta.as_ref().map(|meta| meta.upstream_protocol.clone()),
+                    upstream_endpoint: meta.as_ref().map(|meta| meta.upstream_endpoint.clone()),
                     upstream_model: None,
-                    provider: None,
-                    identity_revision: None,
-                    codec_version: None,
+                    provider: meta.as_ref().map(|meta| meta.provider.clone()),
+                    identity_revision: meta.as_ref().map(|meta| meta.identity_revision),
+                    codec_version: last_attempt_codec_version,
                     response_headers: vec![],
                     attempts: flow.attempts_used(),
                     duration_ms: started.elapsed().as_millis() as u64,
-                    last_failure: flow.last_failure().cloned(),
+                    last_failure,
                 };
             }
         }
@@ -258,6 +318,8 @@ mod tests {
             status: 1,
             allowed_models: "[]".into(),
             allowed_channels: "[]".into(),
+            denied_models: "[]".into(),
+            denied_channels: "[]".into(),
             quota_limit: 0,
             quota_used: 0,
             expires_at: None,
@@ -274,6 +336,7 @@ mod tests {
         weight: i64,
     ) -> Channel {
         Channel {
+            model_mapping_disabled: "[]".into(),
             id: id.into(),
             name: format!("ch-{}", id),
             channel_type: channel_type.into(),
@@ -297,6 +360,10 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_test_at: None,
             last_test_ok: None,
+            last_probe_at: None,
+            last_probe_ok: None,
+            probe_latency_ms: None,
+            api_key_enabled: Some(1),
         }
     }
 
@@ -318,6 +385,7 @@ mod tests {
             body_len: 0,
             audit_result: SecurityScanResult::default(),
             request_features: RequestFeatures::default(),
+            security_settings: crate::security::SecuritySettings::default(),
         }
     }
 
@@ -466,6 +534,7 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
+                cached_tokens: 0,
             };
             let um = attempt.upstream_model.clone();
             async move {

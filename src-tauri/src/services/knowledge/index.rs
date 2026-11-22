@@ -7,7 +7,7 @@
 //! Zero external dependencies beyond `bincode` (already in Cargo.toml).
 
 use bincode::{deserialize, serialize};
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 use std::path::Path;
 
@@ -16,6 +16,11 @@ use std::path::Path;
 pub struct IndexNode {
     /// External ID (maps to chunk ID in SQLite)
     pub id: String,
+    /// 所属文档 ID（增量索引按文档差集增删用）。
+    /// 注意：bincode 非自描述格式，旧版本索引文件缺此字段时加载会失败，
+    /// 由上层回退全量重建——serde(default) 兜不住跨格式的旧文件。
+    #[serde(default)]
+    pub doc_id: String,
     /// The embedding vector
     pub vector: Vec<f32>,
     /// Neighbour node indices (internal, not external IDs)
@@ -46,6 +51,10 @@ pub struct HnswIndex {
     pub entry_point: usize,
     /// Random state for level assignment (simplified: always layer 0)
     pub initialized: bool,
+    /// 已摘除节点的 chunk id 集合（墓碑）：检索结果过滤、len 扣减。
+    /// 图内不做物理摘除（会破坏 HNSW 连通性），压实只在全量 build 时发生。
+    #[serde(default)]
+    pub tombstones: HashSet<String>,
 }
 
 /// Priority queue item for greedy search.
@@ -57,7 +66,7 @@ struct SearchItem {
 
 impl PartialEq for SearchItem {
     fn eq(&self, other: &Self) -> bool {
-        self.distance == other.distance
+        self.cmp(other) == Ordering::Equal
     }
 }
 
@@ -65,14 +74,17 @@ impl Eq for SearchItem {}
 
 impl PartialOrd for SearchItem {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // Min-heap: reverse ordering
-        Some(other.distance.partial_cmp(&self.distance)?)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for SearchItem {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        // Min-heap: reverse ordering; equal distances use a stable node order.
+        other
+            .distance
+            .total_cmp(&self.distance)
+            .then(other.id.cmp(&self.id))
     }
 }
 
@@ -87,11 +99,12 @@ impl HnswIndex {
             dim,
             entry_point: 0,
             initialized: false,
+            tombstones: HashSet::new(),
         }
     }
 
-    /// Build the index from a list of (id, vector) pairs.
-    pub fn build(&mut self, items: &[(String, Vec<f32>)]) {
+    /// Build the index from a list of (id, doc_id, vector) triples.
+    pub fn build(&mut self, items: &[(String, String, Vec<f32>)]) {
         self.build_with_progress(items, |_, _| {});
     }
 
@@ -99,18 +112,26 @@ impl HnswIndex {
     /// `callback(current, total)` is called periodically during construction.
     pub fn build_with_progress<F: Fn(usize, usize)>(
         &mut self,
-        items: &[(String, Vec<f32>)],
+        items: &[(String, String, Vec<f32>)],
         callback: F,
     ) {
         if items.is_empty() {
+            self.nodes.clear();
+            self.tombstones.clear();
+            self.initialized = false;
+            self.entry_point = 0;
             return;
         }
+
+        // 全量重建 = 天然压实：输入来自库内现存行，墓碑一并清零
+        self.tombstones.clear();
 
         // Store all nodes
         self.nodes = items
             .iter()
-            .map(|(id, vec)| IndexNode {
+            .map(|(id, doc_id, vec)| IndexNode {
                 id: id.clone(),
+                doc_id: doc_id.clone(),
                 vector: vec.clone(),
                 neighbours: Vec::new(),
             })
@@ -170,6 +191,9 @@ impl HnswIndex {
             }
         }
 
+        // 近邻图可能分成多个簇；保留相邻节点的双向骨架，度数最多 M + 2。
+        self.connect_backbone();
+
         // Final callback
         callback(n, n);
 
@@ -184,30 +208,211 @@ impl HnswIndex {
 
     /// Search the index for the k nearest neighbours.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
-        if !self.initialized || self.nodes.is_empty() {
-            return Vec::new();
+        self.search_cancellable(query, k, &|| false)
+            .unwrap_or_default()
+    }
+
+    /// 请求取消后停止后台向量计算；旧同步调用继续使用无取消入口。
+    pub fn search_cancellable(
+        &self,
+        query: &[f32],
+        k: usize,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Vec<SearchResult>, String> {
+        if cancelled() {
+            return Err("retrieval cancelled".into());
+        }
+        if !self.initialized || self.nodes.is_empty() || k == 0 || query.len() != self.dim {
+            return Ok(Vec::new());
         }
 
-        let ef = self.ef_search.max(k);
-        let candidates = self.search_internal(query, ef, usize::MAX);
+        // ponytail: 千级以内的小库直接精确搜索；大库保留图搜索，避免线性开销。
+        // 同时兼容旧图的连通性缺陷，不需要为查询重新调用 embedding。
+        let candidates = if self.nodes.len() <= 1024 {
+            let mut all = Vec::with_capacity(self.nodes.len());
+            for (id, node) in self.nodes.iter().enumerate() {
+                if cancelled() {
+                    return Err("retrieval cancelled".into());
+                }
+                all.push(SearchItem {
+                    id,
+                    distance: cosine_distance(query, &node.vector),
+                });
+            }
+            all.sort_by(|a, b| a.distance.total_cmp(&b.distance).then(a.id.cmp(&b.id)));
+            all
+        } else {
+            let ef = self
+                .ef_search
+                .max(k)
+                .saturating_add(self.tombstones.len())
+                .min(self.nodes.len());
+            self.search_internal_cancellable(query, ef, usize::MAX, cancelled)?
+        };
+        if cancelled() {
+            return Err("retrieval cancelled".into());
+        }
 
-        // Convert internal indices to external IDs and compute scores
-        candidates
+        // Convert internal indices to external IDs and compute scores.
+        // 墓碑节点（已摘除）在结果组装前过滤，保证 take(k) 全部是存活节点。
+        Ok(candidates
             .into_iter()
+            .filter(|r| !self.tombstones.contains(&self.nodes[r.id].id))
             .take(k)
             .map(|r| SearchResult {
                 id: self.nodes[r.id].id.clone(),
                 score: 1.0 - r.distance, // Convert distance to similarity score
             })
+            .collect())
+    }
+
+    /// 单点插入（增量索引用）：贪心下沉找最近邻、双向连边，不重排既有节点。
+    /// 返回 false 表示未插入（维度不符，或同 id 存活节点已存在——
+    /// 增量差集保证新 chunk id 全新，出现重复说明上游数据异常）。
+    pub fn insert(&mut self, id: &str, doc_id: &str, vector: &[f32]) -> bool {
+        if vector.len() != self.dim || self.contains_live(id) {
+            return false;
+        }
+        let new_idx = self.nodes.len();
+
+        // 空索引/未初始化：直接作为唯一节点（即入口点）
+        let neighbours: Vec<usize> = if !self.initialized || self.nodes.is_empty() {
+            Vec::new()
+        } else {
+            let ef = self
+                .ef_construction
+                .max(self.max_m)
+                .saturating_add(self.tombstones.len())
+                .min(self.nodes.len());
+            self.search_internal(vector, ef, usize::MAX)
+                .into_iter()
+                .filter(|r| !self.tombstones.contains(&self.nodes[r.id].id))
+                .map(|r| r.id)
+                .take(self.max_m)
+                .collect()
+        };
+
+        self.nodes.push(IndexNode {
+            id: id.to_string(),
+            doc_id: doc_id.to_string(),
+            vector: vector.to_vec(),
+            neighbours: neighbours.clone(),
+        });
+
+        // 反向连边：未满直接加；已满则用新节点替换 host 当前最远邻居。
+        // 全量 build 会把多数节点的邻居表占满 max_m，只做「满则跳过」会
+        // 让新节点在图中不可达（贪心搜索没有任何边指向它）。
+        for &nb in &neighbours {
+            if nb >= new_idx {
+                continue;
+            }
+            let host_full = self.nodes[nb].neighbours.len() >= self.max_m;
+            if !host_full {
+                let host = &mut self.nodes[nb];
+                if !host.neighbours.contains(&new_idx) {
+                    host.neighbours.push(new_idx);
+                }
+                continue;
+            }
+            let host_vec = self.nodes[nb].vector.clone();
+            let mut worst: Option<(f32, usize)> = None; // (distance, position)
+            for (pos, &cand) in self.nodes[nb].neighbours.iter().enumerate() {
+                // 不替换连通骨架边，否则增量插入可能再次割裂旧图。
+                if cand.abs_diff(nb) == 1 {
+                    continue;
+                }
+                let d = cosine_distance(&host_vec, &self.nodes[cand].vector);
+                if worst.map(|(wd, _)| d > wd).unwrap_or(true) {
+                    worst = Some((d, pos));
+                }
+            }
+            if let Some((worst_d, pos)) = worst {
+                if cosine_distance(&host_vec, vector) < worst_d
+                    && !self.nodes[nb].neighbours.contains(&new_idx)
+                {
+                    self.nodes[nb].neighbours[pos] = new_idx;
+                }
+            }
+        }
+
+        if new_idx > 0 {
+            self.connect_pair(new_idx - 1, new_idx);
+        }
+
+        if !self.initialized {
+            self.entry_point = new_idx;
+            self.initialized = true;
+        } else if self.tombstones.contains(&self.nodes[self.entry_point].id) {
+            // 入口点已被摘除：刷新为新节点，保证贪心搜索从存活节点出发
+            self.entry_point = new_idx;
+        }
+        true
+    }
+
+    fn connect_pair(&mut self, a: usize, b: usize) {
+        if !self.nodes[a].neighbours.contains(&b) {
+            self.nodes[a].neighbours.push(b);
+        }
+        if !self.nodes[b].neighbours.contains(&a) {
+            self.nodes[b].neighbours.push(a);
+        }
+    }
+
+    fn connect_backbone(&mut self) {
+        for i in 1..self.nodes.len() {
+            self.connect_pair(i - 1, i);
+        }
+    }
+
+    /// 按 chunk id 摘除（墓碑）：检索不再返回、len 扣减。
+    /// 图内不做物理摘除，压实由全量 build 完成；节点不存在返回 false。
+    pub fn remove(&mut self, id: &str) -> bool {
+        if !self.contains_live(id) {
+            return false;
+        }
+        self.tombstones.insert(id.to_string());
+        true
+    }
+
+    /// 该文档当前存活的 chunk id 列表（增量差集的索引侧输入）
+    pub fn doc_node_ids(&self, doc_id: &str) -> Vec<String> {
+        self.nodes
+            .iter()
+            .filter(|n| n.doc_id == doc_id && !self.tombstones.contains(&n.id))
+            .map(|n| n.id.clone())
             .collect()
+    }
+
+    /// 是否存在该 chunk id 的存活节点
+    pub fn contains_live(&self, id: &str) -> bool {
+        self.nodes
+            .iter()
+            .any(|n| n.id == id && !self.tombstones.contains(&n.id))
+    }
+
+    /// 旧格式索引（节点无 doc_id）：增量路径应回退全量重建。
+    /// schema 中 chunk 的 doc_id 非空，因此「有节点且全空」即旧文件。
+    pub fn is_legacy_format(&self) -> bool {
+        self.initialized && !self.nodes.is_empty() && self.nodes.iter().all(|n| n.doc_id.is_empty())
     }
 
     /// Internal greedy search starting from the entry point.
     /// Returns internal node indices sorted by distance (closest first).
     /// `exclude` is the node index to exclude (used during construction).
     fn search_internal(&self, query: &[f32], ef: usize, exclude: usize) -> Vec<SearchItem> {
-        if self.nodes.is_empty() {
-            return Vec::new();
+        self.search_internal_cancellable(query, ef, exclude, &|| false)
+            .unwrap_or_default()
+    }
+
+    fn search_internal_cancellable(
+        &self,
+        query: &[f32],
+        ef: usize,
+        exclude: usize,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Vec<SearchItem>, String> {
+        if self.nodes.is_empty() || ef == 0 {
+            return Ok(Vec::new());
         }
 
         let n = self.nodes.len();
@@ -221,7 +426,8 @@ impl HnswIndex {
         visited.insert(exclude);
 
         let mut candidates: BinaryHeap<SearchItem> = BinaryHeap::new();
-        let mut results: BinaryHeap<SearchItem> = BinaryHeap::new();
+        // candidates 最近者优先；results 必须最远者优先，容量满时才会淘汰差结果。
+        let mut results: BinaryHeap<Reverse<SearchItem>> = BinaryHeap::new();
 
         // Start from entry point
         let start_dist = cosine_distance(query, &self.nodes[start].vector);
@@ -229,19 +435,22 @@ impl HnswIndex {
             distance: start_dist,
             id: start,
         });
-        results.push(SearchItem {
+        results.push(Reverse(SearchItem {
             distance: start_dist,
             id: start,
-        });
+        }));
         visited.insert(start);
 
         while let Some(SearchItem {
-                           distance: dist,
-                           id: curr,
-                       }) = candidates.pop()
+            distance: dist,
+            id: curr,
+        }) = candidates.pop()
         {
+            if cancelled() {
+                return Err("retrieval cancelled".into());
+            }
             // Check if we should stop
-            let furthest_in_results = results.peek().map(|r| r.distance).unwrap_or(f32::MAX);
+            let furthest_in_results = results.peek().map(|r| r.0.distance).unwrap_or(f32::MAX);
 
             if results.len() >= ef && dist > furthest_in_results {
                 break;
@@ -256,22 +465,20 @@ impl HnswIndex {
 
                 let neighbour_dist = cosine_distance(query, &self.nodes[neighbour_idx].vector);
 
-                let furthest = results.peek().map(|r| r.distance).unwrap_or(f32::MAX);
+                let furthest = results.peek().map(|r| r.0.distance).unwrap_or(f32::MAX);
 
                 if results.len() < ef || neighbour_dist < furthest {
                     candidates.push(SearchItem {
                         distance: neighbour_dist,
                         id: neighbour_idx,
                     });
-                    results.push(SearchItem {
+                    results.push(Reverse(SearchItem {
                         distance: neighbour_dist,
                         id: neighbour_idx,
-                    });
+                    }));
 
                     // Keep results bounded to ef — pop the furthest (max distance)
                     if results.len() > ef {
-                        // BinaryHeap is max-heap on SearchItem (reverse ord),
-                        // so peek() gives the furthest. Pop it.
                         results.pop();
                     }
                 }
@@ -279,13 +486,13 @@ impl HnswIndex {
         }
 
         // Sort results by distance (ascending)
-        let mut sorted: Vec<SearchItem> = results.drain().collect();
+        let mut sorted: Vec<SearchItem> = results.drain().map(|r| r.0).collect();
         sorted.sort_by(|a, b| {
             a.distance
                 .partial_cmp(&b.distance)
                 .unwrap_or(Ordering::Equal)
         });
-        sorted
+        Ok(sorted)
     }
 
     /// Serialize the index to bytes.
@@ -295,13 +502,34 @@ impl HnswIndex {
 
     /// Deserialize from bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
-        deserialize(data).map_err(|e| format!("Failed to deserialize HNSW index: {}", e))
+        let mut index: Self =
+            deserialize(data).map_err(|e| format!("Failed to deserialize HNSW index: {}", e))?;
+        // 旧文件无需改格式；加载后补齐骨架，后续增量保存会保留修复结果。
+        index.connect_backbone();
+        Ok(index)
     }
 
     /// Save to file.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let data = self.to_bytes();
-        std::fs::write(path, &data).map_err(|e| format!("Failed to write index file: {}", e))
+        use std::io::Write;
+        let data = serialize(self).map_err(|e| format!("Failed to serialize index: {e}"))?;
+        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|e| format!("Failed to create index file: {e}"))?;
+        let result = (|| -> std::io::Result<()> {
+            file.write_all(&data)?;
+            file.sync_all()?;
+            drop(file);
+            // 同目录原子替换：检索只能读到完整的旧文件或新文件。
+            std::fs::rename(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result.map_err(|e| format!("Failed to save index file: {e}"))
     }
 
     /// Load from file.
@@ -310,9 +538,77 @@ impl HnswIndex {
         Self::from_bytes(&data)
     }
 
-    /// Get number of nodes.
+    /// 分块读取、解码和骨架修复均检查取消，防止丢弃请求后继续完整扫描。
+    pub fn load_cancellable(path: &Path, cancelled: &impl Fn() -> bool) -> Result<Self, String> {
+        use std::io::Read;
+        struct CheckedReader<'a, R, F> {
+            reader: R,
+            cancelled: &'a F,
+            bytes_since_check: usize,
+        }
+        impl<R: Read, F: Fn() -> bool> Read for CheckedReader<'_, R, F> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.bytes_since_check >= 64 * 1024 {
+                    if (self.cancelled)() {
+                        return Err(std::io::Error::other("retrieval cancelled"));
+                    }
+                    self.bytes_since_check = 0;
+                }
+                let count = self.reader.read(buffer)?;
+                self.bytes_since_check += count;
+                Ok(count)
+            }
+        }
+        let file =
+            std::fs::File::open(path).map_err(|e| format!("Failed to read index file: {e}"))?;
+        let read_started = std::time::Instant::now();
+        let mut data = Vec::new();
+        // read_to_end 会重试 Interrupted；每块显式检查并立即返回取消。
+        let mut reader = std::io::BufReader::new(file);
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            if cancelled() {
+                return Err("retrieval cancelled".into());
+            }
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|e| format!("Failed to read index file: {e}"))?;
+            if count == 0 {
+                break;
+            }
+            data.extend_from_slice(&buffer[..count]);
+        }
+        tracing::debug!(
+            stage = "index_read",
+            elapsed_ms = read_started.elapsed().as_millis() as u64,
+            bytes = data.len(),
+            "RAG index stage"
+        );
+        let decode_started = std::time::Instant::now();
+        let mut index: Self = bincode::deserialize_from(CheckedReader {
+            reader: std::io::Cursor::new(data),
+            cancelled,
+            bytes_since_check: 64 * 1024,
+        })
+        .map_err(|e| format!("Failed to deserialize HNSW index: {e}"))?;
+        for i in 1..index.nodes.len() {
+            if cancelled() {
+                return Err("retrieval cancelled".into());
+            }
+            index.connect_pair(i - 1, i);
+        }
+        tracing::debug!(
+            stage = "index_decode",
+            elapsed_ms = decode_started.elapsed().as_millis() as u64,
+            nodes = index.nodes.len(),
+            "RAG index stage"
+        );
+        Ok(index)
+    }
+
+    /// Get number of live nodes (physical nodes minus tombstones).
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.nodes.len() - self.tombstones.len()
     }
 
     /// Check if empty.
@@ -354,6 +650,140 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancellable_load_preserves_format_and_stops_during_decode() {
+        let path = std::env::temp_dir().join(format!("rag-index-{}.hnsw", uuid::Uuid::new_v4()));
+        let mut index = HnswIndex::new(1536, 2, 10, 5);
+        index.nodes = (0..65)
+            .map(|id| IndexNode {
+                id: id.to_string(),
+                doc_id: "doc".into(),
+                vector: vec![0.25; 1536],
+                neighbours: Vec::new(),
+            })
+            .collect();
+        index.initialized = true;
+        index.save(&path).unwrap();
+        let loaded = HnswIndex::load_cancellable(&path, &|| false).unwrap();
+        assert_eq!(loaded.search(&vec![0.25; 1536], 5).len(), 5);
+        let read_checks = std::fs::metadata(&path).unwrap().len().div_ceil(64 * 1024) as usize + 1;
+        let checks = std::cell::Cell::new(0);
+        let result = HnswIndex::load_cancellable(&path, &|| {
+            checks.set(checks.get() + 1);
+            checks.get() > read_checks + 1
+        });
+        std::fs::remove_file(path).unwrap();
+        assert!(result.unwrap_err().contains("retrieval cancelled"));
+    }
+
+    #[test]
+    fn result_heap_retains_nearest_when_capacity_is_exceeded() {
+        // 完全图排除近似召回因素。旧结果堆在装入第四项时会弹出最近项。
+        let mut index = HnswIndex::new(2, 8, 10, 3);
+        let items = (0..8)
+            .map(|i| (i.to_string(), "doc".to_string(), vec![1.0, i as f32]))
+            .collect::<Vec<_>>();
+        index.build(&items);
+        let found = index.search_internal(&[1.0, 0.0], 3, usize::MAX);
+        assert_eq!(
+            found.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn large_graph_search_returns_live_neighbors_past_tombstones() {
+        let mut index = HnswIndex::new(2, 2, 20, 16);
+        index.nodes = (0..1100)
+            .map(|i| IndexNode {
+                id: i.to_string(),
+                doc_id: "doc".to_string(),
+                vector: vec![(i as f32 * 0.002).cos(), (i as f32 * 0.002).sin()],
+                neighbours: Vec::new(),
+            })
+            .collect();
+        index.initialized = true;
+        index.connect_backbone();
+        for i in 1090..1100 {
+            index.remove(&i.to_string());
+        }
+        let results = index.search(&index.nodes[1099].vector, 3);
+        assert_eq!(
+            results.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["1089", "1088", "1087"]
+        );
+    }
+
+    fn reachable(index: &HnswIndex) -> usize {
+        let mut seen = HashSet::new();
+        let mut pending = vec![index.entry_point];
+        while let Some(node) = pending.pop() {
+            if seen.insert(node) {
+                pending.extend(&index.nodes[node].neighbours);
+            }
+        }
+        seen.len()
+    }
+
+    #[test]
+    fn clustered_build_load_and_far_insert_remain_connected() {
+        let mut index = HnswIndex::new(2, 2, 20, 10);
+        let items = (0..12)
+            .map(|i| {
+                (
+                    i.to_string(),
+                    "doc".to_string(),
+                    if i < 6 {
+                        vec![1.0, i as f32 * 0.01]
+                    } else {
+                        vec![-1.0, i as f32 * 0.01]
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        index.build(&items);
+        assert_eq!(reachable(&index), items.len());
+        assert!(index
+            .nodes
+            .iter()
+            .all(|n| n.neighbours.len() <= index.max_m + 2));
+        assert!(index.insert("far", "doc-new", &[0.0, -1.0]));
+        assert_eq!(reachable(&index), items.len() + 1);
+
+        // 模拟相同序列化格式的旧断连图，加载时自动补齐骨架。
+        for node in &mut index.nodes {
+            node.neighbours.clear();
+        }
+        let restored = HnswIndex::from_bytes(&index.to_bytes()).unwrap();
+        assert_eq!(reachable(&restored), restored.nodes.len());
+        assert_eq!(restored.search(&[0.0, -1.0], 1)[0].id, "far");
+    }
+
+    #[test]
+    fn small_index_exact_results_survive_tombstones_and_empty_rebuild() {
+        let mut index = HnswIndex::new(2, 2, 10, 1);
+        let items = (0..20)
+            .map(|i| (i.to_string(), "doc".to_string(), vec![1.0, i as f32]))
+            .collect::<Vec<_>>();
+        index.build(&items);
+        for i in 0..18 {
+            index.remove(&i.to_string());
+        }
+        assert_eq!(
+            index
+                .search(&[1.0, 0.0], 2)
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["18", "19"]
+        );
+        assert!(index.search(&[1.0, 0.0], 0).is_empty());
+        assert!(index.search(&[1.0], 1).is_empty());
+        index.build(&[]);
+        assert!(index.search(&[1.0, 0.0], 2).is_empty());
+        assert_eq!(index.len(), 0);
+    }
+
+    #[test]
     fn test_cosine_distance() {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
@@ -371,21 +801,21 @@ mod tests {
         let mut index = HnswIndex::new(3, 8, 50, 20);
 
         // Create 100 random-ish vectors
-        let items: Vec<(String, Vec<f32>)> = (0..100)
+        let items: Vec<(String, String, Vec<f32>)> = (0..100)
             .map(|i| {
                 let v = vec![
                     ((i as f32) * 0.1).sin(),
                     ((i as f32) * 0.2).cos(),
                     (i as f32) * 0.01,
                 ];
-                (format!("chunk-{}", i), v)
+                (format!("chunk-{}", i), format!("doc-{}", i % 5), v)
             })
             .collect();
 
         index.build(&items);
 
         // Search for a vector similar to item 5
-        let query = items[5].1.clone();
+        let query = items[5].2.clone();
         let results = index.search(&query, 5);
 
         assert!(!results.is_empty());
@@ -404,10 +834,11 @@ mod tests {
     #[test]
     fn test_serialization() {
         let mut index = HnswIndex::new(3, 8, 50, 20);
-        let items: Vec<(String, Vec<f32>)> = (0..10)
+        let items: Vec<(String, String, Vec<f32>)> = (0..10)
             .map(|i| {
                 (
                     format!("chunk-{}", i),
+                    format!("doc-{}", i % 3),
                     vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0],
                 )
             })
@@ -428,5 +859,208 @@ mod tests {
             assert_eq!(r1[i].id, r2[i].id);
             assert!((r1[i].score - r2[i].score).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn test_insert_then_search_finds_new_node() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..20)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    "doc-base".to_string(),
+                    vec![
+                        ((i as f32) * 0.1).sin(),
+                        ((i as f32) * 0.2).cos(),
+                        (i as f32) * 0.01,
+                    ],
+                )
+            })
+            .collect();
+        index.build(&items);
+
+        // 新增节点紧贴 item 3 的向量
+        let near3 = items[3].2.clone();
+        assert!(index.insert("chunk-new", "doc-new", &near3));
+        assert_eq!(index.len(), 21);
+
+        let results = index.search(&near3, 3);
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"chunk-new"), "results: {:?}", ids);
+    }
+
+    #[test]
+    fn test_remove_tombstones_and_len() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..10)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    "doc-base".to_string(),
+                    vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0],
+                )
+            })
+            .collect();
+        index.build(&items);
+
+        assert!(index.remove("chunk-5"));
+        assert!(!index.remove("chunk-5"), "double remove is a no-op");
+        assert!(!index.remove("chunk-missing"));
+        assert_eq!(index.len(), 9);
+
+        let query = items[5].2.clone();
+        let results = index.search(&query, 10);
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(!ids.contains(&"chunk-5"), "tombstoned must not surface");
+    }
+
+    #[test]
+    fn test_remove_does_not_harm_other_recall() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..100)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    format!("doc-{}", i % 7),
+                    vec![
+                        ((i as f32) * 0.1).sin(),
+                        ((i as f32) * 0.2).cos(),
+                        (i as f32) * 0.01,
+                    ],
+                )
+            })
+            .collect();
+        index.build(&items);
+
+        // 摘掉若干无关节点后，查询点的 Top1 仍是自身
+        for i in [90usize, 91, 92, 93, 94, 95] {
+            assert!(index.remove(&format!("chunk-{}", i)));
+        }
+        let query = items[7].2.clone();
+        let results = index.search(&query, 5);
+        assert_eq!(results[0].id, "chunk-7");
+    }
+
+    #[test]
+    fn test_build_rebuild_compacts_tombstones() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..10)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    "doc-base".to_string(),
+                    vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0],
+                )
+            })
+            .collect();
+        index.build(&items);
+        index.remove("chunk-3");
+        index.remove("chunk-8");
+        assert_eq!(index.len(), 8);
+
+        // 全量重建压实：墓碑清零、节点全部复活（数据仍来自库内）
+        index.build(&items);
+        assert_eq!(index.len(), 10);
+        assert!(index.contains_live("chunk-3"));
+        assert!(index.contains_live("chunk-8"));
+    }
+
+    #[test]
+    fn test_doc_node_ids_and_legacy_detection() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..9)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    format!("doc-{}", i / 3),
+                    vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0],
+                )
+            })
+            .collect();
+        index.build(&items);
+
+        let mut d0 = index.doc_node_ids("doc-0");
+        d0.sort();
+        assert_eq!(d0, vec!["chunk-0", "chunk-1", "chunk-2"]);
+        assert!(!index.is_legacy_format());
+
+        // 摘除后 doc_node_ids 同步收缩
+        index.remove("chunk-1");
+        let mut d0 = index.doc_node_ids("doc-0");
+        d0.sort();
+        assert_eq!(d0, vec!["chunk-0", "chunk-2"]);
+
+        // 旧格式：节点存在但 doc_id 全空
+        let legacy_items: Vec<(String, String, Vec<f32>)> = (0..5)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    String::new(),
+                    vec![i as f32, 1.0, 2.0],
+                )
+            })
+            .collect();
+        let mut legacy = HnswIndex::new(3, 8, 50, 20);
+        legacy.build(&legacy_items);
+        assert!(legacy.is_legacy_format());
+    }
+
+    #[test]
+    fn test_insert_rejects_duplicate_and_dim_mismatch() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..5)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    "doc-base".to_string(),
+                    vec![i as f32, 1.0, 2.0],
+                )
+            })
+            .collect();
+        index.build(&items);
+
+        assert!(!index.insert("chunk-2", "doc-x", &[9.0, 9.0, 9.0]));
+        assert!(!index.insert("chunk-new", "doc-x", &[1.0, 2.0]));
+        assert_eq!(index.len(), 5);
+    }
+
+    #[test]
+    fn test_insert_into_uninitialized_index() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        assert!(index.insert("first", "doc-a", &[1.0, 0.0, 0.0]));
+        assert!(index.initialized);
+        assert_eq!(index.len(), 1);
+        let results = index.search(&[1.0, 0.0, 0.0], 1);
+        assert_eq!(results[0].id, "first");
+
+        // 摘除唯一节点后再插入：物理节点仍在（墓碑），新节点可正常服务检索
+        assert!(index.remove("first"));
+        assert!(index.insert("second", "doc-b", &[0.0, 1.0, 0.0]));
+        let results = index.search(&[0.0, 1.0, 0.0], 2);
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["second"]);
+    }
+
+    #[test]
+    fn test_serde_roundtrip_preserves_tombstones_and_doc_ids() {
+        let mut index = HnswIndex::new(3, 8, 50, 20);
+        let items: Vec<(String, String, Vec<f32>)> = (0..10)
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    format!("doc-{}", i % 2),
+                    vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0],
+                )
+            })
+            .collect();
+        index.build(&items);
+        index.remove("chunk-4");
+        index.insert("chunk-new", "doc-9", &[4.0, 8.0, 12.0]);
+
+        let restored = HnswIndex::from_bytes(&index.to_bytes()).unwrap();
+        assert_eq!(restored.len(), index.len());
+        assert!(restored.tombstones.contains("chunk-4"));
+        assert!(restored.contains_live("chunk-new"));
+        assert_eq!(restored.doc_node_ids("doc-9"), vec!["chunk-new"]);
     }
 }

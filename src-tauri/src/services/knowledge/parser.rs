@@ -49,20 +49,22 @@ pub fn parse_file(filename: &str, content: &[u8]) -> Result<ParsedContent, Strin
         // PDF
         "pdf" => {
             let content_vec = content.to_vec(); // owned copy for catch_unwind
-            // 捕获 PDF 解析过程中的代码崩溃（panic）
+                                                // 捕获 PDF 解析过程中的代码崩溃（panic）
             let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pdf_extract::extract_text_from_mem(&content_vec)
             }))
-                .map_err(|e| {
-                    let msg = e
-                        .downcast_ref::<&str>()
-                        .copied()
-                        .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()))
-                        .unwrap_or("Unknown PDF parse panic");
-                    format!("PDF parse panic: {}", msg)
-                })?;
+            .map_err(|e| {
+                let msg = e
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("Unknown PDF parse panic");
+                format!("PDF parse panic: {}", msg)
+            })?;
             let text = text.map_err(|e| format!("PDF parse error: {}", e))?;
-            Ok(ParsedContent::PlainText(text))
+            Ok(ParsedContent::PlainText(super::text::normalize_radicals(
+                &text,
+            )))
         }
         _ => {
             // Try to decode as UTF-8, fall back to lossy
@@ -94,7 +96,7 @@ pub fn get_file_type(filename: &str) -> String {
         "pdf" => "pdf",
         _ => "text",
     }
-        .to_string()
+    .to_string()
 }
 
 // Note: PDF files are parsed by pdf-extract crate, returning plain text.

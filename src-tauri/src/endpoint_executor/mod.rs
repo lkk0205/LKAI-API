@@ -27,6 +27,8 @@
 //! | optional_bearer | `Authorization: Bearer <key>` only when the key is non-empty (Ollama) |
 
 pub mod driver;
+pub mod estimate_usage;
+pub mod grok_arguments;
 pub mod sse;
 
 #[cfg(test)]
@@ -40,10 +42,79 @@ use crate::core::attempt::{
     PreparedAttempt, TokenUsage,
 };
 use crate::core::channel_identity::ChannelIdentity;
-use crate::core::route_plan::EndpointKind;
+use crate::core::route_plan::{AuthNonStreamFraming, EndpointKind};
 use crate::db::models::Channel;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
+use reqwest::header;
 use serde_json::Value;
+use std::time::Duration;
+
+/// Default idle timeout for mid-stream SSE reads is configurable via
+/// `StreamTimeouts`（FIX-08：`stream.idle_timeout_secs`，缺省 120s，0 = 禁用），
+/// 不再使用固定常量。
+
+/// Maximum backoff applied to a `Retry-After` value before jitter.
+const RETRY_AFTER_CAP_SECS: u64 = 5;
+
+/// Parse an HTTP `Retry-After` header value into seconds.
+///
+/// Supports both delta-seconds (`"120"`) and RFC 7231 IMF-fixdate
+/// (`"Wed, 21 Oct 2026 07:28:00 GMT"`).  Returns `None` on parse failure.
+fn parse_retry_after(value: Option<&str>) -> Option<u64> {
+    let raw = value?.trim();
+    // Try delta-seconds first.
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(secs);
+    }
+    // Try RFC 7231 IMF-fixdate.
+    if let Ok(dt) = DateTime::parse_from_rfc2822(raw) {
+        let now = Utc::now();
+        if dt > now {
+            let secs = (dt.with_timezone(&Utc) - now).num_seconds().max(0) as u64;
+            return Some(secs);
+        }
+        return Some(0);
+    }
+    None
+}
+
+/// Extract a capped, jittered backoff from a response's `Retry-After` header.
+///
+/// Returns `Some(Duration)` when the header is present and parseable,
+/// capped to [`RETRY_AFTER_CAP_SECS`] with ±20% jitter applied.
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = parse_retry_after(headers.get("retry-after").and_then(|v| v.to_str().ok()))?;
+    let capped = raw.min(RETRY_AFTER_CAP_SECS);
+    // ±20% jitter: multiply by a factor in [0.8, 1.2].
+    let jitter_factor = 0.8 + (rand::random::<f64>() * 0.4);
+    let jittered = (capped as f64 * jitter_factor).round() as u64;
+    Some(Duration::from_secs(jittered))
+}
+
+/// Wrapper for the next item from an upstream byte stream with an idle guard.
+///
+/// [`UpstreamItem::Chunk`] wraps the raw `Option<Result<Bytes, _>>` from the
+/// stream; [`UpstreamItem::IdleTimeout`] signals that no data arrived within
+/// the configured idle window.
+pub enum UpstreamItem<E> {
+    Chunk(Option<Result<bytes::Bytes, E>>),
+    IdleTimeout,
+}
+
+/// Read the next item from a stream with an idle-timeout guard.
+///
+/// If the stream does not produce an item within `idle_timeout`, returns
+/// [`UpstreamItem::IdleTimeout`] instead of waiting indefinitely.
+pub async fn next_upstream_item<S, E>(upstream: &mut S, idle_timeout: Duration) -> UpstreamItem<E>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+{
+    match tokio::time::timeout(idle_timeout, upstream.next()).await {
+        Ok(item) => UpstreamItem::Chunk(item),
+        Err(_) => UpstreamItem::IdleTimeout,
+    }
+}
 
 /// A connected upstream stream response (2xx, content still flowing).
 pub struct UpstreamStream {
@@ -61,6 +132,356 @@ pub enum StreamAttemptResult {
     Connected(UpstreamStream),
     /// Failed before any downstream bytes were committed (classified).
     Failure(AttemptFailure),
+}
+
+/// Dispatch an Auth Account attempt.  Account providers intentionally own their
+/// request policy (credential headers, 401 refresh/retry, and quota persistence);
+/// this module only converts the provider result into the executor's common
+/// attempt shape.
+///
+/// Non-stream framing comes exclusively from the RoutePlan-frozen
+/// [`PreparedAttempt::auth_non_stream_framing`]:
+///
+/// * `ForcedResponsesSse` — Codex: force `stream:true`, aggregate the upstream
+///   Responses SSE into a complete document, then decode.
+/// * `Json` — Kimi Chat/Anthropic: force `stream:false`, drop `stream_options`,
+///   send the encoded Chat/Messages body, parse the provider-native JSON and
+///   decode through the prepared codec.
+///
+/// The executor never guesses framing from the body, Content-Type, or a
+/// database row — the attempt is the only source of truth.
+pub async fn dispatch_auth_account_executor(
+    downstream: EndpointKind,
+    attempt: &PreparedAttempt,
+    auth_service: &crate::auth_provider::service::AuthService,
+    safe_headers: &[(String, String)],
+) -> AttemptResult {
+    let headers = &header_map(safe_headers);
+    let framing = attempt
+        .auth_non_stream_framing
+        .unwrap_or(AuthNonStreamFraming::ForcedResponsesSse);
+
+    // Non-stream: both profiles send JSON.  Only the Responses accumulator
+    // path needs the forced `stream:true` body.
+    if framing == AuthNonStreamFraming::Json {
+        let body = non_stream_json_body(&attempt.encoded_body, attempt);
+        let response = match auth_service
+            .outbound(
+                &attempt.channel_id,
+                &body,
+                headers,
+                false,
+                &attempt.upstream_protocol,
+                &attempt.upstream_endpoint,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return AttemptResult::Failure(provider_failure(error)),
+        };
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let retry_after = retry_after_from_headers(response.headers());
+            let text = response.text().await.unwrap_or_default();
+            return AttemptResult::Failure(failure_from_auth_upstream(
+                status,
+                &text,
+                retry_after.map(|d| d.as_secs()),
+            ));
+        }
+        let response_headers = safe_response_headers(response.headers());
+        let bytes = response.bytes().await.unwrap_or_default();
+        let body: Value = match serde_json::from_slice(&bytes) {
+            Ok(body) => body,
+            Err(error) => {
+                return AttemptResult::Failure(AttemptFailure {
+                    failure_class: FailureClass::UpstreamProtocolError,
+                    message: format!("Auth account non-stream body failed JSON decode: {error}"),
+                    status_code: Some(502),
+                    retry_after: None,
+                })
+            }
+        };
+        let mut body = body;
+        normalize_grok_tool_arguments(attempt, &mut body);
+        if let Some(failure) = semantic_failure(&attempt.upstream_protocol, &body) {
+            return AttemptResult::Failure(failure);
+        }
+        return match decode_non_stream(downstream, attempt, &body) {
+            Ok((body, usage)) => AttemptResult::Success(AttemptSuccess {
+                status,
+                body,
+                usage,
+                downstream_events: None,
+                upstream_model: Some(attempt.upstream_model.clone()),
+                response_headers,
+            }),
+            Err(failure) => AttemptResult::Failure(failure),
+        };
+    }
+
+    // Codex forced Responses SSE path (existing behavior).
+    let response = match auth_service
+        .outbound(
+            &attempt.channel_id,
+            &force_responses_stream(&attempt.encoded_body),
+            headers,
+            true,
+            &attempt.upstream_protocol,
+            &attempt.upstream_endpoint,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return AttemptResult::Failure(provider_failure(error)),
+    };
+    let status = response.status().as_u16();
+    if status >= 400 {
+        let retry_after = retry_after_from_headers(response.headers());
+        let text = response.text().await.unwrap_or_default();
+        return AttemptResult::Failure(failure_from_auth_upstream(
+            status,
+            &text,
+            retry_after.map(|d| d.as_secs()),
+        ));
+    }
+    let response_headers = safe_response_headers(response.headers());
+    let bytes = response.bytes().await.unwrap_or_default();
+    let mut accumulator = crate::protocol::codec::ResponsesEventAccumulator::default();
+    if let Err(error) = accumulator.push(&bytes) {
+        return AttemptResult::Failure(responses_protocol_failure(error.message));
+    }
+    let mut body = match accumulator.finish() {
+        Ok(body) => body,
+        Err(error) => return AttemptResult::Failure(responses_protocol_failure(error.message)),
+    };
+    normalize_grok_tool_arguments(attempt, &mut body);
+    if let Some(failure) = semantic_failure(&attempt.upstream_protocol, &body) {
+        return AttemptResult::Failure(failure);
+    }
+    match decode_non_stream(downstream, attempt, &body) {
+        Ok((body, usage)) => AttemptResult::Success(AttemptSuccess {
+            status,
+            body,
+            usage,
+            downstream_events: None,
+            upstream_model: Some(attempt.upstream_model.clone()),
+            response_headers,
+        }),
+        Err(failure) => AttemptResult::Failure(failure),
+    }
+}
+
+/// Connect an Auth Account stream without committing downstream bytes.  The
+/// driver retains the same first-frame commit barrier used for Channels, so a
+/// malformed first event can still fail over.
+///
+/// Framing comes from the RoutePlan-frozen attempt: Codex forces Responses SSE;
+/// Kimi Chat forces `stream:true` and injects `stream_options.include_usage`;
+/// Kimi Messages beta forces `stream:true` with no Chat-only fields.
+pub async fn dispatch_auth_account_stream_executor(
+    attempt: &PreparedAttempt,
+    auth_service: &crate::auth_provider::service::AuthService,
+    safe_headers: &[(String, String)],
+) -> StreamAttemptResult {
+    let headers = &header_map(safe_headers);
+    let framing = attempt
+        .auth_non_stream_framing
+        .unwrap_or(AuthNonStreamFraming::ForcedResponsesSse);
+
+    let body = if framing == AuthNonStreamFraming::Json {
+        streaming_json_body(&attempt.encoded_body, attempt)
+    } else {
+        force_responses_stream(&attempt.encoded_body)
+    };
+
+    let response = match auth_service
+        .outbound(
+            &attempt.channel_id,
+            &body,
+            headers,
+            true,
+            &attempt.upstream_protocol,
+            &attempt.upstream_endpoint,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return StreamAttemptResult::Failure(provider_failure(error)),
+    };
+    let status = response.status().as_u16();
+    if status >= 400 {
+        let retry_after = retry_after_from_headers(response.headers());
+        let text = response.text().await.unwrap_or_default();
+        return StreamAttemptResult::Failure(failure_from_auth_upstream(
+            status,
+            &text,
+            retry_after.map(|d| d.as_secs()),
+        ));
+    }
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("text/event-stream")
+        .to_owned();
+    let headers = safe_response_headers(response.headers());
+    let body = response
+        .bytes_stream()
+        .map(|result| result.map_err(std::io::Error::other))
+        .boxed();
+    // Grok 会把整数参数写成浮点（`4000.0`），Codex 按 schema 反序列化整数会直接
+    // 失败；在上游字节流层规范化，下游无论什么协议都受益。
+    let body = if grok_arguments::needs_normalization(attempt.auth_provider.as_deref()) {
+        grok_arguments::rewrite_stream(body)
+    } else {
+        body
+    };
+    StreamAttemptResult::Connected(UpstreamStream {
+        content_type,
+        headers,
+        body,
+    })
+}
+
+/// Grok 专用：把响应里工具参数的整数值浮点规范成整数。其它 provider 不动。
+fn normalize_grok_tool_arguments(attempt: &PreparedAttempt, body: &mut Value) {
+    if grok_arguments::needs_normalization(attempt.auth_provider.as_deref()) {
+        grok_arguments::rewrite_response_body(body);
+    }
+}
+
+fn force_responses_stream(body: &Value) -> Value {
+    let mut body = body.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.insert("stream".to_owned(), Value::Bool(true));
+    }
+    body
+}
+
+/// Kimi Chat / Anthropic Messages non-stream body: explicitly `stream:false`,
+/// `stream_options` removed (Chat clients may send `stream_options` even when
+/// not streaming, and the fixed Kimi transport must not echo it), and the
+/// fixed Messages beta `betas` token ensured on the Anthropic profile.
+fn is_gemini_auth(attempt: &PreparedAttempt) -> bool {
+    attempt.upstream_protocol == "gemini"
+}
+
+fn non_stream_json_body(body: &Value, attempt: &PreparedAttempt) -> Value {
+    let mut body = body.clone();
+    if is_gemini_auth(attempt) {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("stream");
+            object.remove("stream_options");
+        }
+        return body;
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.insert("stream".to_owned(), Value::Bool(false));
+        object.remove("stream_options");
+    }
+    ensure_messages_betas(&mut body, attempt);
+    body
+}
+
+/// Anthropic Messages beta: ensure the fixed `betas` list contains the
+/// official transport's default token, without duplicates.  This is part of
+/// the Kimi endpoint transport contract, not a codec conversion, and can
+/// never be overridden by renderer/headers/attributes.
+fn ensure_messages_betas(body: &mut Value, attempt: &PreparedAttempt) {
+    if attempt.upstream_protocol != "anthropic" || attempt.upstream_endpoint != "messages_beta" {
+        return;
+    }
+    if let Some(object) = body.as_object_mut() {
+        let betas = object
+            .entry("betas")
+            .or_insert_with(|| Value::Array(Default::default()));
+        if let Some(array) = betas.as_array_mut() {
+            if !array.iter().any(|v| v.as_str() == Some(KIMI_BETAS_DEFAULT)) {
+                array.push(Value::String(KIMI_BETAS_DEFAULT.to_owned()));
+            }
+        }
+    }
+}
+
+/// Kimi streaming body: `stream:true`, and for the Chat profile only inject
+/// `stream_options.include_usage` so every downstream Chat/Responses/Messages
+/// entry (even those that never asked) still gets usage.  The Messages beta
+/// profile gets no Chat-only `stream_options`.
+fn streaming_json_body(body: &Value, attempt: &PreparedAttempt) -> Value {
+    let mut body = body.clone();
+    if is_gemini_auth(attempt) {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("stream");
+            object.remove("stream_options");
+        }
+        return body;
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.insert("stream".to_owned(), Value::Bool(true));
+        if attempt.upstream_endpoint == "chat_completions" && attempt.upstream_protocol == "openai"
+        {
+            let options = object
+                .entry("stream_options")
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Some(options) = options.as_object_mut() {
+                options.insert("include_usage".to_owned(), Value::Bool(true));
+            }
+        }
+    }
+    ensure_messages_betas(&mut body, attempt);
+    body
+}
+
+/// Official Kimi Anthropic beta transport default (kimi-code kosong/anthropic).
+const KIMI_BETAS_DEFAULT: &str = "interleaved-thinking-2025-05-14";
+
+fn header_map(headers: &[(String, String)]) -> reqwest::header::HeaderMap {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = reqwest::header::HeaderValue::from_str(value) else {
+            continue;
+        };
+        map.insert(name, value);
+    }
+    map
+}
+
+/// Map an Auth Account provider error into an [`AttemptFailure`].
+///
+/// Unlike channels, an auth account's credentials belong to the USER (their
+/// OAuth login), so a terminal auth failure keeps the real 401 status instead
+/// of the channel-style 502 mask: the caller needs to know re-login fixes it.
+fn provider_failure(error: crate::auth_provider::ProviderError) -> AttemptFailure {
+    let failure_class = error.failure_class();
+    let budget_payment =
+        crate::services::knowledge::budget::current().is_some() && error.is_payment_required();
+    AttemptFailure {
+        status_code: Some(if budget_payment {
+            402
+        } else {
+            match failure_class {
+                FailureClass::CallerTerminal => 400,
+                FailureClass::ChannelAuthTerminal => 401,
+                _ => 502,
+            }
+        }),
+        failure_class,
+        message: error.to_string(),
+        retry_after: None,
+    }
+}
+
+fn responses_protocol_failure(message: String) -> AttemptFailure {
+    AttemptFailure {
+        failure_class: FailureClass::UpstreamProtocolError,
+        message: format!("Responses SSE aggregation failed: {message}"),
+        status_code: Some(502),
+        retry_after: None,
+    }
 }
 
 /// RFC 9110 hop-by-hop fields and credentials belonging to the *client* must
@@ -86,6 +507,7 @@ pub fn is_unsafe_proxy_header(name: &str) -> bool {
             | "content-length"
             | "content-type"
             | "expect"
+            | "accept-encoding"
             | "wali-trace-id"
     )
 }
@@ -186,34 +608,214 @@ pub fn endpoint_path(protocol: &str, endpoint: &str) -> String {
 /// only `EndpointUnsupported` when the body proves the *path* is missing, never
 /// for a missing model.  401/403 map to `ChannelAuthTerminal` (never a local
 /// API-key error); not every `>= 400` is retried.
+///
+/// FIX-25：404 嗅探的单一事实源在 `core::attempt`（legacy 轨经
+/// `classify_http_status_with_body` 共用同一实现），此处仅委托。
 pub fn classify_upstream_status(status: u16, body: &str) -> Option<FailureClass> {
-    if status == 404 {
-        // T00 decision 5: a 404 is EndpointUnsupported ONLY when the executor
-        // proves the *path* is missing — never for a missing model (which the
-        // upstream reports as "model not found", "no such model", etc.).
-        let lower = body.to_lowercase();
-        let path_missing = lower.contains("no such endpoint")
-            || lower.contains("unknown endpoint")
-            || lower.contains("endpoint does not exist")
-            || lower.contains("path not found")
-            || lower.contains("no such path")
-            || (lower.contains("not found")
-                && !lower.contains("model")
-                && !lower.contains("model_not_found"));
-        return if path_missing {
-            Some(FailureClass::EndpointUnsupported)
-        } else {
-            // 404 with no path-not-found proof: treat as retryable/degradable,
-            // never as a caller-terminal (a missing model must not 4xx the client).
-            Some(FailureClass::Retryable)
-        };
+    crate::core::attempt::classify_http_status_with_body(status, Some(body))
+}
+
+/// 将 HTTP 2xx 中的协议失败统一收敛到这里。这个函数只接受已读完的
+/// JSON/SSE data，绝不消费无界流；调用者仍负责 HTTP 状态分类。
+///
+/// 不以任意 `message` 中出现 error 为依据。必须是协议规定的 error shape，
+/// 才会在下游提交前触发故障转移。
+pub fn semantic_failure(protocol: &str, body: &Value) -> Option<AttemptFailure> {
+    let response_status = body.get("status").and_then(Value::as_str);
+    let responses_failed =
+        protocol == "openai" && matches!(response_status, Some("failed") | Some("cancelled"));
+    let anthropic_error = protocol == "anthropic"
+        && (body.get("type").and_then(Value::as_str) == Some("error")
+            || body.get("error").is_some_and(|v| !v.is_null()));
+    // OpenAI-compatible providers conventionally use a top-level non-null
+    // error object. A normal Chat/Responses success does not have this shape.
+    let openai_error = protocol != "anthropic" && body.get("error").is_some_and(|v| !v.is_null());
+    if protocol == "gemini" {
+        if let Some(failure) = gemini_prompt_feedback_failure(body) {
+            return Some(failure);
+        }
     }
-    classify_http_status(status)
+    if !(responses_failed || anthropic_error || openai_error) {
+        return None;
+    }
+    if crate::services::knowledge::budget::current().is_some() && structured_quota_error(body) {
+        return Some(AttemptFailure {
+            failure_class: FailureClass::CallerTerminal,
+            message: "upstream quota rejected".to_string(),
+            status_code: Some(429),
+            retry_after: None,
+        });
+    }
+    let error = body.get("error").filter(|v| !v.is_null()).unwrap_or(body);
+    let kind = error
+        .get("type")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("code").and_then(Value::as_str))
+        .or_else(|| body.get("type").and_then(Value::as_str))
+        .unwrap_or("upstream_error");
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| body.get("message").and_then(Value::as_str))
+        .or_else(|| error.as_str())
+        .unwrap_or("upstream returned a semantic error")
+        .chars()
+        .take(300)
+        .collect::<String>();
+    let retry_after = error
+        .get("retry_after")
+        .and_then(|v| v.as_u64())
+        .or_else(|| body.get("retry_after").and_then(|v| v.as_u64()))
+        .map(|seconds| seconds.min(RETRY_AFTER_CAP_SECS));
+    let haystack = format!(
+        "{} {}",
+        kind.to_ascii_lowercase(),
+        message.to_ascii_lowercase()
+    );
+    let failure_class = if haystack.contains("invalid_api_key")
+        || haystack.contains("authentication")
+        || haystack.contains("unauthorized")
+        || haystack.contains("permission_denied")
+    {
+        FailureClass::ChannelAuthTerminal
+    } else if haystack.contains("invalid_request")
+        || haystack.contains("invalid model")
+        || haystack.contains("unsupported parameter")
+    {
+        FailureClass::CallerTerminal
+    } else {
+        // overload/rate-limit have the same routing result as provider-side
+        // temporary failures: retry another credential/candidate.
+        FailureClass::Retryable
+    };
+    Some(AttemptFailure {
+        failure_class,
+        message: format!("{kind}: {message}"),
+        status_code: Some(if failure_class == FailureClass::CallerTerminal {
+            400
+        } else {
+            502
+        }),
+        retry_after,
+    })
+}
+
+fn gemini_prompt_feedback_failure(body: &Value) -> Option<AttemptFailure> {
+    let vertex = body.get("response").unwrap_or(body);
+    let feedback = vertex.get("promptFeedback")?;
+    let reason = feedback
+        .get("blockReason")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty() && *s != "BLOCK_REASON_UNSPECIFIED")?;
+    let message = feedback
+        .get("blockReasonMessage")
+        .and_then(Value::as_str)
+        .unwrap_or("prompt blocked");
+    Some(AttemptFailure {
+        failure_class: FailureClass::CallerTerminal,
+        message: format!("gemini promptFeedback {reason}: {message}")
+            .chars()
+            .take(300)
+            .collect(),
+        status_code: Some(400),
+        retry_after: None,
+    })
+}
+
+/// Backwards-compatible Anthropic helper retained for the existing callers and
+/// tests. New code should use [`semantic_failure`].
+pub fn anthropic_error_envelope_message(body: &Value) -> Option<String> {
+    semantic_failure("anthropic", body).map(|failure| failure.message)
+}
+
+/// Parse a bounded response body and detect an Anthropic error envelope.
+pub fn anthropic_error_envelope_from_bytes(bytes: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| anthropic_error_envelope_message(&value))
+}
+
+/// Inspect a complete upstream SSE record before any downstream byte is sent.
+/// It supports multi-line `data:` fields and both event-name and JSON shapes.
+pub fn semantic_stream_failure(protocol: &str, record: &[u8]) -> Option<AttemptFailure> {
+    let text = std::str::from_utf8(record).ok()?;
+    let event = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("event:").map(str::trim));
+    let data = text
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("data:").map(str::trim_start))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if protocol == "anthropic" && event == Some("error") {
+        return serde_json::from_str::<Value>(&data)
+            .ok()
+            .and_then(|value| semantic_failure(protocol, &value))
+            .or_else(|| {
+                Some(AttemptFailure {
+                    failure_class: FailureClass::Retryable,
+                    message: "Anthropic upstream stream error".to_string(),
+                    status_code: Some(502),
+                    retry_after: None,
+                })
+            });
+    }
+    if protocol == "openai" && matches!(event, Some("response.failed") | Some("response.cancelled"))
+    {
+        return serde_json::from_str::<Value>(&data)
+            .ok()
+            .and_then(|value| semantic_failure(protocol, value.get("response").unwrap_or(&value)))
+            .or_else(|| {
+                Some(AttemptFailure {
+                    failure_class: FailureClass::Retryable,
+                    message: "Responses upstream stream failed before output".to_string(),
+                    status_code: Some(502),
+                    retry_after: None,
+                })
+            });
+    }
+    serde_json::from_str::<Value>(&data)
+        .ok()
+        .and_then(|value| semantic_failure(protocol, &value))
+}
+
+/// Inspect one complete Anthropic SSE record for an error event/envelope.
+pub fn anthropic_stream_error_message(record: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(record).ok()?;
+    let event_error = text.lines().any(|line| line.trim() == "event: error");
+    let mut data = String::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        if let Some(value) = line.strip_prefix("data:") {
+            data.push_str(value.trim_start());
+        }
+    }
+    let envelope = anthropic_error_envelope_from_bytes(data.as_bytes());
+    if event_error {
+        return envelope.or_else(|| Some("error: Anthropic upstream stream error".to_string()));
+    }
+    envelope
 }
 
 /// Build a classified [`AttemptFailure`] from an upstream non-2xx.
-pub fn failure_from_upstream(status: u16, body: &str) -> AttemptFailure {
-    let class = classify_upstream_status(status, body).unwrap_or(FailureClass::Retryable);
+///
+/// `retry_after_secs` — when the upstream returned a `Retry-After` header,
+/// the parsed (capped) seconds value; `None` if absent or unparseable.
+pub fn failure_from_upstream(
+    status: u16,
+    body: &str,
+    retry_after_secs: Option<u64>,
+) -> AttemptFailure {
+    let mut class = classify_upstream_status(status, body).unwrap_or(FailureClass::Retryable);
+    // 仅预算请求收紧明确的额度拒绝；不能通过换 Key 或关键词降级绕过。
+    // 只识别结构化机器码，不按上游自由消息文本猜测额度。
+    if crate::services::knowledge::budget::current().is_some() && status == 429 {
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            if structured_quota_error(&value) {
+                class = FailureClass::CallerTerminal;
+            }
+        }
+    }
     let message = error_message_from_body(body).unwrap_or_else(|| {
         let cls = class.as_str();
         format!("upstream HTTP {status} ({cls})")
@@ -229,8 +831,35 @@ pub fn failure_from_upstream(status: u16, body: &str) -> AttemptFailure {
         failure_class: class,
         message,
         status_code,
-        retry_after: None,
+        retry_after: retry_after_secs,
     }
+}
+
+fn structured_quota_error(value: &Value) -> bool {
+    ["/error/code", "/error/type", "/code", "/type"]
+        .iter()
+        .any(|pointer| {
+            matches!(
+                value.pointer(pointer).and_then(Value::as_str),
+                Some("insufficient_quota" | "quota_exceeded" | "billing_hard_limit_reached")
+            )
+        })
+}
+
+/// Auth Account variant of [`failure_from_upstream`]: the account belongs to
+/// the user (OAuth login), so a terminal 401/403 keeps its real status instead
+/// of the channel mask.  The failure CLASS is unchanged, so failover semantics
+/// (in-group only, never cross-group) are identical to channels.
+pub fn failure_from_auth_upstream(
+    status: u16,
+    body: &str,
+    retry_after_secs: Option<u64>,
+) -> AttemptFailure {
+    let mut failure = failure_from_upstream(status, body, retry_after_secs);
+    if failure.failure_class == FailureClass::ChannelAuthTerminal {
+        failure.status_code = Some(status);
+    }
+    failure
 }
 
 fn error_message_from_body(body: &str) -> Option<String> {
@@ -245,18 +874,42 @@ fn error_message_from_body(body: &str) -> Option<String> {
 }
 
 fn transport_failure(e: reqwest::Error) -> AttemptFailure {
+    if crate::services::knowledge::budget::current().is_some() {
+        return AttemptFailure {
+            failure_class: FailureClass::Retryable,
+            message: if e.is_timeout() {
+                "upstream transport timed out"
+            } else {
+                "upstream transport failed"
+            }
+            .to_string(),
+            // 没有收到 HTTP 响应；与真实上游状态区分，防止上游正文伪造本地失败。
+            status_code: None,
+            retry_after: None,
+        };
+    }
     AttemptFailure {
         failure_class: FailureClass::Retryable,
         message: format!("upstream connection failed: {e}"),
-        status_code: Some(502),
+        // 保留 reqwest 的类型化超时原因；AttemptFlow 对 Retryable 的最终 HTTP
+        // 仍统一返回 502，504 只用于网关内部诊断，不改变重试/跨渠道规则。
+        status_code: Some(if e.is_timeout() { 504 } else { 502 }),
         retry_after: None,
     }
 }
 
-fn undecodable_body(e: impl std::fmt::Display) -> AttemptFailure {
+fn undecodable_body(
+    status: u16,
+    body_len: usize,
+    content_type: Option<&str>,
+    e: impl std::fmt::Display,
+) -> AttemptFailure {
+    let content_type = content_type.unwrap_or("unknown");
     AttemptFailure {
         failure_class: FailureClass::UpstreamProtocolError,
-        message: format!("upstream returned an undecodable body: {e}"),
+        message: format!(
+            "upstream returned an undecodable body (HTTP {status}, {body_len} bytes, content-type {content_type}): {e}"
+        ),
         status_code: Some(502),
         retry_after: None,
     }
@@ -282,11 +935,12 @@ fn first_sse_data_json(bytes: &[u8]) -> Option<Value> {
     None
 }
 
-fn client(timeout_secs: i64) -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs.max(1) as u64))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+fn client(timeout_secs: i64, is_stream: bool, proxy_url: Option<&str>) -> reqwest::Client {
+    if is_stream {
+        crate::adaptor::streaming_client(proxy_url)
+    } else {
+        crate::adaptor::blocking_client(timeout_secs.max(1) as u64, proxy_url)
+    }
 }
 
 fn is_stream_body(body: &Value) -> bool {
@@ -430,9 +1084,17 @@ async fn send_request(
     safe_headers: &[(String, String)],
     query: Option<&str>,
 ) -> Result<reqwest::Response, AttemptFailure> {
-    let c = client(channel.timeout_secs);
     let is_gemini = identity.legacy_executor_override.as_deref() == Some("gemini_native");
     let stream = is_stream_body(&attempt.encoded_body);
+    // 渠道级出站代理：从渠道 config JSON 的 proxy 键解析
+    //（global/direct/custom）。未填写 proxy 时跟随全局设置；显式
+    // direct 仍保持直连。
+    let proxy_url = crate::adaptor::ProxySetting::from_extra(
+        &serde_json::from_str::<serde_json::Value>(&channel.config).unwrap_or_default(),
+    )
+    .map(|p| p.resolve())
+    .unwrap_or_else(crate::adaptor::global_proxy_url);
+    let c = client(channel.timeout_secs, stream, proxy_url.as_deref());
 
     if is_gemini {
         let url = gemini_url(
@@ -469,6 +1131,28 @@ async fn send_request(
     for (k, v) in safe_headers {
         req = req.header(k, v);
     }
+    // 渠道级自定义请求头：仅发送启用项，并禁止覆盖网关鉴权与传输层受保护头。
+    if let Ok(config) = serde_json::from_str::<Value>(&channel.config) {
+        if let Some(headers) = config.get("request_headers").and_then(Value::as_array) {
+            for item in headers {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let value = item.get("value").and_then(Value::as_str).unwrap_or("");
+                let status = item.get("status").and_then(Value::as_i64).unwrap_or(1);
+                if !name.is_empty() && status != 0 && !is_unsafe_proxy_header(name) {
+                    if let (Ok(header_name), Ok(header_value)) = (
+                        reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                        reqwest::header::HeaderValue::from_str(value),
+                    ) {
+                        req = req.header(header_name, header_value);
+                    }
+                }
+            }
+        }
+    }
     req.json(&attempt.encoded_body)
         .send()
         .await
@@ -494,8 +1178,13 @@ pub async fn dispatch_executor(
     };
     let status = resp.status().as_u16();
     if status >= 400 {
+        let retry_after = retry_after_from_headers(resp.headers());
         let text = resp.text().await.unwrap_or_default();
-        return AttemptResult::Failure(failure_from_upstream(status, &text));
+        return AttemptResult::Failure(failure_from_upstream(
+            status,
+            &text,
+            retry_after.map(|d| d.as_secs()),
+        ));
     }
     // T06 M-2: preserve safely-passthrough response headers (credentials and
     // hop-by-hop fields dropped) so the non-stream executor boundary retains
@@ -503,6 +1192,7 @@ pub async fn dispatch_executor(
     // Snapshot headers for the success path AND the decode-failure diagnostics
     // before `bytes()` consumes the response.
     let response_headers = safe_response_headers(resp.headers());
+    let retry_after = retry_after_from_headers(resp.headers()).map(|d| d.as_secs());
     let content_encoding = resp
         .headers()
         .get(reqwest::header::CONTENT_ENCODING)
@@ -515,7 +1205,14 @@ pub async fn dispatch_executor(
         .map(|s| s.to_string());
     // Read the raw bytes once; parse JSON ourselves so the bytes stay available
     // for diagnostics when the decode fails.
-    let bytes = resp.bytes().await.unwrap_or_default();
+    let bytes = match resp.bytes().await {
+        Ok(bytes) => bytes,
+        // 总超时也可能发生在收到响应头后，不能吞掉后误判为 JSON 格式错误。
+        Err(error) if error.is_timeout() => {
+            return AttemptResult::Failure(transport_failure(error));
+        }
+        Err(_) => bytes::Bytes::new(),
+    };
     let body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -523,20 +1220,25 @@ pub async fn dispatch_executor(
             // text) or an undecoded compressed body (gzip etc.) — the distinction
             // only shows up in the bytes and headers, so log them before failing.
             let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).to_string();
-            tracing::warn!(
-                url = %final_url(
-                    &attempt.native_base_url,
-                    &endpoint_path(&attempt.upstream_protocol, &attempt.upstream_endpoint),
-                    query
-                ),
-                status = status,
-                content_encoding = ?content_encoding,
-                content_type = ?content_type,
-                body_len = bytes.len(),
-                body_preview = %preview,
-                err = %e,
-                "2xx upstream body failed JSON decode"
-            );
+            if crate::services::knowledge::budget::current().is_some() {
+                tracing::warn!(status, content_encoding = ?content_encoding, content_type = ?content_type,
+                    body_len = bytes.len(), "RAG 上游响应不是有效 JSON");
+            } else {
+                tracing::warn!(
+                    url = %final_url(
+                        &attempt.native_base_url,
+                        &endpoint_path(&attempt.upstream_protocol, &attempt.upstream_endpoint),
+                        query
+                    ),
+                    status = status,
+                    content_encoding = ?content_encoding,
+                    content_type = ?content_type,
+                    body_len = bytes.len(),
+                    body_preview = %preview,
+                    err = %e,
+                    "2xx upstream body failed JSON decode"
+                );
+            }
             // Draft-test probes only: a gateway that ignores `stream:false` and
             // ALWAYS returns SSE is still speaking the endpoint's protocol, so a
             // probe must not fail it just because the body is SSE-framed rather
@@ -548,13 +1250,29 @@ pub async fn dispatch_executor(
             if attempt.route_group.starts_with("draft_test/") {
                 match first_sse_data_json(&bytes) {
                     Some(v) => v,
-                    None => return AttemptResult::Failure(undecodable_body(e)),
+                    None => {
+                        return AttemptResult::Failure(undecodable_body(
+                            status,
+                            bytes.len(),
+                            content_type.as_deref(),
+                            e,
+                        ))
+                    }
                 }
             } else {
-                return AttemptResult::Failure(undecodable_body(e));
+                return AttemptResult::Failure(undecodable_body(
+                    status,
+                    bytes.len(),
+                    content_type.as_deref(),
+                    e,
+                ));
             }
         }
     };
+    if let Some(mut failure) = semantic_failure(&attempt.upstream_protocol, &body) {
+        failure.retry_after = retry_after;
+        return AttemptResult::Failure(failure);
+    }
     // Legacy Gemini override: the upstream `generateContent` response must be
     // converted back to OpenAI Chat (this is the ONLY executor that converts
     // responses; it is selected exclusively via identity override).
@@ -582,71 +1300,56 @@ pub async fn dispatch_executor(
     }
 }
 
-/// Decode a non-stream upstream body into the downstream protocol.
-/// Native groups pass the body through unchanged; conversion groups decode
-/// through the correct codec direction (the registry's response-decoder wiring
-/// is intentionally NOT used — its orientation is the encoder's, see T04 note).
+/// Decode one upstream body through the request-scoped codec plan.
+///
+/// The factory preserves the exact `ConversionContext` created while encoding
+/// this attempt.  It also returns observed usage as part of the same decode,
+/// avoiding a second protocol-specific pass for quota accounting.
 fn decode_non_stream(
-    _downstream: EndpointKind,
+    downstream: EndpointKind,
     attempt: &PreparedAttempt,
     body: &Value,
 ) -> Result<(Value, Option<TokenUsage>), AttemptFailure> {
-    let usage = extract_usage(&attempt.upstream_protocol, &attempt.upstream_endpoint, body);
-
-    match attempt.codec_version.as_deref() {
-        None => Ok((body.clone(), usage)),
-        Some("chat_to_messages_v1") => {
-            // downstream Chat, upstream Messages: Messages body -> Chat body.
-            let context = crate::protocol::codec::report::ConversionContext::new(
-                format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()),
-                attempt.upstream_model.clone(),
-                false,
-            );
-            let out =
-                crate::protocol::codec::messages::decode_messages_response_to_chat(body, &context)
-                    .map_err(|e| AttemptFailure {
-                        failure_class: FailureClass::UpstreamProtocolError,
-                        message: format!(
-                            "Messages response cannot be decoded to Chat: {}",
-                            e.message
-                        ),
-                        status_code: Some(502),
-                        retry_after: None,
-                    })?;
-            Ok((out, usage))
-        }
-        Some("messages_to_chat_v1") => {
-            // downstream Messages, upstream Chat: Chat body -> Messages body.
-            let context = crate::protocol::codec::report::ConversionContext::new(
-                format!("msg_{}", uuid::Uuid::new_v4().simple()),
-                attempt.upstream_model.clone(),
-                false,
-            );
-            let out =
-                crate::protocol::codec::chat::decode_chat_response_to_messages(body, &context)
-                    .map_err(|e| AttemptFailure {
-                        failure_class: FailureClass::UpstreamProtocolError,
-                        message: format!(
-                            "Chat response cannot be decoded to Messages: {}",
-                            e.message
-                        ),
-                        status_code: Some(502),
-                        retry_after: None,
-                    })?;
-            Ok((out, usage))
-        }
-        Some("responses_via_chat_v1") => {
-            // downstream Responses, upstream Chat: Chat body -> Responses body.
-            let out = crate::protocol::openai_to_responses(body, &attempt.upstream_model);
-            Ok((out, usage))
-        }
-        Some(other) => Err(AttemptFailure {
+    let Some(codec) = attempt.prepared_codec.as_ref() else {
+        return match downstream {
+            EndpointKind::CountTokens | EndpointKind::Embeddings => Ok((
+                body.clone(),
+                extract_usage(&attempt.upstream_protocol, &attempt.upstream_endpoint, body),
+            )),
+            // Endpoint draft probes intentionally construct a minimal attempt
+            // without request preparation.  They exercise upstream reachability
+            // only and never serve a client response, so retain their historical
+            // raw-body inspection path while production remains fail-closed.
+            _ if attempt.route_group.starts_with("draft_test/") => Ok((
+                body.clone(),
+                extract_usage(&attempt.upstream_protocol, &attempt.upstream_endpoint, body),
+            )),
+            _ => Err(AttemptFailure {
+                failure_class: FailureClass::UpstreamProtocolError,
+                message: "three-protocol attempt is missing its prepared codec".to_string(),
+                status_code: Some(502),
+                retry_after: None,
+            }),
+        };
+    };
+    let decoded = codec
+        .new_non_stream_decoder()
+        .decode(body)
+        .map_err(|error| AttemptFailure {
             failure_class: FailureClass::UpstreamProtocolError,
-            message: format!("unknown codec version on a conversion attempt: {other}"),
+            message: format!("upstream response could not be decoded: {error}"),
             status_code: Some(502),
             retry_after: None,
+        })?;
+    Ok((
+        decoded.body,
+        decoded.usage.map(|usage| TokenUsage {
+            prompt_tokens: usage.input_tokens,
+            completion_tokens: usage.output_tokens,
+            total_tokens: usage.input_tokens + usage.output_tokens,
+            cached_tokens: usage.cache_read_input_tokens,
         }),
-    }
+    ))
 }
 
 /// Extract token usage from the RAW upstream body (before any response decode).
@@ -658,10 +1361,15 @@ pub fn extract_usage(protocol: &str, endpoint: &str, body: &Value) -> Option<Tok
             .get("output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let cached = usage
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         return Some(TokenUsage {
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input + output,
+            cached_tokens: cached,
         });
     }
     if endpoint == "responses" {
@@ -674,10 +1382,19 @@ pub fn extract_usage(protocol: &str, endpoint: &str, body: &Value) -> Option<Tok
             .and_then(Value::as_u64)
             .or_else(|| usage.get("completion_tokens").and_then(Value::as_u64))
             .unwrap_or(0);
+        // OpenAI Responses API returns cached tokens inside input_tokens_details.cached_tokens
+        let cached = usage
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
+            .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+            .unwrap_or(0);
         return Some(TokenUsage {
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input + output,
+            cached_tokens: cached,
         });
     }
     let prompt = usage.get("prompt_tokens").and_then(Value::as_u64)?;
@@ -689,10 +1406,20 @@ pub fn extract_usage(protocol: &str, endpoint: &str, body: &Value) -> Option<Tok
         .get("total_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(prompt + completion);
+    let cached = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            // DeepSeek-compatible upstreams use their own cache-hit field.
+            usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
     Some(TokenUsage {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
+        cached_tokens: cached,
     })
 }
 
@@ -717,8 +1444,13 @@ pub async fn dispatch_stream_executor(
     };
     let status = resp.status().as_u16();
     if status >= 400 {
+        let retry_after = retry_after_from_headers(resp.headers());
         let text = resp.text().await.unwrap_or_default();
-        return StreamAttemptResult::Failure(failure_from_upstream(status, &text));
+        return StreamAttemptResult::Failure(failure_from_upstream(
+            status,
+            &text,
+            retry_after.map(|d| d.as_secs()),
+        ));
     }
     let content_type = resp
         .headers()
@@ -743,6 +1475,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_retry_after_delta_seconds() {
+        assert_eq!(parse_retry_after(Some("120")), Some(120));
+        assert_eq!(parse_retry_after(Some("0")), Some(0));
+        assert_eq!(parse_retry_after(Some("  30  ")), Some(30));
+    }
+
+    #[test]
+    fn parse_retry_after_http_date() {
+        // A future date ~120 seconds from now.
+        let future = Utc::now() + chrono::Duration::seconds(120);
+        let rfc2822 = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let parsed = parse_retry_after(Some(&rfc2822));
+        assert!(parsed.is_some(), "should parse HTTP-date: {rfc2822}");
+        let secs = parsed.unwrap();
+        assert!(secs >= 115 && secs <= 125, "should be ~120s, got {secs}");
+    }
+
+    #[test]
+    fn parse_retry_after_invalid() {
+        assert_eq!(parse_retry_after(None), None);
+        assert_eq!(parse_retry_after(Some("garbage")), None);
+        assert_eq!(parse_retry_after(Some("")), None);
+    }
+
+    #[test]
+    fn retry_after_from_headers_caps_and_jitters() {
+        // A huge value (3600s) should be capped to RETRY_AFTER_CAP_SECS (5).
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "3600".parse().unwrap());
+        let dur = retry_after_from_headers(&headers).unwrap();
+        // With ±20% jitter on 5s, range is [4, 6].
+        assert!(
+            dur.as_secs() >= 4 && dur.as_secs() <= 6,
+            "capped+jit={:?}",
+            dur
+        );
+    }
+
+    #[test]
+    fn retry_after_from_headers_absent() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert!(retry_after_from_headers(&headers).is_none());
+    }
+
+    #[test]
     fn final_url_joins_cleanly() {
         assert_eq!(
             final_url("https://api.openai.com/v1", "chat/completions", None),
@@ -764,6 +1541,12 @@ mod tests {
     }
 
     #[test]
+    fn auth_account_body_always_forces_responses_streaming() {
+        let forced = force_responses_stream(&serde_json::json!({"model":"m","stream":false}));
+        assert_eq!(forced["stream"], true);
+    }
+
+    #[test]
     fn auth_schemes() {
         assert_eq!(
             auth_headers(AuthScheme::Bearer, "k"),
@@ -779,6 +1562,71 @@ mod tests {
             auth_headers(AuthScheme::OptionalBearer, "k"),
             vec![("authorization".to_string(), "Bearer k".to_string())]
         );
+    }
+
+    #[test]
+    fn anthropic_error_envelopes_include_overload_and_ignore_messages_success() {
+        let error = serde_json::json!({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "Selected model is at capacity."}
+        });
+        assert_eq!(
+            anthropic_error_envelope_message(&error).as_deref(),
+            Some("overloaded_error: Selected model is at capacity.")
+        );
+        assert!(anthropic_error_envelope_message(&serde_json::json!({
+            "type": "message", "content": [], "stop_reason": "end_turn"
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn anthropic_stream_error_envelope_is_detected_before_commit() {
+        let record = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n";
+        assert_eq!(
+            anthropic_stream_error_message(record).as_deref(),
+            Some("overloaded_error: busy")
+        );
+    }
+
+    #[test]
+    fn semantic_failure_covers_responses_and_openai_compatible_shapes() {
+        let failed =
+            serde_json::json!({"status":"failed","error":{"code":"server_error","message":"busy"}});
+        assert_eq!(
+            semantic_failure("openai", &failed).unwrap().failure_class,
+            FailureClass::Retryable
+        );
+        let cancelled = serde_json::json!({"status":"cancelled"});
+        assert!(semantic_failure("openai", &cancelled).is_some());
+        let compat = serde_json::json!({"error":{"type":"rate_limit_error","message":"slow down"}});
+        assert_eq!(
+            semantic_failure("openai", &compat).unwrap().failure_class,
+            FailureClass::Retryable
+        );
+        let success = serde_json::json!({"object":"chat.completion","message":"error text"});
+        assert!(semantic_failure("openai", &success).is_none());
+        let blocked = serde_json::json!({
+            "response": {
+                "promptFeedback": {"blockReason": "SAFETY", "blockReasonMessage": "hate"},
+                "candidates": []
+            }
+        });
+        let failure = semantic_failure("gemini", &blocked).unwrap();
+        assert_eq!(failure.failure_class, FailureClass::CallerTerminal);
+        assert!(failure.message.contains("SAFETY"));
+        let ok =
+            serde_json::json!({"response":{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}});
+        assert!(semantic_failure("gemini", &ok).is_none());
+    }
+
+    #[test]
+    fn responses_failed_sse_envelope_is_detected() {
+        let record = br#"event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"message":"capacity"}}}
+
+"#;
+        assert!(semantic_stream_failure("openai", record).is_some());
     }
 
     #[test]
@@ -854,13 +1702,38 @@ mod tests {
 
     #[test]
     fn failure_from_upstream_never_leaks_channel_auth() {
-        let f = failure_from_upstream(401, r#"{"error":{"message":"bad channel key"}}"#);
+        let f = failure_from_upstream(401, r#"{"error":{"message":"bad channel key"}}"#, None);
         assert_eq!(f.failure_class, FailureClass::ChannelAuthTerminal);
         assert_eq!(
             f.status_code,
             Some(502),
             "channel auth must map to 502 downstream"
         );
+    }
+
+    #[test]
+    fn auth_upstream_keeps_real_401_status() {
+        // Auth accounts own their OAuth credentials: the caller must see the
+        // real 401 to know re-login fixes it (failover class unchanged).
+        let f = failure_from_auth_upstream(401, r#"{"error":{"message":"invalid token"}}"#, None);
+        assert_eq!(f.failure_class, FailureClass::ChannelAuthTerminal);
+        assert_eq!(f.status_code, Some(401));
+        let f = failure_from_auth_upstream(403, "forbidden", None);
+        assert_eq!(f.failure_class, FailureClass::ChannelAuthTerminal);
+        assert_eq!(f.status_code, Some(403));
+        // Non-auth failures behave exactly like the channel variant.
+        let f = failure_from_auth_upstream(500, "boom", None);
+        assert_eq!(f.failure_class, FailureClass::Retryable);
+        assert_eq!(f.status_code, Some(500));
+    }
+
+    #[test]
+    fn provider_unauthorized_maps_to_401() {
+        let f = provider_failure(crate::auth_provider::ProviderError::Unauthorized);
+        assert_eq!(f.failure_class, FailureClass::ChannelAuthTerminal);
+        assert_eq!(f.status_code, Some(401));
+        let f = provider_failure(crate::auth_provider::ProviderError::Retryable);
+        assert_eq!(f.status_code, Some(502));
     }
 
     #[test]

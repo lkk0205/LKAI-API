@@ -18,8 +18,12 @@ pub struct KbKnowledgeBase {
     pub excluded_files: String,
     pub included_files: String,
     pub embedding_dim: i64,
+    pub embedding_revision: i64,
     pub index_status: String,
     pub embedding_batch_size: i64,
+    /// 知识库级 OCR 视觉模型（如 qwen-vl-max）；None/空 = 不启用。
+    /// 仅在全局设置 ocr.enabled 开启后对扫描版 PDF 生效。
+    pub ocr_model: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -30,6 +34,7 @@ pub struct CreateKbInput {
     pub description: Option<String>,
     pub embedding_model: Option<String>,
     pub embedding_channel_id: Option<String>,
+    pub ocr_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +51,7 @@ pub struct UpdateKbInput {
     pub excluded_files: Option<String>,
     pub included_files: Option<String>,
     pub embedding_batch_size: Option<i64>,
+    pub ocr_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -65,6 +71,12 @@ pub struct KbDocument {
     pub source_url: Option<String>,
     pub source_path: Option<String>,
     pub doc_meta: String,
+    /// OCR 识别引擎（'vlm' / NULL = 未经过 OCR）
+    pub ocr_engine: Option<String>,
+    /// PDF 页数（仅 OCR 文档回填）
+    pub page_count: i64,
+    /// OCR 失败页码的 JSON 数组（如 "[3,7]"）
+    pub ocr_failed_pages: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -98,6 +110,20 @@ pub struct SearchResult {
     pub metadata: serde_json::Value,
 }
 
+/// 通用检索结果；旧请求仍只返回 data，新能力仅在显式请求时附加元数据。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResponse {
+    pub data: Vec<SearchResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<RagDiagnostics>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagAnswer {
     pub answer: String,
@@ -105,6 +131,43 @@ pub struct RagAnswer {
     pub usage: Option<UsageInfo>,
     #[serde(default)]
     pub retrieval_details: Option<Vec<RetrievalDetail>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<RagDiagnostics>,
+    /// 仅显式启用关键词降级的请求返回实际检索模式。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
+    /// 只确认已请求思考档位，不表示上游接受或执行。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<RagReasoning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RagReasoning {
+    pub requested: String,
+    pub status: ReasoningStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningStatus {
+    Requested,
+    NotSent,
+}
+
+/// 仅显式诊断请求返回阶段结果，不包含提示词、渠道地址或凭据。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RagDiagnostics {
+    pub request_id: String,
+    pub stages: Vec<RagDiagnosticStage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RagDiagnosticStage {
+    pub stage: String,
+    pub status: String,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +187,19 @@ pub struct SourceInfo {
     pub filename: String,
     pub score: f32,
     pub snippet: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_no: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet_start: Option<usize>,
+    /// 显式候选请求提供最终上下文原文，供任意客户端按 Unicode 码点核对引用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +265,21 @@ pub struct AskInput {
     pub keyword_weight: Option<f32>,
     #[serde(default)]
     pub search_mode: Option<String>,
+    /// 启用严格健康检测：必须有检索片段、有效答案和来源。
+    #[serde(default)]
+    pub diagnostics: bool,
+    /// 整次 RAG 共用时间预算，服务端限制为 100..=120000 毫秒；省略保持历史行为。
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// 授权通过后的可恢复向量查询失败，允许使用关键词检索。
+    #[serde(default)]
+    pub allow_keyword_fallback: bool,
+    /// 最终截断前的候选池；省略时保持普通请求原有行为。
+    #[serde(default)]
+    pub candidate_k: Option<usize>,
+    /// 省略或 default 不覆盖网关 / 模型默认；其他档位使用通用协议参数。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 fn default_top_k() -> usize {

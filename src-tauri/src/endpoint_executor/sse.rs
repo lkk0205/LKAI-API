@@ -1,95 +1,56 @@
-//! SSE framing + streaming commit-barrier pump (T06).
+//! SSE framing + the streaming commit-barrier pump.
 //!
-//! [`StreamPumpCore`] is the pure, testable engine behind the streaming plan
-//! driver.  It owns a [`StreamSupervisor`] and drives the commit barrier:
-//!
-//! ```text
-//! FirstFrameBufferedAndValidated → commit_downstream → begin_streaming →
-//!   (per-frame) → complete | abort
-//! ```
-//!
-//! Native streams pass raw bytes through (validating the first complete record
-//! before commit); conversion streams run the correct versioned codec decoder
-//! so the downstream only ever sees its own protocol.  The pump performs no
-//! network I/O — the driver feeds it bytes.
+//! Protocol conversion is deliberately absent from this module.  A selected
+//! [`PreparedCodec`](crate::protocol::codec::PreparedCodec) creates the decoder
+//! before entering the pump, so this type only owns framing, commit state and
+//! decoder driving.
 
 use crate::core::stream_supervisor::{StreamSupervisor, StreamTransitionError};
-use crate::protocol::codec::registry::StreamDecoder;
+use crate::protocol::codec::StreamDecoder;
 use serde_json::Value;
 
-/// Which transform a streaming attempt needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SseMode {
-    /// Raw byte passthrough (OpenAI Chat SSE / OpenAI Responses SSE /
-    /// Anthropic Messages SSE).  First-frame validation = one well-formed SSE
-    /// record; terminal markers `[DONE]` / `message_stop` are exactly-once.
-    Native,
-    /// Chat SSE -> Messages SSE (downstream Messages, upstream Chat).
-    ChatToMessages,
-    /// Messages SSE -> Chat SSE (downstream Chat, upstream Messages).
-    MessagesToChat,
-    /// Chat SSE -> Responses SSE (downstream Responses, upstream Chat via the
-    /// per-record `responses_via_chat_v1` legacy debt).
-    ResponsesViaChat,
-}
-
-impl SseMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SseMode::Native => "native",
-            SseMode::ChatToMessages => "chat_to_messages_v1",
-            SseMode::MessagesToChat => "messages_to_chat_v1",
-            SseMode::ResponsesViaChat => "responses_via_chat_v1",
-        }
-    }
-}
-
-/// A pump failure.  Before commit these allow upstream swap; after commit they
-/// become a protocol-representable downstream error (never a retry).
 #[derive(Debug, Clone)]
 pub enum PumpError {
-    /// Codec/upstream protocol error (undecodable frame, invalid SSE, etc.).
     Protocol(String),
-    /// The supervisor rejected a transition (e.g. terminal already emitted).
     Supervisor(String),
 }
 
 impl From<StreamTransitionError> for PumpError {
-    fn from(e: StreamTransitionError) -> Self {
-        PumpError::Supervisor(format!("{e:?}"))
+    fn from(error: StreamTransitionError) -> Self {
+        Self::Supervisor(format!("{error:?}"))
     }
 }
 
 impl PumpError {
     pub fn message(&self) -> &str {
         match self {
-            PumpError::Protocol(m) | PumpError::Supervisor(m) => m,
+            Self::Protocol(message) | Self::Supervisor(message) => message,
         }
     }
 }
 
-/// Locate the terminating sequence of the next full SSE record (shared with the
-/// codec's framing helpers so native validation matches conversion validation).
 pub fn record_end(input: &[u8]) -> Option<usize> {
     crate::protocol::codec::sse::record_end(input)
 }
 
-/// Parse one raw SSE record into its `data:` payload.
 pub fn parse_data_payload(record: &[u8]) -> Result<String, String> {
-    crate::protocol::codec::sse::parse_data_payload(record).map_err(|e| e.message)
+    crate::protocol::codec::sse::parse_data_payload(record).map_err(|error| error.message)
 }
 
-fn sse_record_text(record: &[u8]) -> String {
-    String::from_utf8_lossy(record).into_owned()
-}
+/// 泵累积内容（正文/推理文本）上限（FIX-11）：超长生成停止拼接并落截断
+/// 标记，防止故障/恶意上游把内存与日志体积放大到失控。下游转发不受影响
+/// （转发的字节不经过累积），仅影响落库的 response_choices。
+pub(crate) const MAX_ACCUMULATED_CONTENT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const ACCUMULATION_TRUNCATION_MARKER: &str =
+    "\n\n[... WaLiAPI: accumulated content truncated ...]";
 
-/// Validate a first native SSE record (pre-commit).  A record is valid when it
-/// has a `data:` payload (or an `event:` field) and, if the payload is JSON, it
-/// parses.  `[DONE]` is valid too.
+/// Validate only enough framing to retain the pre-commit failover barrier.
+/// Full protocol validation belongs to the decoder factory selected at prepare
+/// time and therefore runs inside [`StreamPumpCore::new`].
 pub fn validate_native_first_record(record: &[u8]) -> Result<(), String> {
-    let text = sse_record_text(record);
+    let text = String::from_utf8_lossy(record);
     if text.contains("event:") {
-        return Ok(()); // Anthropic-style event record
+        return Ok(());
     }
     let payload = parse_data_payload(record)?;
     if payload.is_empty() || payload == "[DONE]" {
@@ -97,160 +58,120 @@ pub fn validate_native_first_record(record: &[u8]) -> Result<(), String> {
     }
     serde_json::from_str::<Value>(&payload)
         .map(|_| ())
-        .map_err(|e| format!("first SSE data frame is not valid JSON: {e}"))
+        .map_err(|error| format!("first SSE data frame is not valid JSON: {error}"))
 }
 
-/// Extract the last token-usage triple observed in native OpenAI SSE chunks.
-/// Mirrors the legacy `parse_usage_from_chunk` behaviour (best effort).
-pub fn scan_usage_from_chunk(text: &str) -> Option<(i64, i64, i64)> {
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("data:") {
+/// 下行 SSE 事件是否为协议终止标记：Chat 的 `data: [DONE]`、Anthropic 的
+/// `message_stop`、Responses 的 `response.completed`/`response.done`。
+///
+/// 终止事件到达即视为流在协议层完成——下游已拿到完整响应，不必再等上游
+/// TCP EOF（部分上游发完数据后延迟关连接，EOF 可能迟迟不来，issue #57）。
+/// 只识别成功终止：错误型事件（`error`/`response.failed`）仍交给 EOF/
+/// 超时路径处理，避免把「上游报错后挂死」记成成功流。
+pub(crate) fn sse_event_is_terminal(event: &str) -> bool {
+    for line in event.lines() {
+        let line = line.trim();
+        let Some(payload) = line.strip_prefix("data:") else {
             continue;
+        };
+        let payload = payload.trim();
+        if payload == "[DONE]" {
+            return true;
         }
-        let data_str = trimmed.trim_start_matches("data:").trim();
-        if data_str == "[DONE]" || data_str.is_empty() {
-            continue;
-        }
-        if let Ok(json) = serde_json::from_str::<Value>(data_str) {
-            if let Some(usage) = json.get("usage") {
-                let prompt = usage
-                    .get("prompt_tokens")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
-                let completion = usage
-                    .get("completion_tokens")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
-                let total = usage
-                    .get("total_tokens")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
-                if total > 0 || prompt > 0 || completion > 0 {
-                    return Some((prompt, completion, total));
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(t) = v.get("type").and_then(Value::as_str) {
+                if matches!(t, "message_stop" | "response.completed" | "response.done") {
+                    return true;
                 }
             }
         }
     }
-    None
+    false
 }
 
-/// Pure streaming pump: drives the supervisor + decoder as bytes arrive.
+/// A protocol-agnostic pump. The decoder is mandatory: identity directions use
+/// the same path as conversions, which prevents an executor-side "native"
+/// branch from bypassing validation or usage collection.
 pub struct StreamPumpCore {
     supervisor: StreamSupervisor,
-    mode: SseMode,
-    decoder: Option<Box<dyn StreamDecoder>>,
-    /// Bytes to emit on the first poll (raw first record, or the first encoded
-    /// downstream events for conversion modes).
+    decoder: Box<dyn StreamDecoder + Send + Sync>,
     first_frame: Vec<u8>,
     first_done: bool,
     terminal_registered: bool,
     finished: bool,
-    /// Mapped upstream model (for responses/chat conversion synthesis).
-    model: String,
-    /// Responses-via-chat streaming state (responses::StreamState).
-    responses_state: Option<crate::protocol::responses::StreamState>,
-    responses_id: String,
     accumulated_content: String,
-    /// Last native usage observed.
-    usage: Option<(i64, i64, i64)>,
+    accumulated_reasoning: String,
+    /// role from the first delta that carries one (defaults to "assistant").
+    response_role: Option<String>,
+    /// finish_reason captured from the terminal SSE record.
+    finish_reason: Option<String>,
+    /// tool_calls accumulated from stream deltas, keyed by index.
+    tool_calls_map: std::collections::BTreeMap<i64, serde_json::Value>,
+    /// 累积内容触上限后置位：停止拼接正文/推理，落库时追加截断标记（FIX-11）。
+    accumulation_truncated: bool,
 }
 
 impl StreamPumpCore {
-    /// Build a pump.  `supervisor` must already be in
-    /// `FirstFrameBufferedAndValidated`.
-    ///
-    /// `first_frame` is the first complete upstream SSE record (already
-    /// validated by the driver).  `carry` is the RAW remainder of the same
-    /// upstream chunk that arrived after the first record — records 2..N.
-    ///
-    /// For CONVERSION modes BOTH `first_frame` and `carry` are fed through the
-    /// codec decoder BEFORE commit (decision 6: the first downstream event must
-    /// be successfully encoded before the 200 is committed), so `start()`
-    /// returns only ENCODED downstream bytes — NEVER raw upstream protocol
-    /// bytes, even when the first TCP chunk spans several records.  The decoder
-    /// consumes records 1..N in order; its state is NOT left at record N+1.
-    /// For native passthrough, `first_frame` + `carry` are preserved raw.
-    ///
-    /// Returns `Err` on a codec rejection of any first-chunk record.  This is a
-    /// pre-commit failover: the downstream 200 was NOT committed and the next
-    /// candidate may be tried.
+    /// Feed the complete first record and any bytes read past it into the same
+    /// fresh decoder before committing downstream. This makes an invalid first
+    /// response (including an identity response) retryable without leaking raw
+    /// bytes to the client.
     pub fn new(
-        supervisor: StreamSupervisor,
-        mode: SseMode,
-        decoder: Option<Box<dyn StreamDecoder>>,
+        mut supervisor: StreamSupervisor,
+        mut decoder: Box<dyn StreamDecoder + Send + Sync>,
         first_frame: Vec<u8>,
         carry: Vec<u8>,
-        model: String,
     ) -> Result<Self, PumpError> {
-        let mut core = Self {
-            supervisor,
-            mode,
-            decoder,
-            first_frame: Vec::new(),
-            first_done: false,
-            terminal_registered: false,
-            finished: false,
-            model,
-            responses_state: if mode == SseMode::ResponsesViaChat {
-                Some(crate::protocol::responses::StreamState::default())
-            } else {
-                None
-            },
-            responses_id: format!("resp_{}", uuid::Uuid::new_v4().simple()),
-            accumulated_content: String::new(),
-            usage: None,
-        };
-        match mode {
-            SseMode::Native => {
-                let mut buf = first_frame;
-                buf.extend_from_slice(&carry);
-                // T10 integration fix: a short SSE upstream can deliver the WHOLE
-                // stream in the first TCP burst, so records 2..N land in `carry`
-                // and are never pushed through `encode_native_chunk`.  Scan usage
-                // and terminal markers from the combined first-chunk bytes so a
-                // first-burst stream still records token usage and terminates
-                // exactly once.
-                let text = String::from_utf8_lossy(&buf);
-                if let Some(u) = scan_usage_from_chunk(&text) {
-                    core.usage = Some(u);
-                }
-                if !core.terminal_registered
-                    && (text.contains("data: [DONE]") || text.contains("message_stop"))
-                {
-                    core.terminal_registered = core.supervisor.register_terminal();
-                }
-                core.first_frame = buf;
+        let mut output = Vec::new();
+        let mut accumulated_content = String::new();
+        let mut accumulated_reasoning = String::new();
+        let mut response_role: Option<String> = None;
+        let mut finish_reason: Option<String> = None;
+        let mut tool_calls_map = std::collections::BTreeMap::<i64, serde_json::Value>::new();
+        let mut terminal_registered = false;
+        for bytes in [&first_frame[..], &carry[..]] {
+            if bytes.is_empty() {
+                continue;
             }
-            SseMode::ChatToMessages | SseMode::MessagesToChat => {
-                let mut out = Vec::new();
-                if !first_frame.is_empty() {
-                    out.extend(core.encode_conversion_chunk(&first_frame)?);
-                }
-                if !carry.is_empty() {
-                    out.extend(core.encode_conversion_chunk(&carry)?);
-                }
-                core.first_frame = out;
-            }
-            SseMode::ResponsesViaChat => {
-                let mut out = Vec::new();
-                if !first_frame.is_empty() {
-                    out.extend(
-                        core.encode_responses_chunk(&String::from_utf8_lossy(&first_frame))?,
-                    );
-                }
-                if !carry.is_empty() {
-                    out.extend(core.encode_responses_chunk(&String::from_utf8_lossy(&carry))?);
-                }
-                core.first_frame = out;
+            let events = decoder.feed(bytes).map_err(|error| {
+                PumpError::Protocol(format!("upstream stream could not be decoded: {error}"))
+            })?;
+            for event in &events {
+                output.extend_from_slice(event.as_bytes());
+                accumulate_from_sse_event(
+                    event,
+                    &mut accumulated_content,
+                    &mut accumulated_reasoning,
+                    &mut response_role,
+                    &mut finish_reason,
+                    &mut tool_calls_map,
+                );
+                terminal_registered |= sse_event_is_terminal(event);
             }
         }
-        Ok(core)
+        // 首帧/伴随帧里就可能含终止标记（极短响应），提前登记——输出扫描
+        // 与解码器的上游终止状态双通道。
+        terminal_registered |= decoder.saw_terminal();
+        if terminal_registered {
+            supervisor.register_terminal();
+        }
+        let accumulation_truncated = accumulated_content.len() >= MAX_ACCUMULATED_CONTENT_BYTES;
+        Ok(Self {
+            supervisor,
+            decoder,
+            first_frame: output,
+            first_done: false,
+            terminal_registered,
+            finished: false,
+            accumulated_content,
+            accumulated_reasoning,
+            response_role,
+            finish_reason,
+            tool_calls_map,
+            accumulation_truncated,
+        })
     }
 
-    /// Commit the downstream 200 + first frame.  Idempotent.  For conversion
-    /// modes the first frame is already the ENCODED downstream events (from
-    /// [`StreamPumpCore::new`]); for native it is the raw validated record.
     pub fn start(&mut self) -> Result<Vec<u8>, PumpError> {
         if self.first_done {
             return Ok(Vec::new());
@@ -261,203 +182,135 @@ impl StreamPumpCore {
         Ok(std::mem::take(&mut self.first_frame))
     }
 
-    /// Encode one native (passthrough) chunk: scan usage / terminal markers
-    /// and return the raw bytes.
-    fn encode_native_chunk(&mut self, bytes: &[u8]) -> Vec<u8> {
-        let text = String::from_utf8_lossy(bytes);
-        if let Some(u) = scan_usage_from_chunk(&text) {
-            self.usage = Some(u);
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, PumpError> {
+        let mut output = self.start()?;
+        let events = self.decoder.feed(bytes).map_err(|error| {
+            PumpError::Protocol(format!("upstream stream could not be decoded: {error}"))
+        })?;
+        for event in &events {
+            output.extend_from_slice(event.as_bytes());
+            self.accumulate_from_sse(event);
+            if sse_event_is_terminal(event) {
+                self.register_terminal_once();
+            }
         }
-        if !self.terminal_registered
-            && (text.contains("data: [DONE]") || text.contains("message_stop"))
-        {
+        // 转换方向把终止事件推迟到 finish() 合成（输出里看不到），以解码器
+        // 的上游终止状态为准（#57）。
+        if self.decoder.saw_terminal() {
+            self.register_terminal_once();
+        }
+        Ok(output)
+    }
+
+    /// Exactly-once 终止登记（push 检测与 finish 共用）。
+    fn register_terminal_once(&mut self) {
+        if !self.terminal_registered {
             self.terminal_registered = self.supervisor.register_terminal();
         }
-        bytes.to_vec()
     }
 
-    /// Encode one ChatToMessages / MessagesToChat chunk through the decoder.
-    fn encode_conversion_chunk(&mut self, bytes: &[u8]) -> Result<Vec<u8>, PumpError> {
-        let decoder = self.decoder.as_mut().ok_or_else(|| {
-            PumpError::Protocol("conversion stream is missing its decoder".to_string())
-        })?;
-        let events = decoder.feed(bytes).map_err(|e| {
-            PumpError::Protocol(format!(
-                "upstream stream could not be converted ({}): {}",
-                self.mode.as_str(),
-                e.message
-            ))
-        })?;
-        let mut out = Vec::new();
-        for ev in events {
-            if ev.contains("message_stop") {
-                self.terminal_registered = self.supervisor.register_terminal();
-            }
-            // The codec event strings already end in "\n\n" (sse::event /
-            // sse::data_frame); do NOT append another newline.
-            out.extend_from_slice(ev.as_bytes());
-        }
-        Ok(out)
+    /// 帧间空闲超时观测（FIX-08）：记录到流监督状态机供诊断，不改变泵状态。
+    pub fn mark_idle_timeout(&mut self) {
+        let _ = self
+            .supervisor
+            .on_timeout(crate::core::stream_supervisor::StreamTimeoutKind::StreamIdle);
     }
 
-    /// Encode one ResponsesViaChat chunk through the Responses SSE converter.
-    fn encode_responses_chunk(&mut self, text: &str) -> Result<Vec<u8>, PumpError> {
-        if let Some(u) = scan_usage_from_chunk(text) {
-            self.usage = Some(u);
-        }
-        // accumulate content for the synthetic completed events
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if !trimmed.starts_with("data:") {
-                continue;
-            }
-            let data_str = trimmed.trim_start_matches("data:").trim();
-            if data_str == "[DONE]" || data_str.is_empty() {
-                continue;
-            }
-            if let Ok(json) = serde_json::from_str::<Value>(data_str) {
-                if let Some(choices) = json.get("choices").and_then(Value::as_array) {
-                    if let Some(choice) = choices.first() {
-                        if let Some(delta) = choice.get("delta") {
-                            if let Some(c) = delta.get("content").and_then(Value::as_str) {
-                                self.accumulated_content.push_str(c);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let events = crate::protocol::responses::convert_openai_sse_to_responses(
-            text,
-            &self.model,
-            &self.responses_id,
-            &self.accumulated_content,
-            self.responses_state.as_mut().unwrap(),
-        );
-        let mut out = Vec::new();
-        for ev in events {
-            if ev.contains("response.completed") {
-                self.terminal_registered = self.supervisor.register_terminal();
-            }
-            out.extend_from_slice(ev.as_bytes());
-        }
-        Ok(out)
-    }
-
-    /// Feed an upstream chunk.  Returns downstream bytes to emit.
-    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, PumpError> {
-        let mut out = self.start()?;
-        match self.mode {
-            SseMode::Native => {
-                out.extend_from_slice(&self.encode_native_chunk(bytes));
-            }
-            SseMode::ChatToMessages | SseMode::MessagesToChat => {
-                out.extend_from_slice(&self.encode_conversion_chunk(bytes)?);
-            }
-            SseMode::ResponsesViaChat => {
-                out.extend_from_slice(
-                    &self.encode_responses_chunk(&String::from_utf8_lossy(bytes))?,
-                );
-            }
-        }
-        Ok(out)
-    }
-
-    /// End-of-stream: flush any decoder final events and complete the stream.
     pub fn finish(&mut self) -> Result<Vec<u8>, PumpError> {
         if self.finished {
             return Ok(Vec::new());
         }
         self.finished = true;
-        let mut out = self.start()?;
-        match self.mode {
-            SseMode::Native => {
-                if !self.terminal_registered {
-                    // A clean EOF without an explicit terminal marker still
-                    // terminates the stream exactly once.
-                    self.terminal_registered = self.supervisor.register_terminal();
-                }
-            }
-            SseMode::ChatToMessages | SseMode::MessagesToChat => {
-                let decoder = self.decoder.as_mut().ok_or_else(|| {
-                    PumpError::Protocol("conversion stream is missing its decoder".to_string())
-                })?;
-                let events = decoder.finish().map_err(|e| {
-                    PumpError::Protocol(format!(
-                        "upstream stream ended with an incomplete conversion ({}): {}",
-                        self.mode.as_str(),
-                        e.message
-                    ))
-                })?;
-                for ev in events {
-                    if ev.contains("message_stop") || ev.contains("[DONE]") {
-                        self.terminal_registered = self.supervisor.register_terminal();
-                    }
-                    // Codec event strings already end in "\n\n"; no extra newline.
-                    out.extend_from_slice(ev.as_bytes());
-                }
-            }
-            SseMode::ResponsesViaChat => {
-                let synth = crate::protocol::responses::create_synthetic_completed_events(
-                    &self.model,
-                    &self.responses_id,
-                    &self.accumulated_content,
-                    self.responses_state.as_ref().unwrap(),
-                    self.usage.map(|u| u.0).unwrap_or(0),
-                    self.usage.map(|u| u.1).unwrap_or(0),
-                );
-                for ev in synth {
-                    if ev.contains("response.completed") {
-                        self.terminal_registered = self.supervisor.register_terminal();
-                    }
-                    out.extend_from_slice(ev.as_bytes());
-                }
-                out.extend_from_slice(b"data: [DONE]\n\n");
-                if !self.terminal_registered {
-                    self.terminal_registered = self.supervisor.register_terminal();
-                }
-            }
+        let mut output = self.start()?;
+        let events = self.decoder.finish().map_err(|error| {
+            PumpError::Protocol(format!(
+                "upstream stream ended with an incomplete decode: {error}"
+            ))
+        })?;
+        for event in &events {
+            output.extend_from_slice(event.as_bytes());
+            self.accumulate_from_sse(event);
         }
-        self.supervisor.complete()?;
-        Ok(out)
+        // Decoder correctness includes protocol terminal validation. The pump
+        // owns only the supervisor's exactly-once terminal transition.
+        self.register_terminal_once();
+        Ok(output)
     }
 
-    /// Whether the stream terminated (Completed/Aborted).
-    #[allow(dead_code)] // part of the pump's public API (used by the driver's
-                        // future client-cancellation path)
-    pub fn terminated(&self) -> bool {
-        matches!(
-            self.supervisor.state(),
-            crate::core::stream_supervisor::StreamState::Completed
-                | crate::core::stream_supervisor::StreamState::Aborted
-        )
-    }
-
-    #[allow(dead_code)]
     pub fn committed(&self) -> bool {
         self.supervisor.committed()
     }
 
-    #[allow(dead_code)]
-    pub fn client_cancelled(&self) -> bool {
-        self.supervisor.client_cancelled()
+    pub fn terminated(&self) -> bool {
+        self.supervisor.terminal_emitted()
     }
 
-    /// Token usage observed so far (best effort).
-    pub fn usage(&self) -> (i64, i64, i64) {
-        if let Some(u) = self.usage {
-            return u;
+    pub fn usage(&self) -> (i64, i64, i64, i64) {
+        self.decoder.usage().map_or((0, 0, 0, 0), |usage| {
+            let prompt = usage.input_tokens as i64;
+            let completion = usage.output_tokens as i64;
+            let cached = usage.cache_read_input_tokens as i64;
+            (prompt, completion, prompt + completion, cached)
+        })
+    }
+
+    pub fn accumulated_content(&self) -> &str {
+        &self.accumulated_content
+    }
+
+    /// Accumulate content/reasoning/tool_calls from a downstream SSE event string.
+    /// 正文/推理触上限后停止拼接（FIX-11）；终止事件检测在 push 外层独立
+    /// 进行、不受累积上限影响，tool_calls 仍累积以保证落账结构完整。
+    fn accumulate_from_sse(&mut self, event: &str) {
+        if !self.accumulation_truncated
+            && self.accumulated_content.len() >= MAX_ACCUMULATED_CONTENT_BYTES
+        {
+            self.accumulated_content
+                .push_str(ACCUMULATION_TRUNCATION_MARKER);
+            self.accumulation_truncated = true;
         }
-        if let Some(d) = self.decoder.as_ref() {
-            if let Some(u) = d.usage() {
-                return (
-                    u.input_tokens as i64,
-                    u.output_tokens as i64,
-                    (u.input_tokens + u.output_tokens) as i64,
-                );
-            }
+        if self.accumulation_truncated {
+            return;
         }
-        (0, 0, 0)
+        accumulate_from_sse_event(
+            event,
+            &mut self.accumulated_content,
+            &mut self.accumulated_reasoning,
+            &mut self.response_role,
+            &mut self.finish_reason,
+            &mut self.tool_calls_map,
+        );
+    }
+
+    /// Build a `response_choices` JSON string suitable for the audit log,
+    /// consuming accumulated stream content.  Returns `None` when nothing
+    /// was accumulated (empty stream or error).
+    pub fn build_response_choices(&self) -> Option<String> {
+        let has_content = !self.accumulated_content.is_empty()
+            || !self.accumulated_reasoning.is_empty()
+            || !self.tool_calls_map.is_empty();
+        if !has_content {
+            return None;
+        }
+        let mut message = serde_json::json!({
+            "role": self.response_role.as_deref().unwrap_or("assistant"),
+        });
+        if !self.accumulated_content.is_empty() {
+            message["content"] = serde_json::json!(&self.accumulated_content);
+        }
+        if !self.accumulated_reasoning.is_empty() {
+            message["reasoning_content"] = serde_json::json!(&self.accumulated_reasoning);
+        }
+        if !self.tool_calls_map.is_empty() {
+            let tcs: Vec<serde_json::Value> = self.tool_calls_map.values().cloned().collect();
+            message["tool_calls"] = serde_json::json!(tcs);
+        }
+        let choices = vec![serde_json::json!({
+            "index": 0,
+            "message": message,
+            "finish_reason": self.finish_reason.as_deref().unwrap_or("stop"),
+        })];
+        Some(serde_json::to_string(&choices).unwrap_or_default())
     }
 
     #[allow(dead_code)]
@@ -471,263 +324,476 @@ impl StreamPumpCore {
     }
 }
 
-/// Build the decoder for a conversion mode (correct direction, NOT the registry
-/// wiring whose response orientation is the encoder's).
-///
-/// * `ChatToMessages`  = Chat SSE → Messages SSE (downstream Messages, upstream
-///   Chat) uses `chat::ChatStreamDecoder` — the Chat SSE stream is converted to
-///   Messages SSE events.
-/// * `MessagesToChat`  = Messages SSE → Chat SSE (downstream Chat, upstream
-///   Messages) uses `messages::MessagesStreamDecoder`.
-pub fn decoder_for(mode: SseMode, model: &str, message_id: &str) -> Option<Box<dyn StreamDecoder>> {
-    use crate::protocol::codec::report::ConversionContext;
-    match mode {
-        SseMode::ChatToMessages => {
-            let context = ConversionContext::new(message_id, model, true);
-            Some(crate::protocol::codec::chat::ChatStreamDecoder::boxed(
-                &context,
-            ))
+/// Parse a single SSE event string and accumulate content/reasoning/tool_calls.
+/// Supports OpenAI Chat Completions, Anthropic Messages, and OpenAI Responses streaming formats.
+fn accumulate_from_sse_event(
+    event: &str,
+    content: &mut String,
+    reasoning: &mut String,
+    role: &mut Option<String>,
+    finish_reason: &mut Option<String>,
+    tool_calls_map: &mut std::collections::BTreeMap<i64, serde_json::Value>,
+) {
+    // Each event may contain multiple `data:` lines.
+    for line in event.lines() {
+        let line = line.trim();
+        if !line.starts_with("data:") {
+            continue;
         }
-        SseMode::MessagesToChat => {
-            let context = ConversionContext::new(message_id, model, true);
-            Some(crate::protocol::codec::messages::MessagesStreamDecoder::boxed(&context))
+        let payload = line[5..].trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
         }
-        _ => None,
+        let v: serde_json::Value = match serde_json::from_str(payload) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // ── OpenAI Chat Completions streaming ──
+        if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
+            for choice in choices {
+                // role (usually on the first delta)
+                if let Some(r) = choice.pointer("/delta/role").and_then(|r| r.as_str()) {
+                    if role.is_none() {
+                        *role = Some(r.to_string());
+                    }
+                }
+                // content
+                if let Some(c) = choice.pointer("/delta/content").and_then(|c| c.as_str()) {
+                    content.push_str(c);
+                }
+                // reasoning_content (DeepSeek / OpenAI o-series)
+                if let Some(rc) = choice
+                    .pointer("/delta/reasoning_content")
+                    .and_then(|rc| rc.as_str())
+                {
+                    reasoning.push_str(rc);
+                }
+                // tool_calls
+                if let Some(tcs) = choice
+                    .pointer("/delta/tool_calls")
+                    .and_then(|tc| tc.as_array())
+                {
+                    for tc in tcs {
+                        let idx = tc.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
+                        let entry = tool_calls_map
+                            .entry(idx)
+                            .or_insert_with(|| serde_json::json!({"index": idx, "id": null, "type": "function", "function": {"name": "", "arguments": ""}}));
+                        if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                            entry["id"] = serde_json::json!(id);
+                        }
+                        if let Some(t) = tc.pointer("/function/name").and_then(|n| n.as_str()) {
+                            entry["function"]["name"] = serde_json::json!(t);
+                        }
+                        if let Some(args) =
+                            tc.pointer("/function/arguments").and_then(|a| a.as_str())
+                        {
+                            if let Some(existing) = entry
+                                .pointer("/function/arguments")
+                                .and_then(|a| a.as_str())
+                            {
+                                entry["function"]["arguments"] =
+                                    serde_json::json!(format!("{existing}{args}"));
+                            } else {
+                                entry["function"]["arguments"] = serde_json::json!(args);
+                            }
+                        }
+                    }
+                }
+                // finish_reason
+                if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                    *finish_reason = Some(fr.to_string());
+                }
+            }
+            continue;
+        }
+
+        // ── Anthropic Messages / OpenAI Responses streaming ──
+        // Both protocols stamp a `type` field on each event, so they must share
+        // a single match.  (The Responses arms used to live in a second `if`
+        // below this block, but the unconditional `continue` here made that
+        // code unreachable — every Responses event fell into `_ => {}` and
+        // nothing was ever accumulated for streaming Responses requests.)
+        if let Some(et) = v.get("type").and_then(|t| t.as_str()) {
+            match et {
+                // ── Anthropic Messages ──
+                "content_block_start" => {
+                    if let Some(block) = v.get("content_block") {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            let idx = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                            // Use a hash of the id as the key for tool calls
+                            let key = idx
+                                .bytes()
+                                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+                            tool_calls_map.insert(key, serde_json::json!({
+                                "index": key,
+                                "id": idx,
+                                "type": "function",
+                                "function": {"name": block.get("name").and_then(|n| n.as_str()).unwrap_or(""), "arguments": ""}
+                            }));
+                        }
+                    }
+                }
+                "content_block_delta" => {
+                    if let Some(delta) = v.get("delta") {
+                        if delta.get("type").and_then(|t| t.as_str()) == Some("text_delta") {
+                            if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
+                                content.push_str(t);
+                            }
+                        }
+                        if delta.get("type").and_then(|t| t.as_str()) == Some("thinking_delta") {
+                            if let Some(t) = delta.get("thinking").and_then(|t| t.as_str()) {
+                                reasoning.push_str(t);
+                            }
+                        }
+                        if delta.get("type").and_then(|t| t.as_str()) == Some("input_json_delta") {
+                            if let Some(pj) = delta.get("partial_json").and_then(|j| j.as_str()) {
+                                // Append to the most recent tool call's arguments
+                                if let Some((&_k, _)) = tool_calls_map.last_key_value() {
+                                    if let Some(entry) = tool_calls_map.get_mut(&_k) {
+                                        let existing = entry
+                                            .pointer("/function/arguments")
+                                            .and_then(|a| a.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        entry["function"]["arguments"] =
+                                            serde_json::json!(format!("{existing}{pj}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                "message_start" => {
+                    if let Some(r) = v.pointer("/message/role").and_then(|r| r.as_str()) {
+                        if role.is_none() {
+                            *role = Some(r.to_string());
+                        }
+                    }
+                }
+                "message_delta" => {
+                    if let Some(fr) = v.pointer("/delta/stop_reason").and_then(|s| s.as_str()) {
+                        *finish_reason = Some(fr.to_string());
+                    }
+                }
+                // ── OpenAI Responses API ──
+                // Events like response.output_text.delta / response.completed
+                "response.output_text.delta" | "response.text.delta" => {
+                    if let Some(t) = v.get("delta").and_then(|d| d.as_str()) {
+                        content.push_str(t);
+                    }
+                }
+                "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                    if let Some(t) = v.get("delta").and_then(|d| d.as_str()) {
+                        reasoning.push_str(t);
+                    }
+                }
+                "response.function_call_arguments.delta" => {
+                    // {item_id, output_index, delta} — key by item_id hash.
+                    let item_id = v.get("item_id").and_then(|i| i.as_str()).unwrap_or("");
+                    let key = item_id
+                        .bytes()
+                        .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+                    if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
+                        let entry = tool_calls_map.entry(key).or_insert_with(|| {
+                            serde_json::json!({"index": key, "id": item_id, "type": "function", "function": {"name": "", "arguments": ""}})
+                        });
+                        let existing = entry
+                            .pointer("/function/arguments")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        entry["function"]["arguments"] =
+                            serde_json::json!(format!("{existing}{d}"));
+                    }
+                }
+                "response.output_item.done" => {
+                    // A completed function_call item carries the full
+                    // name/arguments — authoritative over the deltas.
+                    if let Some(item) = v.get("item") {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                            let item_id = item
+                                .get("call_id")
+                                .or_else(|| item.get("id"))
+                                .and_then(|i| i.as_str())
+                                .unwrap_or("");
+                            let key = item_id
+                                .bytes()
+                                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+                            // Delta accumulation keyed by `item_id` (the "fc_…"
+                            // id), while this event keys by call_id — merge onto
+                            // the delta entry when both ids are present.
+                            let delta_key = item
+                                .get("id")
+                                .and_then(|i| i.as_str())
+                                .unwrap_or("")
+                                .bytes()
+                                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+                            tool_calls_map.remove(&delta_key);
+                            tool_calls_map.insert(key, serde_json::json!({
+                                "index": key,
+                                "id": item_id,
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                                    "arguments": item.get("arguments").and_then(|a| a.as_str()).unwrap_or(""),
+                                }
+                            }));
+                        }
+                    }
+                }
+                "response.completed" | "response.done" => {
+                    // Try to extract from the final response object
+                    if let Some(resp) = v.get("response") {
+                        if let Some(output) = resp.get("output").and_then(|o| o.as_array()) {
+                            for item in output {
+                                if let Some(c) = item.get("content").and_then(|c| c.as_array()) {
+                                    for part in c {
+                                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                            if content.is_empty() {
+                                                content.push_str(t);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::codec::{DecodeError, Usage};
 
-    fn native_supervisor() -> StreamSupervisor {
-        let mut s = StreamSupervisor::new();
-        s.begin_connect().unwrap();
-        s.on_upstream_headers().unwrap();
-        s.on_first_frame_validated().unwrap();
-        s
+    struct Decoder {
+        usage: Option<Usage>,
+    }
+
+    impl StreamDecoder for Decoder {
+        fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
+            let text = String::from_utf8_lossy(bytes);
+            if text.contains("bad") {
+                return Err(DecodeError::new("/", "bad upstream event"));
+            }
+            if text.contains("usage") {
+                self.usage = Some(Usage {
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    usage_unknown: false,
+                });
+            }
+            Ok(vec![format!("out:{text}")])
+        }
+
+        fn finish(&mut self) -> Result<Vec<String>, DecodeError> {
+            Ok(vec!["done".into()])
+        }
+
+        fn usage(&self) -> Option<Usage> {
+            self.usage
+        }
+    }
+
+    fn supervisor() -> StreamSupervisor {
+        let mut supervisor = StreamSupervisor::new();
+        supervisor.begin_connect().unwrap();
+        supervisor.on_upstream_headers().unwrap();
+        supervisor.on_first_frame_validated().unwrap();
+        supervisor
     }
 
     #[test]
-    fn native_passthrough_commits_and_terminates_exactly_once() {
-        let mut core = StreamPumpCore::new(
-            native_supervisor(),
-            SseMode::Native,
-            None,
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_vec(),
-            Vec::new(),
-            "m".to_string(),
+    fn first_record_and_carry_are_decoded_before_commit() {
+        let mut pump = StreamPumpCore::new(
+            supervisor(),
+            Box::new(Decoder { usage: None }),
+            b"first".to_vec(),
+            b"carry".to_vec(),
         )
         .unwrap();
-        let first = core.start().unwrap();
-        assert!(core.committed());
-        assert!(String::from_utf8_lossy(&first).contains("data: {"));
-        let out = core
-            .push(b"data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n")
-            .unwrap();
         assert_eq!(
-            String::from_utf8_lossy(&out),
-            "data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n"
+            String::from_utf8(pump.start().unwrap()).unwrap(),
+            "out:firstout:carry"
         );
-        let done = core.push(b"data: [DONE]\n\n").unwrap();
-        assert_eq!(String::from_utf8_lossy(&done), "data: [DONE]\n\n");
-        assert!(core.terminal_registered);
-        let fin = core.finish().unwrap();
-        assert!(core.terminated());
-        assert!(fin.is_empty());
+        assert!(pump.committed());
     }
 
     #[test]
-    fn native_first_record_validation() {
-        assert!(validate_native_first_record(b"data: {\"a\":1}\n\n").is_ok());
-        assert!(validate_native_first_record(b"data: [DONE]\n\n").is_ok());
-        assert!(validate_native_first_record(b"event: message_start\ndata: {}\n\n").is_ok());
-        assert!(validate_native_first_record(b"data: not-json\n\n").is_err());
-    }
-
-    #[test]
-    fn usage_scan_finds_openai_usage() {
-        let chunk = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10}}\n\n";
-        assert_eq!(scan_usage_from_chunk(chunk), Some((4, 6, 10)));
-    }
-
-    #[test]
-    fn messages_to_chat_pump_converts_stream() {
-        // downstream Chat, upstream Messages: Messages SSE -> Chat SSE.
-        let mut core = StreamPumpCore::new(
-            native_supervisor(),
-            SseMode::MessagesToChat,
-            decoder_for(SseMode::MessagesToChat, "up-model", ""),
+    fn decoder_usage_reaches_the_pump() {
+        let mut pump = StreamPumpCore::new(
+            supervisor(),
+            Box::new(Decoder { usage: None }),
             Vec::new(),
             Vec::new(),
-            "up-model".to_string(),
         )
         .unwrap();
-        let first = core.start().unwrap();
-        assert!(first.is_empty(), "no first frame until a chunk is fed");
+        pump.push(b"usage").unwrap();
+        assert_eq!(pump.usage(), (2, 3, 5, 0));
+        assert_eq!(pump.finish().unwrap(), b"done");
+        assert!(pump.terminated());
+    }
 
-        let msg_start = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"up-model\",\"content\":[]}}\n\n";
-        let out = core.push(msg_start).unwrap();
-        assert!(
-            !out.is_empty(),
-            "message_start must produce the Chat role frame"
-        );
-        assert!(String::from_utf8_lossy(&out).contains("data: {"));
+    /// #57：终止标记识别——三种下游协议的成功终止事件都算，错误事件不算。
+    #[test]
+    fn terminal_event_detection_covers_three_protocols() {
+        // Chat
+        assert!(sse_event_is_terminal("data: [DONE]\n\n"));
+        // Anthropic（含 event: 行与 data JSON 两种形态）
+        assert!(sse_event_is_terminal(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        ));
+        // Responses
+        assert!(sse_event_is_terminal(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\n"
+        ));
+        assert!(sse_event_is_terminal(
+            "data: {\"type\":\"response.done\"}\n\n"
+        ));
+        // 非终止：普通 delta / 错误事件（错误仍走 EOF/超时路径，不视为成功完成）
+        assert!(!sse_event_is_terminal(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+        ));
+        assert!(!sse_event_is_terminal(
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n"
+        ));
+        // JSON 带空格的宽松形态
+        assert!(sse_event_is_terminal(
+            "data: {\"type\": \"message_stop\"}\n\n"
+        ));
+    }
 
-        let delta = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n";
-        let out = core.push(delta).unwrap();
-        assert!(String::from_utf8_lossy(&out).contains("\"content\":\"hello\""));
+    /// #57：push 阶段检测到终止即登记 terminated()——不需要等 finish()。
+    /// 用透传解码器（把输入原样作为事件输出）验证真实事件流。
+    struct PassthroughDecoder;
 
-        // A real Messages stream carries message_delta with stop_reason before
-        // message_stop; without it the codec fails closed (unknown finish reason).
-        let delta = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":2,\"output_tokens\":3}}\n\n";
-        let _ = core.push(delta).unwrap();
-        let stop = b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
-        let _ = core.push(stop).unwrap();
-        let fin = core.finish().unwrap();
-        assert!(String::from_utf8_lossy(&fin).contains("[DONE]"));
-        assert!(core.terminated());
+    impl StreamDecoder for PassthroughDecoder {
+        fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
+            Ok(vec![String::from_utf8_lossy(bytes).to_string()])
+        }
+        fn finish(&mut self) -> Result<Vec<String>, DecodeError> {
+            Ok(vec![])
+        }
+        fn usage(&self) -> Option<Usage> {
+            None
+        }
     }
 
     #[test]
-    fn chat_to_messages_pump_converts_stream() {
-        // downstream Messages, upstream Chat: Chat SSE -> Messages SSE.
-        let mut core = StreamPumpCore::new(
-            native_supervisor(),
-            SseMode::ChatToMessages,
-            decoder_for(SseMode::ChatToMessages, "up-model", ""),
+    fn push_registers_terminal_without_finish() {
+        let mut pump = StreamPumpCore::new(
+            supervisor(),
+            Box::new(PassthroughDecoder),
+            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n".to_vec(),
             Vec::new(),
-            Vec::new(),
-            "up-model".to_string(),
         )
         .unwrap();
-        let chunk =
-            b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n";
-        let out = core.push(chunk).unwrap();
-        assert!(String::from_utf8_lossy(&out).contains("message_start"));
-        // A real Chat stream ends with a finish_reason frame; without it the
-        // codec fails closed (unknown finish reason).
-        let done = b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n";
-        let _ = core.push(done).unwrap();
-        let fin = core.finish().unwrap();
-        let text = String::from_utf8_lossy(&fin);
-        assert!(text.contains("message_stop"));
-        assert!(core.terminated());
+        pump.start().unwrap();
+        assert!(!pump.terminated(), "message_start is not terminal");
+        pump.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+            .unwrap();
+        assert!(
+            pump.terminated(),
+            "message_stop during push must register terminal without finish()"
+        );
+        // finish 之后重复登记仍恰好一次（幂等）。
+        pump.finish().unwrap();
+        assert!(pump.terminated());
     }
 
     #[test]
-    fn empty_upstream_native_completes_without_error() {
-        let mut core = StreamPumpCore::new(
-            native_supervisor(),
-            SseMode::Native,
-            None,
+    fn first_decoder_failure_stays_precommit() {
+        let result = StreamPumpCore::new(
+            supervisor(),
+            Box::new(Decoder { usage: None }),
+            b"bad".to_vec(),
             Vec::new(),
-            Vec::new(),
-            "m".to_string(),
-        )
-        .unwrap();
-        let fin = core.finish().unwrap();
-        assert!(core.terminated());
-        assert!(fin.is_empty());
+        );
+        let error = match result {
+            Ok(_) => panic!("bad first event must fail before commit"),
+            Err(error) => error,
+        };
+        assert!(error.message().contains("bad upstream event"));
     }
 
-    /// C-1 regression: a NON-EMPTY raw upstream first record fed to a
-    /// conversion-mode pump must be encoded through the decoder BEFORE commit —
-    /// `start()` must emit only converted downstream bytes, never the raw
-    /// upstream protocol bytes, and the decoder must not start at record 2.
-    #[test]
-    fn conversion_first_frame_is_encoded_not_raw() {
-        // upstream Messages record (Anthropic) → downstream Chat client.
-        let raw_first = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"up-model\",\"content\":[]}}\n\n";
-        let mut core = StreamPumpCore::new(
-            native_supervisor(),
-            SseMode::MessagesToChat,
-            decoder_for(SseMode::MessagesToChat, "up-model", ""),
-            raw_first.to_vec(),
-            Vec::new(),
-            "up-model".to_string(),
-        )
-        .unwrap();
-        let first = core.start().unwrap();
-        assert!(
-            !first.is_empty(),
-            "start() must emit the converted first event"
+    fn accumulate(
+        event: &str,
+    ) -> (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        std::collections::BTreeMap<i64, serde_json::Value>,
+    ) {
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut role = None;
+        let mut finish_reason = None;
+        let mut tool_calls = std::collections::BTreeMap::new();
+        accumulate_from_sse_event(
+            event,
+            &mut content,
+            &mut reasoning,
+            &mut role,
+            &mut finish_reason,
+            &mut tool_calls,
         );
-        let text = String::from_utf8_lossy(&first);
-        assert!(
-            !text.contains("event: message_start"),
-            "downstream must never see raw upstream Anthropic bytes: {text}"
-        );
-        assert!(
-            text.contains("data: {"),
-            "downstream must see Chat SSE role frame"
-        );
-        assert!(core.committed());
-
-        // The decoder state must already be past the first record: a second
-        // Anthropic delta converts normally (not as a first frame).
-        let delta = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n";
-        let out = core.push(delta).unwrap();
-        assert!(String::from_utf8_lossy(&out).contains("\"content\":\"hello\""));
+        (content, reasoning, role, finish_reason, tool_calls)
     }
 
-    /// C-1 carry regression: when the first upstream chunk contains MULTIPLE
-    /// records, `new()` must encode the carry (records 2..N) through the decoder
-    /// too, so `start()` emits converted output for ALL records — never raw
-    /// upstream protocol bytes for the carry.
+    /// Regression: Responses API events carry a `type` field and used to be
+    /// swallowed by the Anthropic branch's unconditional `continue`, leaving
+    /// `response_choices` empty for every streaming Responses request.
     #[test]
-    fn conversion_carry_is_encoded_not_raw() {
-        // Two Anthropic records in one chunk (downstream Chat client): the
-        // message_start first record AND a content_block_delta carry record.
-        let first = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"up-model\",\"content\":[]}}\n\n";
-        let carry = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"carried\"}}\n\n";
-        let mut core = StreamPumpCore::new(
-            native_supervisor(),
-            SseMode::MessagesToChat,
-            decoder_for(SseMode::MessagesToChat, "up-model", ""),
-            first.to_vec(),
-            carry.to_vec(),
-            "up-model".to_string(),
-        )
-        .unwrap();
-        let out = core.start().unwrap();
-        let text = String::from_utf8_lossy(&out);
-        assert!(
-            !text.contains("event: message_start") && !text.contains("event: content_block_delta"),
-            "downstream must never see raw upstream Anthropic bytes (carry included): {text}"
-        );
-        assert!(
-            text.contains("\"content\":\"carried\""),
-            "carry record (record 2) must be decoded into downstream output: {text}"
-        );
-        assert!(core.committed());
+    fn responses_api_output_text_deltas_are_accumulated() {
+        let (mut content, ..) =
+            accumulate("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}");
+        let (c2, reasoning, _, _, _) =
+            accumulate("data: {\"type\":\"response.output_text.delta\",\"delta\":\" world\"}");
+        content.push_str(&c2);
+        assert_eq!(content, "Hello world");
+        assert!(reasoning.is_empty());
     }
 
-    /// C-1: a conversion-mode first record carrying reasoning is now fail-open:
-    /// the ChatToMessages decoder maps it to a Messages `thinking` block and
-    /// `new()` succeeds (no pre-commit rejection).
     #[test]
-    fn conversion_first_frame_thinking_fail_open_before_commit() {
-        let raw_first =
-            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"secret chain\"}}]}\n\n";
-        let mut core = StreamPumpCore::new(
-            native_supervisor(),
-            SseMode::ChatToMessages,
-            decoder_for(SseMode::ChatToMessages, "up-model", ""),
-            raw_first.to_vec(),
-            Vec::new(),
-            "up-model".to_string(),
-        )
-        .expect("thinking first frame must be accepted fail-open");
-        let first = core.start().unwrap();
-        let text = String::from_utf8_lossy(&first);
-        assert!(text.contains("message_start"), "first frame emits message_start: {text}");
-        // serde_json sorts object keys (no preserve_order), so assert on
-        // order-independent fragments rather than `"type":"thinking"` adjacency.
-        assert!(
-            text.contains("\"type\":\"thinking\"") &&
-                text.contains("\"thinking\":\"secret chain\""),
-            "reasoning must surface as a Messages thinking block: {text}"
+    fn responses_api_reasoning_deltas_are_accumulated() {
+        let (_, reasoning, ..) = accumulate(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}",
         );
+        assert_eq!(reasoning, "thinking");
+    }
+
+    #[test]
+    fn responses_api_completed_extracts_text_fallback() {
+        let (content, ..) = accumulate(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"content\":[{\"type\":\"output_text\",\"text\":\"final answer\"}]}]}}",
+        );
+        assert_eq!(content, "final answer");
+    }
+
+    #[test]
+    fn responses_api_function_call_output_item_is_accumulated() {
+        let (.., tool_calls) = accumulate(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}",
+        );
+        assert_eq!(tool_calls.len(), 1);
+        let tc = tool_calls.values().next().unwrap();
+        assert_eq!(
+            tc.pointer("/function/name").and_then(|n| n.as_str()),
+            Some("get_weather")
+        );
+        assert!(tc
+            .pointer("/function/arguments")
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .contains("Paris"));
     }
 }

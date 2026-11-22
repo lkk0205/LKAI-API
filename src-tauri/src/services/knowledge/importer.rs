@@ -1,47 +1,59 @@
+use super::import_guard;
 use super::models::ImportSourceInput;
 use super::parser;
 use super::processor;
 use super::repository::KbRepository;
+use crate::server::event_bridge::EventSink;
+use crate::settings_store::SettingsStore;
 use sha2::Digest;
 use sqlx::SqlitePool;
-use std::path::PathBuf;
-use tauri::{AppHandle, Emitter};
+use std::path::{Path, PathBuf};
+
+/// url 导入的响应体大小上限（SSRF 探测常用的超大响应/压缩炸弹防御）
+const MAX_IMPORT_URL_BYTES: usize = 10 * 1024 * 1024;
+/// url 导入允许的重定向跳数上限（同主机内跟随，跨主机一律拒绝）
+const MAX_IMPORT_REDIRECTS: usize = 5;
 
 /// Import a Git repository: clone → filter → process files
 pub async fn import_git_repo(
     pool: &SqlitePool,
-    app: &AppHandle,
+    events: &EventSink,
     kb_id: &str,
     source_id: &str,
     input: &ImportSourceInput,
+    settings: &SettingsStore,
+    data_dir: &Path,
 ) -> Result<usize, String> {
     let repo_url = input
         .repo_url
         .as_ref()
         .ok_or("repo_url is required for git import")?;
 
+    // FIX-07 导入加固：scheme 白名单（仅 https，拒绝 ext::/ssh/file 等）+ URL 解析重建
+    // （丢弃 userinfo/query/fragment）；凭证经 git -c http.extraHeader 注入，绝不拼进 URL
+    // （git 失败时会回显完整 URL，token 进 URL 即随 stderr 泄漏）。
+    let clone_url = import_guard::normalize_git_url(repo_url)?;
     let branch = input.branch.as_deref().unwrap_or("main");
-    let token = input.token.as_deref();
+    import_guard::validate_branch(branch)?;
+    let token = input
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
 
     // Clone repo to temp dir
     let temp_dir = std::env::temp_dir().join(format!("kb_import_{}", uuid::Uuid::new_v4()));
-    let clone_url = if let Some(t) = token {
-        // Insert token into URL for auth
-        if repo_url.starts_with("https://") {
-            repo_url.replacen("https://", &format!("https://{}@", t), 1)
-        } else if repo_url.starts_with("http://") {
-            repo_url.replacen("http://", &format!("http://{}@", t), 1)
-        } else {
-            repo_url.clone()
-        }
-    } else {
-        repo_url.clone()
-    };
+    emit_import_progress(events, kb_id, source_id, 0, "Cloning repository...");
 
-    emit_import_progress(app, kb_id, source_id, 0, "Cloning repository...");
-
-    let clone_result = tokio::process::Command::new("git")
-        .args(&[
+    let mut command = tokio::process::Command::new("git");
+    if let Some(token) = token {
+        command.arg("-c").arg(format!(
+            "http.extraHeader={}",
+            import_guard::git_auth_header(token)
+        ));
+    }
+    let clone_result = command
+        .args([
             "clone",
             "--depth",
             "1",
@@ -55,13 +67,12 @@ pub async fn import_git_repo(
         .map_err(|e| format!("Failed to run git clone: {}", e))?;
 
     if !clone_result.status.success() {
-        let err = String::from_utf8_lossy(&clone_result.stderr);
+        // 回传前剥离任何含凭证的行（明文 token / extraHeader 形态）再截断
+        let err =
+            import_guard::sanitize_git_error(&String::from_utf8_lossy(&clone_result.stderr), token);
         // Clean up
         std::fs::remove_dir_all(&temp_dir).ok();
-        return Err(format!(
-            "Git clone failed: {}",
-            err.chars().take(500).collect::<String>()
-        ));
+        return Err(format!("Git clone failed: {err}"));
     }
 
     // Process files from cloned repo
@@ -71,7 +82,7 @@ pub async fn import_git_repo(
 
     let result = process_directory_files(
         pool,
-        app,
+        events,
         kb_id,
         source_id,
         &temp_dir,
@@ -79,10 +90,12 @@ pub async fn import_git_repo(
         &included_files,
         max_file_size,
         "git",
-        Some(repo_url),
+        Some(&clone_url),
         None,
+        settings,
+        data_dir,
     )
-        .await;
+    .await;
 
     // Clean up temp dir
     std::fs::remove_dir_all(&temp_dir).ok();
@@ -91,27 +104,59 @@ pub async fn import_git_repo(
 }
 
 /// Import from a URL: fetch content → process
+///
+/// FIX-07 SSRF 防护：仅 http/https；DNS 解析后拒绝环回/私网/链路本地等内网目标
+/// （校验全部解析记录）；禁用自动重定向、仅跟随同主机跳转且每跳重新校验；
+/// 响应体流式读取并限制在 10MB 以内。
 pub async fn import_url(
     pool: &SqlitePool,
-    app: &AppHandle,
+    events: &EventSink,
     kb_id: &str,
     source_id: &str,
     input: &ImportSourceInput,
+    settings: &SettingsStore,
+    data_dir: &Path,
 ) -> Result<usize, String> {
-    let url = input.url.as_ref().ok_or("url is required for url import")?;
+    let url_input = input.url.as_ref().ok_or("url is required for url import")?;
 
-    emit_import_progress(app, kb_id, source_id, 0, "Fetching URL...");
+    emit_import_progress(events, kb_id, source_id, 0, "Fetching URL...");
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(url)
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+    let mut current = import_guard::validate_import_url(url_input).await?;
+
+    // 禁用 reqwest 自动重定向（默认策略会跟到任意主机，可绕过首跳校验），
+    // 手动跟随同主机跳转，每跳重新过 scheme + DNS 校验。
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
+    let mut redirects = 0usize;
+    let resp = loop {
+        let resp = client
+            .get(current.clone())
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch URL: {e}"))?;
+        if resp.status().is_redirection() {
+            redirects += 1;
+            if redirects > MAX_IMPORT_REDIRECTS {
+                return Err(format!("重定向次数超过上限（{MAX_IMPORT_REDIRECTS}）"));
+            }
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or("重定向响应缺少 Location 头")?;
+            let next = import_guard::redirect_allowed(&current, location)?;
+            current = import_guard::validate_import_url(next.as_str()).await?;
+            continue;
+        }
+        break resp;
+    };
 
     if !resp.status().is_success() {
-        return Err(format!("HTTP {}: {}", resp.status(), url));
+        return Err(format!("HTTP {}: {}", resp.status(), current));
     }
 
     let content_type = resp
@@ -121,14 +166,28 @@ pub async fn import_url(
         .unwrap_or("text/plain")
         .to_string();
 
-    let content = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read body: {}", e))?;
+    // 流式读取响应体并施加大小上限（防超大响应/压缩炸弹撑爆内存）
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut content: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Failed to read body: {e}"))?;
+        if content.len() + chunk.len() > MAX_IMPORT_URL_BYTES {
+            return Err(format!(
+                "响应超过大小上限（{} MB），已中止导入",
+                MAX_IMPORT_URL_BYTES / 1024 / 1024
+            ));
+        }
+        content.extend_from_slice(&chunk);
+    }
 
-    // Determine filename from URL
-    let filename = url.rsplit('/').next().unwrap_or("imported").to_string();
-    let filename = if filename.contains('.') {
+    // Determine filename from URL（用解析后的 path，天然无 query/fragment）
+    let filename = current
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .unwrap_or("imported")
+        .to_string();
+    let filename = if filename.contains('.') && !filename.starts_with('.') {
         filename
     } else if content_type.contains("html") {
         format!("{}.html", filename)
@@ -147,7 +206,7 @@ pub async fn import_url(
 
     // Check duplicate
     if let Ok(Some(_)) = repo.find_document_by_hash(kb_id, &hash_hex).await {
-        emit_import_progress(app, kb_id, source_id, 100, "URL content already exists");
+        emit_import_progress(events, kb_id, source_id, 100, "URL content already exists");
         return Ok(0);
     }
 
@@ -160,7 +219,7 @@ pub async fn import_url(
             content.len() as i64,
             &hash_hex,
             "url",
-            Some(url),
+            Some(current.as_str()),
             None,
         )
         .await
@@ -170,40 +229,46 @@ pub async fn import_url(
     let kb = repo.get_kb(kb_id).await.map_err(|e| e.to_string())?;
     let emb_model = kb.embedding_model.clone();
 
-    emit_import_progress(app, kb_id, source_id, 30, "Processing document...");
+    emit_import_progress(events, kb_id, source_id, 30, "Processing document...");
 
     processor::process_document(
         pool,
-        app,
+        events,
         kb_id,
         &doc.id,
         &filename,
         &content,
         emb_model.as_deref(),
+        settings,
+        data_dir,
     )
-        .await?;
+    .await?;
 
-    emit_import_progress(app, kb_id, source_id, 100, "URL import complete");
+    emit_import_progress(events, kb_id, source_id, 100, "URL import complete");
     Ok(1)
 }
 
 /// Import from a local directory: scan → filter → process files
+///
+/// FIX-07 边界约束：默认仅允许数据目录内的路径；数据目录外的目录必须在设置项
+/// `kb.import.allowed_roots`（字符串数组）中显式加入白名单。canonicalize 解析
+/// 符号链接后做前缀校验——指向允许范围外的符号链接其规范形态必然落在根外而被拒绝。
 pub async fn import_local_dir(
     pool: &SqlitePool,
-    app: &AppHandle,
+    events: &EventSink,
     kb_id: &str,
     source_id: &str,
     input: &ImportSourceInput,
+    settings: &SettingsStore,
+    data_dir: &Path,
 ) -> Result<usize, String> {
     let dir_path = input
         .dir_path
         .as_ref()
         .ok_or("dir_path is required for local_dir import")?;
 
-    let path = PathBuf::from(dir_path);
-    if !path.is_dir() {
-        return Err(format!("Directory not found: {}", dir_path));
-    }
+    let allowed_roots = import_guard::allowed_roots_from_settings(settings);
+    let path = import_guard::validate_local_dir(Path::new(dir_path), data_dir, &allowed_roots)?;
 
     let excluded_dirs = input.excluded_dirs.clone().unwrap_or_default();
     let included_files = input.included_files.clone().unwrap_or_default();
@@ -211,7 +276,7 @@ pub async fn import_local_dir(
 
     process_directory_files(
         pool,
-        app,
+        events,
         kb_id,
         source_id,
         &path,
@@ -221,14 +286,17 @@ pub async fn import_local_dir(
         "local_dir",
         None,
         Some(dir_path),
+        settings,
+        data_dir,
     )
-        .await
+    .await
 }
 
 /// Common: process all files in a directory with filtering
+#[allow(clippy::too_many_arguments)]
 async fn process_directory_files(
     pool: &SqlitePool,
-    app: &AppHandle,
+    events: &EventSink,
     kb_id: &str,
     source_id: &str,
     dir: &PathBuf,
@@ -238,14 +306,16 @@ async fn process_directory_files(
     source_type: &str,
     source_url: Option<&str>,
     _source_path: Option<&str>,
+    settings: &SettingsStore,
+    data_dir: &Path,
 ) -> Result<usize, String> {
-    emit_import_progress(app, kb_id, source_id, 5, "Scanning directory...");
+    emit_import_progress(events, kb_id, source_id, 5, "Scanning directory...");
 
     let files = scan_directory(dir, excluded_dirs, included_files, max_file_size)?;
 
     if files.is_empty() {
         emit_import_progress(
-            app,
+            events,
             kb_id,
             source_id,
             100,
@@ -270,7 +340,7 @@ async fn process_directory_files(
 
         let pct = 10 + ((i as f64 / total as f64) * 80.0) as u8;
         emit_import_progress(
-            app,
+            events,
             kb_id,
             source_id,
             pct,
@@ -332,14 +402,16 @@ async fn process_directory_files(
         // Process document
         if let Err(e) = processor::process_document(
             pool,
-            app,
+            events,
             kb_id,
             &doc.id,
             &filename,
             &content,
             emb_model.as_deref(),
+            settings,
+            data_dir,
         )
-            .await
+        .await
         {
             tracing::warn!("Failed to process document {}: {}", filename, e);
             skipped += 1;
@@ -352,7 +424,7 @@ async fn process_directory_files(
     repo.update_kb_counts(kb_id).await.ok();
 
     emit_import_progress(
-        app,
+        events,
         kb_id,
         source_id,
         100,
@@ -520,8 +592,14 @@ fn is_supported_extension(ext: &str) -> bool {
     )
 }
 
-fn emit_import_progress(app: &AppHandle, kb_id: &str, source_id: &str, progress: u8, detail: &str) {
-    let _ = app.emit(
+fn emit_import_progress(
+    events: &EventSink,
+    kb_id: &str,
+    source_id: &str,
+    progress: u8,
+    detail: &str,
+) {
+    events.emit(
         "kb-import-progress",
         serde_json::json!({
             "kb_id": kb_id,

@@ -79,10 +79,8 @@ impl Adaptor for GeminiAdaptor {
         let openai_body = &request.body;
         let gemini_body = convert_openai_to_gemini(openai_body);
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let proxy = config.proxy_url();
+        let client = crate::adaptor::blocking_client(config.timeout_secs, proxy.as_deref());
         let resp = client
             .post(&url)
             .header("Content-Type", "application/json")
@@ -98,6 +96,7 @@ impl Adaptor for GeminiAdaptor {
                 prompt_tokens: u.get("prompt_tokens")?.as_u64()?,
                 completion_tokens: u.get("completion_tokens")?.as_u64()?,
                 total_tokens: u.get("total_tokens")?.as_u64()?,
+                cached_tokens: 0,
             })
         });
 
@@ -124,10 +123,8 @@ impl Adaptor for GeminiAdaptor {
         let openai_body = &request.body;
         let gemini_body = convert_openai_to_gemini(openai_body);
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let proxy = config.proxy_url();
+        let client = crate::adaptor::streaming_client(proxy.as_deref());
         let resp = client
             .post(&url)
             .header("Content-Type", "application/json")

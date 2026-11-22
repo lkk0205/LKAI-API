@@ -1,6 +1,7 @@
 use crate::db::repository::Repository;
 use crate::AppState;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +27,9 @@ pub struct AppInfo {
 pub struct ApplyResult {
     pub success: bool,
     pub message: String,
+    /// Codex 专用：切回原账号后检测到 auth.json 仍处于 API Key 模式时的提示
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +55,12 @@ struct AppDef {
 }
 
 fn home_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("WALIAPI_TARGET_HOME") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -127,22 +137,22 @@ const APPS: &[AppDef] = &[
         name: "openclaw",
         label: "OpenClaw",
         icon: "bot",
-        description: "开源 Agent 框架，读取配置文件中的 provider 段",
-        config_format: "JSON (~/.qclaw/)",
+        description: "开源 Agent 框架，读取 openclaw.json 中的 models.providers 段",
+        config_format: "JSON (~/.openclaw/openclaw.json)",
         download_url: "https://openclaw.ai",
-        config_dir_fn: || home_dir().join(".qclaw"),
-        config_file: "config.json",
+        config_dir_fn: || home_dir().join(".openclaw"),
+        config_file: "openclaw.json",
         check_installed_fn: |dir| dir.exists(),
     },
     AppDef {
         name: "hermes",
         label: "Hermes Agent",
         icon: "code",
-        description: "Hermes Agent 框架，读取配置文件中的 custom_providers 段",
-        config_format: "TOML/JSON (Hermes config)",
+        description: "Hermes Agent 框架，读取 config.yaml 中的 model 与 custom_providers 段",
+        config_format: "YAML (~/.hermes/config.yaml)",
         download_url: "https://github.com/openai/hermes",
         config_dir_fn: || home_dir().join(".hermes"),
-        config_file: "config.json",
+        config_file: "config.yaml",
         check_installed_fn: |dir| dir.exists(),
     },
     AppDef {
@@ -192,6 +202,17 @@ fn read_json_file<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T, S
 fn write_json_file<T: Serialize>(path: &PathBuf, data: &T) -> Result<(), String> {
     let json = to_pretty_json(data).map_err(|e| format!("序列化 JSON 失败: {e}"))?;
     atomic_write(path, json.as_bytes())
+}
+
+/// 写 YAML 配置（Hermes 的 config.yaml）。首行注明本文件由 WaLiAPI 写入，
+/// 提醒注释不会保留、原文件在 `.waliapi-backup`。
+fn write_yaml_file<T: Serialize>(path: &PathBuf, data: &T) -> Result<(), String> {
+    let yaml = serde_yaml::to_string(data).map_err(|e| format!("序列化 YAML 失败: {e}"))?;
+    let text = format!(
+        "# 本文件由 WaLiAPI 写入；YAML 注释不会被保留，原文件已备份为同名 .waliapi-backup。\n{}\n",
+        yaml.trim_start_matches("---\n")
+    );
+    atomic_write(path, text.as_bytes())
 }
 
 /// 自定义 JSON pretty printer，不转义 non-ASCII 字符
@@ -290,19 +311,49 @@ fn backup_path(config_path: &PathBuf) -> PathBuf {
 }
 
 fn backup_config(config_path: &PathBuf) -> Result<(), String> {
-    if config_path.exists() {
-        let content = fs::read(config_path).map_err(|e| format!("读取配置失败: {e}"))?;
-        atomic_write(&backup_path(config_path), &content)?;
+    let backup = backup_path(config_path);
+    // 幂等：`.waliapi-backup` 永远代表首次应用前的原始字节，重复应用
+    // 或 Hermes 自己的写入流程都不能用当前网关配置覆盖它。
+    if backup.exists() {
+        if backup.is_file() {
+            return Ok(());
+        }
+        return Err(format!("备份路径不是文件: {}", backup.display()));
     }
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let content = fs::read(config_path).map_err(|e| format!("读取配置失败: {e}"))?;
+    atomic_write(&backup, &content)?;
     Ok(())
 }
 
+/// 标记文件：记录写入前配置不存在，恢复时应删除写入的配置
+fn absent_marker_path(config_path: &PathBuf) -> PathBuf {
+    let mut name = config_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    name.push_str(".waliapi-absent");
+    config_path.with_file_name(name)
+}
+
 fn restore_config(config_path: &PathBuf) -> Result<(), String> {
+    let absent_marker = absent_marker_path(config_path);
+    if absent_marker.exists() {
+        // 写入前配置本就不存在：恢复 = 删除写入的配置
+        if config_path.exists() {
+            fs::remove_file(config_path).map_err(|e| format!("删除配置失败: {e}"))?;
+        }
+        fs::remove_file(&absent_marker).map_err(|e| format!("删除缺失标记失败: {e}"))?;
+        return Ok(());
+    }
     let backup = backup_path(config_path);
     if backup.exists() {
         let content = fs::read(&backup).map_err(|e| format!("读取备份失败: {e}"))?;
         atomic_write(config_path, &content)?;
-        let _ = fs::remove_file(&backup);
+        fs::remove_file(&backup).map_err(|e| format!("删除备份失败: {e}"))?;
         Ok(())
     } else {
         Err("没有找到备份文件".to_string())
@@ -312,6 +363,12 @@ fn restore_config(config_path: &PathBuf) -> Result<(), String> {
 // ── 获取 WaLiAPI 网关信息 ──
 
 async fn get_waliapi_url(state: &Arc<AppState>) -> String {
+    if let Ok(public_url) = std::env::var("WALIAPI_PUBLIC_URL") {
+        let public_url = public_url.trim().trim_end_matches('/');
+        if !public_url.is_empty() {
+            return public_url.to_string();
+        }
+    }
     let port = *state.server_port.read().await;
     format!("http://127.0.0.1:{}", port)
 }
@@ -332,32 +389,304 @@ fn get_waliapi_key(state: &Arc<AppState>) -> Result<String, String> {
 
 // ── 各应用配置写入逻辑 ──
 
-fn write_claude_code(
+/// 先读取并验证，再创建备份并原子替换。这样格式错误或认证冲突不会留下新的
+/// 备份/缺失标记，更不会触碰用户的原文件。
+fn write_claude_code_transactional(
     config_dir: &PathBuf,
     waliapi_url: &str,
     waliapi_key: &str,
     model: &str,
 ) -> Result<(), String> {
     let settings_path = config_dir.join("settings.json");
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        read_json_file(&settings_path).unwrap_or_else(|_| serde_json::json!({}))
+    let original = if settings_path.exists() {
+        Some(fs::read(&settings_path).map_err(|e| format!("读取配置失败: {e}"))?)
     } else {
-        serde_json::json!({})
+        None
+    };
+    let mut settings: serde_json::Value = match &original {
+        Some(bytes) => serde_json::from_slice(bytes).map_err(|e| format!("解析 JSON 失败: {e}"))?,
+        None => serde_json::json!({}),
     };
 
-    if let Some(obj) = settings.as_object_mut() {
-        obj.insert(
-            "env".to_string(),
-            serde_json::json!({
-                "ANTHROPIC_BASE_URL": waliapi_url,
-                "ANTHROPIC_API_KEY": waliapi_key,
-                "ANTHROPIC_MODEL": model
-            }),
-        );
-        obj.insert("_waliapi".to_string(), serde_json::json!(true));
+    apply_waliapi_claude_code_settings(&mut settings, waliapi_url, waliapi_key, model)?;
+    let json = to_pretty_json(&settings).map_err(|e| format!("序列化 JSON 失败: {e}"))?;
+
+    // 只有所有校验均通过后才接触恢复资料；已有备份永远代表首次应用前的原始字节。
+    let backup = backup_path(&settings_path);
+    let absent = absent_marker_path(&settings_path);
+    let created_backup = original.is_some() && !backup.exists();
+    let created_absent_marker = original.is_none() && !absent.exists();
+    if created_backup {
+        atomic_write(&backup, original.as_ref().expect("checked above"))?;
+    }
+    if created_absent_marker {
+        if let Err(error) = atomic_write(&absent, b"") {
+            let cleanup = if created_backup {
+                fs::remove_file(&backup)
+                    .map_err(|cleanup_error| format!("清理备份失败: {cleanup_error}"))
+                    .err()
+            } else {
+                None
+            };
+            return Err(match cleanup {
+                Some(cleanup_error) => format!("{error}；{cleanup_error}"),
+                None => error,
+            });
+        }
     }
 
-    write_json_file(&settings_path, &settings)
+    if let Err(error) = atomic_write(&settings_path, json.as_bytes()) {
+        // 本次失败不能改变恢复资料的可见状态。
+        let mut cleanup_errors = Vec::new();
+        if created_backup {
+            if let Err(cleanup_error) = fs::remove_file(&backup) {
+                cleanup_errors.push(format!("清理备份失败: {cleanup_error}"));
+            }
+        }
+        if created_absent_marker {
+            if let Err(cleanup_error) = fs::remove_file(&absent) {
+                cleanup_errors.push(format!("清理缺失标记失败: {cleanup_error}"));
+            }
+        }
+        if cleanup_errors.is_empty() {
+            return Err(error);
+        }
+        return Err(format!("{error}；{}", cleanup_errors.join("；")));
+    }
+    Ok(())
+}
+
+/// Claude Code 对不在内置目录中的模型会按 200K 上下文处理。参考 Codex 的
+/// GPT-5.6 目录，已知 gpt-5.6 系列在 Claude Code 网关场景应声明为 372K。
+const CLAUDE_CODE_GPT_56_CONTEXT_TOKENS: &str = "372000";
+const CLAUDE_CODE_GPT_56_AUTO_COMPACT_TOKENS: &str = "360000";
+const WALIAPI_CLAUDE_SETTINGS_META: &str = "_waliapi_claude_code";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaudeCodeModelCompatibility {
+    context_tokens: Option<&'static str>,
+    auto_compact_tokens: Option<&'static str>,
+    behaves_as: Option<&'static str>,
+    source: &'static str,
+    confidence: &'static str,
+}
+
+fn claude_code_model_compatibility(model: &str) -> ClaudeCodeModelCompatibility {
+    // 渠道列表有时以 `gpt-5.6-luna[1m]` 标示上游变体；兼容声明仍使用已
+    // 确认的 GPT-5.6 注册表项，未知模型绝不根据名称臆造窗口。
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.split('[').next().unwrap_or(&model);
+    if model.starts_with("gpt-5.6") {
+        ClaudeCodeModelCompatibility {
+            context_tokens: Some(CLAUDE_CODE_GPT_56_CONTEXT_TOKENS),
+            auto_compact_tokens: Some(CLAUDE_CODE_GPT_56_AUTO_COMPACT_TOKENS),
+            behaves_as: Some("claude-opus-4-8"),
+            source: "verified-gpt-5.6-model-metadata",
+            confidence: "verified",
+        }
+    } else {
+        ClaudeCodeModelCompatibility {
+            context_tokens: None,
+            auto_compact_tokens: None,
+            behaves_as: None,
+            source: "none",
+            confidence: "unknown",
+        }
+    }
+}
+
+fn waliapi_managed_string_array(
+    settings: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Vec<String> {
+    settings
+        .get(WALIAPI_CLAUDE_SETTINGS_META)
+        .and_then(|value| value.get(key))
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn secret_fingerprint(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn is_legacy_waliapi_settings(root: &serde_json::Map<String, serde_json::Value>) -> bool {
+    root.get("_waliapi").and_then(serde_json::Value::as_bool) == Some(true)
+        && !root.contains_key(WALIAPI_CLAUDE_SETTINGS_META)
+}
+
+/// 将 WaLiAPI 所有的字段投影到 Claude Code settings。settings.json 同时属于
+/// Claude Code 和用户，绝不能为了更新网关而整体替换 env 或 modelPicker。
+fn apply_waliapi_claude_code_settings(
+    settings: &mut serde_json::Value,
+    waliapi_url: &str,
+    waliapi_key: &str,
+    model: &str,
+) -> Result<(), String> {
+    let root = settings.as_object_mut().ok_or_else(|| {
+        "Claude Code settings.json 必须是 JSON 对象，已取消写入以保护原配置".to_string()
+    })?;
+
+    let previously_managed_env = waliapi_managed_string_array(root, "managedEnvKeys");
+    let previously_managed_picker_models = waliapi_managed_string_array(root, "modelPickerModels");
+    let previous_auth_fingerprint = root
+        .get(WALIAPI_CLAUDE_SETTINGS_META)
+        .and_then(|m| m.get("managedAuthFingerprint"))
+        .and_then(|f| f.as_str())
+        .map(ToOwned::to_owned);
+    let legacy_settings = is_legacy_waliapi_settings(root);
+
+    let env = root
+        .entry("env".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            "Claude Code settings.json 的 env 必须是 JSON 对象，已取消写入以保护原配置".to_string()
+        })?;
+
+    // Claude Code 网关统一使用真实数据面密钥作为 Bearer token。旧版本写入的
+    // API_KEY 仅在值等于本次选择的密钥、或已记录为受管字段时迁移；未知凭据必须
+    // 阻止写入，避免覆盖用户自己的 Anthropic 配置。
+    for key in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] {
+        if let Some(value) = env.get(key) {
+            let is_target_key = value.as_str() == Some(waliapi_key);
+            let is_managed = previously_managed_env.iter().any(|managed| managed == key);
+            if !is_target_key && !is_managed {
+                return Err(format!(
+                    "Claude Code 已存在非 WaLiAPI 管理的 {key}；为保护现有凭证未写入。请先在 settings.json 中移除或手动选择一种认证方式"
+                ));
+            }
+            if key == "ANTHROPIC_API_KEY" && is_managed && !is_target_key {
+                let fingerprint_matches = previous_auth_fingerprint
+                    .as_deref()
+                    .zip(value.as_str())
+                    .is_some_and(|(expected, actual)| secret_fingerprint(actual) == expected);
+                if !fingerprint_matches {
+                    return Err(
+                        "Claude Code 已修改受管的 ANTHROPIC_API_KEY；为保护现有凭证未写入"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    // 仅替换本次网关需要的字段；其余用户环境变量（包括企业代理和自定义模型）原样保留。
+    env.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        serde_json::Value::String(waliapi_url.trim().trim_end_matches('/').to_string()),
+    );
+    env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        serde_json::Value::String(waliapi_key.to_string()),
+    );
+    env.remove("ANTHROPIC_API_KEY");
+    // 受管模型环境变量不应覆盖 Claude Code 的 /model 持久化选择。仅删除由
+    // WaLiAPI 以前写入的值或 legacy 配置中的值；用户自行设置的覆盖原样保留。
+    if previously_managed_env
+        .iter()
+        .any(|managed| managed == "ANTHROPIC_MODEL")
+        || legacy_settings
+    {
+        env.remove("ANTHROPIC_MODEL");
+    }
+
+    let mut managed_env_keys = vec![
+        "ANTHROPIC_BASE_URL".to_string(),
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+    ];
+    let compatibility = claude_code_model_compatibility(model);
+    if let (Some(max_context), Some(auto_compact)) = (
+        compatibility.context_tokens,
+        compatibility.auto_compact_tokens,
+    ) {
+        for (key, value) in [
+            ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", max_context),
+            ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", auto_compact),
+        ] {
+            if !env.contains_key(key) {
+                env.insert(
+                    key.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+                managed_env_keys.push(key.to_string());
+            }
+        }
+    }
+
+    let mut managed_picker_models = Vec::new();
+    if !model.trim().to_ascii_lowercase().starts_with("claude-")
+        && compatibility.behaves_as.is_some()
+    {
+        let picker = root
+            .entry("modelPicker".to_string())
+            .or_insert_with(|| serde_json::json!({ "options": [] }))
+            .as_object_mut()
+            .ok_or_else(|| {
+                "Claude Code settings.json 的 modelPicker 必须是 JSON 对象，已取消写入以保护原配置"
+                    .to_string()
+            })?;
+        let options = picker
+            .get_mut("options")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| "Claude Code settings.json 的 modelPicker.options 必须是数组，已取消写入以保护原配置".to_string())?;
+
+        // 仅删除此前由 WaLiAPI 加入的行，随后为当前模型写入一条最小兼容行。
+        options.retain(|option| {
+            let option_model = option.get("model").and_then(serde_json::Value::as_str);
+            !option_model.is_some_and(|option_model| {
+                previously_managed_picker_models
+                    .iter()
+                    .any(|managed| managed == option_model)
+            })
+        });
+
+        if !options.iter().any(|option| {
+            option.get("model").and_then(serde_json::Value::as_str) == Some(model.trim())
+        }) {
+            // Claude Code 2.1.266 已正式支持该形状。behavesAs 仅用于客户端的
+            // prompt/capability/effort 处理，请求中的 model 仍保持用户选择的值。
+            options.push(serde_json::json!({
+                "model": model.trim(),
+                "label": model.trim(),
+                "description": "由 WaLiAPI 网关提供",
+                "behavesAs": compatibility.behaves_as.expect("checked above")
+            }));
+            managed_picker_models.push(model.trim().to_string());
+        }
+    }
+
+    root.insert(
+        "model".to_string(),
+        serde_json::Value::String(model.trim().to_string()),
+    );
+    root.insert("_waliapi".to_string(), serde_json::json!(true));
+    root.insert(
+        WALIAPI_CLAUDE_SETTINGS_META.to_string(),
+        serde_json::json!({
+            "version": 3,
+            "managedEnvKeys": managed_env_keys,
+            "modelPickerModels": managed_picker_models,
+            "managedTopLevelFields": ["model"],
+            "managedAuthFingerprint": secret_fingerprint(waliapi_key),
+            "modelCompatibility": {
+                "model": model.trim(),
+                "source": compatibility.source,
+                "confidence": compatibility.confidence,
+            },
+        }),
+    );
+    Ok(())
 }
 
 fn write_codex(
@@ -427,6 +756,80 @@ fn write_codex(
     Ok(())
 }
 
+/// 检测 Codex auth.json 是否卡在 API Key 鉴权模式。
+///
+/// 判定（任一命中即视为 API Key 模式）：
+/// - `auth_mode == "apikey"`
+/// - `OPENAI_API_KEY` 为非空字符串，且没有 ChatGPT 登录态（`tokens` 缺失或为 null）
+///
+/// 返回 `Some(原因)` 表示处于 API Key 模式；`None` 表示 ChatGPT 登录态正常，
+/// 或文件不存在 / 无法解析（交给 Codex 自行处理）。
+fn detect_codex_apikey_mode(config_dir: &PathBuf) -> Option<String> {
+    let auth_path = config_dir.join("auth.json");
+    let text = std::fs::read_to_string(&auth_path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+
+    let auth_mode = v.get("auth_mode").and_then(|x| x.as_str()).unwrap_or("");
+    let api_key = v
+        .get("OPENAI_API_KEY")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let has_tokens = v.get("tokens").map(|t| t.is_object()).unwrap_or(false);
+
+    if auth_mode.eq_ignore_ascii_case("apikey") || (!api_key.is_empty() && !has_tokens) {
+        let reason = if !api_key.is_empty() {
+            "OPENAI_API_KEY 已设置"
+        } else {
+            "auth_mode = apikey"
+        };
+        Some(format!("auth.json 处于 API Key 模式（{reason}）"))
+    } else {
+        None
+    }
+}
+
+/// 将 Codex auth.json 重置为 ChatGPT 登录模式。
+///
+/// 原 auth.json 备份为 `~/.codex/auth.json.waliapi-backup`；重置后用户需运行
+/// `codex login` 重新完成 ChatGPT 授权（官方推荐的退出 API Key 模式流程）。
+#[tauri::command]
+pub async fn reset_codex_auth() -> Result<ApplyResult, String> {
+    reset_codex_auth_in(&home_dir().join(".codex"))
+}
+
+fn reset_codex_auth_in(config_dir: &PathBuf) -> Result<ApplyResult, String> {
+    let auth_path = config_dir.join("auth.json");
+
+    if !auth_path.exists() {
+        return Ok(ApplyResult {
+            success: false,
+            message: "auth.json 不存在，无需重置：直接运行 codex login 登录 ChatGPT 账号即可"
+                .to_string(),
+            auth_warning: None,
+        });
+    }
+
+    let content = fs::read(&auth_path).map_err(|e| format!("读取 auth.json 失败: {e}"))?;
+    atomic_write(
+        &auth_path.with_file_name("auth.json.waliapi-backup"),
+        &content,
+    )?;
+
+    let reset = serde_json::json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": serde_json::Value::Null,
+        "tokens": serde_json::Value::Null,
+    });
+    let text = serde_json::to_string_pretty(&reset).map_err(|e| format!("序列化失败: {e}"))?;
+    atomic_write(&auth_path, text.as_bytes())?;
+
+    Ok(ApplyResult {
+        success: true,
+        message: "已重置 auth.json 为 ChatGPT 登录模式（原文件备份为 ~/.codex/auth.json.waliapi-backup）。请重启 Codex 并运行 codex login 完成登录".to_string(),
+        auth_warning: None,
+    })
+}
+
 fn write_gemini_cli(
     config_dir: &PathBuf,
     waliapi_url: &str,
@@ -481,12 +884,20 @@ fn write_opencode(
 ) -> Result<(), String> {
     let config_path = config_dir.join("opencode.json");
     let mut config: serde_json::Value = if config_path.exists() {
-        read_json_file(&config_path).unwrap_or_else(|_| serde_json::json!({}))
+        read_json_file(&config_path)?
     } else {
         serde_json::json!({"$schema": "https://opencode.ai/config.json"})
     };
 
-    if let Some(obj) = config.as_object_mut() {
+    let obj = config
+        .as_object_mut()
+        .ok_or_else(|| "OpenCode 配置根节点必须是对象，已取消写入以保护原配置".to_string())?;
+    {
+        // opencode 把 `models` 的**键**当作请求里的 model（`name` 只是显示名），
+        // 键必须是网关认识的模型名：写占位名会被服务端以 "No available upstream
+        // candidate" 拒掉，客户端侧看起来只是“没有响应”。
+        let mut models = serde_json::Map::new();
+        models.insert(model.to_string(), serde_json::json!({ "name": model }));
         let provider = serde_json::json!({
             "npm": "@ai-sdk/openai-compatible",
             "name": "WaLiAPI Gateway",
@@ -494,18 +905,27 @@ fn write_opencode(
                 "baseURL": format!("{}/v1", waliapi_url),
                 "apiKey": waliapi_key
             },
-            "models": {
-                "waliapi-default": { "name": model }
-            }
+            "models": serde_json::Value::Object(models)
         });
-        if let Some(providers) = obj.get_mut("provider").and_then(|v| v.as_object_mut()) {
-            providers.insert("waliapi".to_string(), provider);
-        } else {
-            obj.insert(
-                "provider".to_string(),
-                serde_json::json!({"waliapi": provider}),
-            );
+        match obj.get_mut("provider") {
+            Some(value) => {
+                let providers = value.as_object_mut().ok_or_else(|| {
+                    "OpenCode 的 provider 必须是对象，已取消写入以保护原配置".to_string()
+                })?;
+                providers.insert("waliapi".to_string(), provider);
+            }
+            None => {
+                obj.insert(
+                    "provider".to_string(),
+                    serde_json::json!({"waliapi": provider}),
+                );
+            }
         }
+        // 顶层 `model` 决定默认模型；缺省时 opencode 会退回第一个可用模型。
+        obj.insert(
+            "model".to_string(),
+            serde_json::json!(format!("waliapi/{model}")),
+        );
     }
 
     write_json_file(&config_path, &config)
@@ -517,21 +937,114 @@ fn write_openclaw(
     waliapi_key: &str,
     model: &str,
 ) -> Result<(), String> {
-    let config_path = config_dir.join("config.json");
+    let config_path = config_dir.join("openclaw.json");
     let mut config: serde_json::Value = if config_path.exists() {
-        read_json_file(&config_path).unwrap_or_else(|_| serde_json::json!({}))
+        read_json_file(&config_path)?
     } else {
         serde_json::json!({})
     };
 
-    if let Some(obj) = config.as_object_mut() {
-        obj.insert(
-            "baseUrl".to_string(),
-            serde_json::json!(format!("{}/v1", waliapi_url)),
+    let obj = config
+        .as_object_mut()
+        .ok_or_else(|| "OpenClaw 配置根节点必须是对象，已取消写入以保护原配置".to_string())?;
+
+    // OpenClaw 的 provider 定义在 `models.providers.<id>`，默认模型是
+    // `agents.defaults.model.primary` 里的 `provider/model` 引用；旧版写的平铺
+    // `{baseUrl, apiKey, model}` 既不在正确路径也不在正确结构里，读不到。
+    let provider_id = "waliapi";
+    let model_ref = format!("{provider_id}/{model}");
+    let provider_prefix = format!("{provider_id}/");
+    let base_url = format!("{}/v1", waliapi_url);
+
+    {
+        let models = obj
+            .entry("models".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let models_obj = models
+            .as_object_mut()
+            .ok_or_else(|| "OpenClaw 的 models 必须是对象，已取消写入以保护原配置".to_string())?;
+        // `merge` 保留 OpenClaw 内置的模型目录，只追加我们的 provider。
+        models_obj
+            .entry("mode".to_string())
+            .or_insert_with(|| serde_json::json!("merge"));
+        let providers = models_obj
+            .entry("providers".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let providers_obj = providers.as_object_mut().ok_or_else(|| {
+            "OpenClaw 的 models.providers 必须是对象，已取消写入以保护原配置".to_string()
+        })?;
+        providers_obj.insert(
+            provider_id.to_string(),
+            serde_json::json!({
+                "baseUrl": base_url,
+                "apiKey": waliapi_key,
+                "api": "openai-completions",
+                "models": [{ "id": model, "name": model }]
+            }),
         );
-        obj.insert("apiKey".to_string(), serde_json::json!(waliapi_key));
-        obj.insert("model".to_string(), serde_json::json!(model));
-        obj.insert("_waliapi".to_string(), serde_json::json!(true));
+
+        let agents = obj
+            .entry("agents".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let agents_obj = agents
+            .as_object_mut()
+            .ok_or_else(|| "OpenClaw 的 agents 必须是对象，已取消写入以保护原配置".to_string())?;
+        let defaults = agents_obj
+            .entry("defaults".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let defaults_obj = defaults.as_object_mut().ok_or_else(|| {
+            "OpenClaw 的 agents.defaults 必须是对象，已取消写入以保护原配置".to_string()
+        })?;
+        let model_cfg = defaults_obj
+            .entry("model".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let model_obj = model_cfg.as_object_mut().ok_or_else(|| {
+            "OpenClaw 的 agents.defaults.model 必须是对象，已取消写入以保护原配置".to_string()
+        })?;
+        model_obj.insert("primary".to_string(), serde_json::json!(model_ref.clone()));
+        // 未进 allowlist 的模型不会出现在可选列表里。
+        let allow = defaults_obj
+            .entry("models".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let allow_obj = allow.as_object_mut().ok_or_else(|| {
+            "OpenClaw 的 agents.defaults.models 必须是对象，已取消写入以保护原配置".to_string()
+        })?;
+        // waliapi provider 的模型目录由本网关维护：清掉历史遗留的
+        // `waliapi/*` 条目，避免留下网关已不认识的模型名。
+        allow_obj.retain(|key, _| !key.starts_with(&provider_prefix));
+        allow_obj.insert(model_ref.clone(), serde_json::json!({}));
+        // 模型可见性策略：OpenClaw 只把 `modelPolicy.allow` 里的模型暴露给
+        // agent，但**没有 modelPolicy 时表示不限制**（allowAny）。因此只在用户
+        // 已经配置了它的情况下维护 allow：凭空新建一个只含本网关模型的白名单，
+        // 会把该用户其它 provider 的模型全部挡掉。
+        if let Some(policy) = defaults_obj.get_mut("modelPolicy") {
+            let Some(policy_obj) = policy.as_object_mut() else {
+                return Err(
+                    "OpenClaw 的 agents.defaults.modelPolicy 不是对象，已取消写入以保护原配置"
+                        .to_string(),
+                );
+            };
+            let policy_allow = policy_obj
+                .entry("allow".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            let Some(policy_allow_arr) = policy_allow.as_array_mut() else {
+                return Err(
+                            "OpenClaw 的 agents.defaults.modelPolicy.allow 不是数组，已取消写入以保护原配置"
+                                .to_string(),
+                        );
+            };
+            policy_allow_arr.retain(|item| {
+                item.as_str()
+                    .map(|value| !value.starts_with(&provider_prefix))
+                    .unwrap_or(true)
+            });
+            policy_allow_arr.push(serde_json::json!(model_ref.clone()));
+        }
+        // OpenClaw 的配置 schema 对根级未知键做严格校验，带上 `_waliapi` 标记会让
+        // 它直接以 `Invalid config ... Unrecognized key: "_waliapi"` 拒绝启动。
+        // 「是否已应用」改由 `models.providers.waliapi` 判断（见 `detect_applied`），
+        // 这里顺手清掉历史版本写入的标记，让老配置在下次应用时自愈。
+        let _ = obj.remove("_waliapi");
     }
 
     write_json_file(&config_path, &config)
@@ -543,47 +1056,76 @@ fn write_hermes(
     waliapi_key: &str,
     model: &str,
 ) -> Result<(), String> {
-    let config_path = config_dir.join("config.json");
+    // Hermes 的主配置是 `~/.hermes/config.yaml`：provider 走 `custom_providers`
+    // 列表（元素用 `name`），默认模型由 `model` 段的 `provider: custom:<name>` +
+    // `default` + `base_url` 决定。用 serde_yaml 读回现有配置再合并，只覆盖
+    // model 段与本网关的条目；YAML 重写不保留注释，故写入前先备份原文件。
+    let config_path = config_dir.join("config.yaml");
     let mut config: serde_json::Value = if config_path.exists() {
-        read_json_file(&config_path).unwrap_or_else(|_| serde_json::json!({}))
+        let raw = fs::read_to_string(&config_path).map_err(|e| format!("读取文件失败: {e}"))?;
+        if raw.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_yaml::from_str::<serde_json::Value>(&raw)
+                .map_err(|e| format!("解析 ~/.hermes/config.yaml 失败（原文件未改动）：{e}"))?
+        }
     } else {
         serde_json::json!({})
     };
-
-    if let Some(obj) = config.as_object_mut() {
-        if let Some(providers) = obj
-            .get_mut("custom_providers")
-            .and_then(|v| v.as_array_mut())
-        {
-            providers.retain(|p| p.get("id").and_then(|v| v.as_str()) != Some("waliapi"));
-            let mut entry = serde_json::Map::new();
-            entry.insert("id".to_string(), serde_json::json!("waliapi"));
-            entry.insert("name".to_string(), serde_json::json!("WaLiAPI Gateway"));
-            entry.insert(
-                "base_url".to_string(),
-                serde_json::json!(format!("{}/v1", waliapi_url)),
-            );
-            entry.insert("api_key".to_string(), serde_json::json!(waliapi_key));
-            entry.insert("default_model".to_string(), serde_json::json!(model));
-            providers.push(serde_json::Value::Object(entry));
-        } else {
-            let mut entry = serde_json::Map::new();
-            entry.insert("id".to_string(), serde_json::json!("waliapi"));
-            entry.insert("name".to_string(), serde_json::json!("WaLiAPI Gateway"));
-            entry.insert(
-                "base_url".to_string(),
-                serde_json::json!(format!("{}/v1", waliapi_url)),
-            );
-            entry.insert("api_key".to_string(), serde_json::json!(waliapi_key));
-            entry.insert("default_model".to_string(), serde_json::json!(model));
-            obj.insert(
-                "custom_providers".to_string(),
-                serde_json::Value::Array(vec![serde_json::Value::Object(entry)]),
-            );
-        }
+    if !config.is_object() {
+        return Err("Hermes 配置根节点必须是对象，已取消写入以保护原配置".to_string());
     }
 
-    write_json_file(&config_path, &config)
+    let provider_id = "waliapi";
+    let base_url = format!("{}/v1", waliapi_url);
+    let obj = config
+        .as_object_mut()
+        .ok_or_else(|| "Hermes 配置根节点必须是对象，已取消写入以保护原配置".to_string())?;
+    {
+        let mut entry = serde_json::Map::new();
+        entry.insert("name".to_string(), serde_json::json!(provider_id));
+        entry.insert("base_url".to_string(), serde_json::json!(base_url.clone()));
+        entry.insert("api_key".to_string(), serde_json::json!(waliapi_key));
+        entry.insert(
+            "api_mode".to_string(),
+            serde_json::json!("chat_completions"),
+        );
+        let mut models = serde_json::Map::new();
+        models.insert(model.to_string(), serde_json::json!({}));
+        entry.insert("models".to_string(), serde_json::Value::Object(models));
+
+        let providers = obj
+            .entry("custom_providers".to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        let list = providers.as_array_mut().ok_or_else(|| {
+            "Hermes 的 custom_providers 必须是数组，已取消写入以保护原配置".to_string()
+        })?;
+        // 旧版本写的是 `id` 字段（Hermes 不认），这里按 `name` 去重重建。
+        list.retain(|p| p.get("name").and_then(serde_json::Value::as_str) != Some(provider_id));
+        list.push(serde_json::Value::Object(entry));
+
+        let model_cfg = obj
+            .entry("model".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let model_obj = model_cfg
+            .as_object_mut()
+            .ok_or_else(|| "Hermes 的 model 必须是对象，已取消写入以保护原配置".to_string())?;
+        model_obj.insert(
+            "provider".to_string(),
+            serde_json::json!(format!("custom:{provider_id}")),
+        );
+        model_obj.insert("default".to_string(), serde_json::json!(model));
+        model_obj.insert("base_url".to_string(), serde_json::json!(base_url));
+        model_obj.insert(
+            "api_mode".to_string(),
+            serde_json::json!("chat_completions"),
+        );
+        obj.insert("_waliapi".to_string(), serde_json::json!(true));
+    }
+
+    // YAML 重写不留注释：先留一份 `.waliapi-backup` 作为退路。
+    backup_config(&config_path)?;
+    write_yaml_file(&config_path, &config)
 }
 
 fn write_walicode(
@@ -729,7 +1271,28 @@ fn detect_applied(config_path: &PathBuf, app_name: &str) -> bool {
                 Ok(v) => v,
                 Err(_) => return false,
             };
-            v.get("_waliapi").and_then(|v| v.as_bool()).unwrap_or(false)
+            if app_name == "claude-code" {
+                let managed = v
+                    .get(WALIAPI_CLAUDE_SETTINGS_META)
+                    .and_then(|m| m.get("version"))
+                    .and_then(|n| n.as_u64())
+                    .is_some_and(|version| version >= 3);
+                let env = v.get("env").and_then(|e| e.as_object());
+                managed
+                    && v.get("_waliapi").and_then(|x| x.as_bool()) == Some(true)
+                    && env
+                        .and_then(|e| e.get("ANTHROPIC_AUTH_TOKEN"))
+                        .and_then(|x| x.as_str())
+                        .is_some_and(|s| !s.is_empty())
+                    && env.and_then(|e| e.get("ANTHROPIC_API_KEY")).is_none()
+            } else if app_name == "openclaw" {
+                // OpenClaw 不允许根级未知键，所以不能用 `_waliapi` 标记认领写入的
+                // 配置；`models.providers.waliapi` 本身就是「已由 WaLiAPI 写入」的
+                // 证据（与 opencode 分支同一思路）。
+                v.pointer("/models/providers/waliapi").is_some()
+            } else {
+                v.get("_waliapi").and_then(|v| v.as_bool()).unwrap_or(false)
+            }
         }
         "codex" => content.contains("WaLiAPI") || content.contains("waliapi"),
         "gemini-cli" => content.contains("WaLiAPI"),
@@ -741,7 +1304,9 @@ fn detect_applied(config_path: &PathBuf, app_name: &str) -> bool {
             v.pointer("/provider/waliapi").is_some()
         }
         "hermes" => {
-            let v: serde_json::Value = match serde_json::from_str(&content) {
+            // Hermes 的主配置是 YAML（`config.yaml`），必须用 YAML 解析器；
+            // provider 名在 `custom_providers[].name`（`id` 是不被识别的旧字段）。
+            let v: serde_json::Value = match serde_yaml::from_str(&content) {
                 Ok(v) => v,
                 Err(_) => return false,
             };
@@ -749,7 +1314,7 @@ fn detect_applied(config_path: &PathBuf, app_name: &str) -> bool {
                 .and_then(|v| v.as_array())
                 .and_then(|arr| {
                     arr.iter()
-                        .find(|p| p.get("id").and_then(|v| v.as_str()) == Some("waliapi"))
+                        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("waliapi"))
                 })
                 .is_some()
         }
@@ -798,7 +1363,10 @@ fn detect_applied(config_path: &PathBuf, app_name: &str) -> bool {
 pub async fn get_app_configs(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<AppInfo>, String> {
-    let _ = &state;
+    get_app_configs_impl(state.inner()).await
+}
+
+pub async fn get_app_configs_impl(_state: &Arc<AppState>) -> Result<Vec<AppInfo>, String> {
     let apps: Vec<AppInfo> = APPS
         .iter()
         .map(|app| {
@@ -831,7 +1399,16 @@ pub async fn apply_app_config(
     model: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<ApplyResult, String> {
-    let waliapi_url = get_waliapi_url(&state).await;
+    apply_app_config_impl(&app_name, &api_key, &model, state.inner()).await
+}
+
+pub async fn apply_app_config_impl(
+    app_name: &str,
+    api_key: &str,
+    model: &str,
+    state: &Arc<AppState>,
+) -> Result<ApplyResult, String> {
+    let waliapi_url = get_waliapi_url(state).await;
 
     let app_def = APPS
         .iter()
@@ -841,10 +1418,35 @@ pub async fn apply_app_config(
     let config_dir = (app_def.config_dir_fn)();
     let config_path = config_dir.join(app_def.config_file);
 
-    let _ = backup_config(&config_path);
+    // 仅在「未应用」状态下备份：避免重复写入时把已被修改的配置当成原始配置覆盖备份，
+    // 否则「恢复原配置」会恢复成 waliapi 配置，永远切不回去。
+    if app_name == "claude-code" {
+        // Claude Code 在事务写入器中完成读取、校验、首次备份和原子替换；
+        // 外层不能提前创建备份，否则冲突失败会误消费原始备份。
+    } else if detect_applied(&config_path, app_name) {
+        // 已处于网关配置状态，保留最初的备份，直接重写即可
+    } else if config_path.exists() {
+        backup_config(&config_path)?;
+        let absent = absent_marker_path(&config_path);
+        if absent.exists() {
+            fs::remove_file(&absent).map_err(|e| format!("删除缺失标记失败: {e}"))?;
+        }
+    } else {
+        // 原配置不存在：打标记，恢复时删除写入的配置
+        let absent = absent_marker_path(&config_path);
+        if !absent.exists() {
+            atomic_write(&absent, b"")?;
+        }
+        let backup = backup_path(&config_path);
+        if backup.exists() {
+            fs::remove_file(&backup).map_err(|e| format!("删除旧备份失败: {e}"))?;
+        }
+    }
 
-    let result = match app_name.as_str() {
-        "claude-code" => write_claude_code(&config_dir, &waliapi_url, &api_key, &model),
+    let result = match app_name {
+        "claude-code" => {
+            write_claude_code_transactional(&config_dir, &waliapi_url, &api_key, &model)
+        }
         "codex" => write_codex(&config_dir, &waliapi_url, &api_key, &model),
         "gemini-cli" => write_gemini_cli(&config_dir, &waliapi_url, &api_key, &model),
         "claude-desktop" => write_claude_desktop(&config_dir, &waliapi_url, &api_key, &model),
@@ -857,7 +1459,12 @@ pub async fn apply_app_config(
 
     match result {
         Ok(()) => {
-            let msg = if app_name == "walicode" {
+            let msg = if app_name == "claude-code" {
+                format!(
+                    "WaLiAPI 网关配置已写入 {}。Claude Code 的 API Key 网关不要求 Anthropic 账户登录或执行 /login，请重启 Claude Code 生效",
+                    config_path.display()
+                )
+            } else if app_name == "walicode" {
                 format!(
                     "配置已写入。请重启 WaLiCode 使配置生效（WaLiCode 会使用本地缓存覆盖旧配置）"
                 )
@@ -867,13 +1474,22 @@ pub async fn apply_app_config(
             Ok(ApplyResult {
                 success: true,
                 message: msg,
+                auth_warning: None,
             })
         }
         Err(e) => {
-            let _ = restore_config(&config_path);
+            let message = if app_name == "claude-code" {
+                e
+            } else {
+                match restore_config(&config_path) {
+                    Ok(()) => e,
+                    Err(restore_error) => format!("{e}；恢复原配置失败: {restore_error}"),
+                }
+            };
             Ok(ApplyResult {
                 success: false,
-                message: e,
+                message,
+                auth_warning: None,
             })
         }
     }
@@ -881,6 +1497,10 @@ pub async fn apply_app_config(
 
 #[tauri::command]
 pub async fn clear_app_config(app_name: String) -> Result<ApplyResult, String> {
+    clear_app_config_impl(&app_name).await
+}
+
+pub async fn clear_app_config_impl(app_name: &str) -> Result<ApplyResult, String> {
     let app_def = APPS
         .iter()
         .find(|a| a.name == app_name)
@@ -890,19 +1510,38 @@ pub async fn clear_app_config(app_name: String) -> Result<ApplyResult, String> {
     let config_path = config_dir.join(app_def.config_file);
 
     match restore_config(&config_path) {
-        Ok(()) => Ok(ApplyResult {
-            success: true,
-            message: format!("已恢复 {} 的原始配置", app_def.label),
-        }),
+        Ok(()) => {
+            let mut auth_warning = None;
+            let message = if app_name == "codex" {
+                // auth.json 若被其他工具改成 API Key 模式，仅恢复 config.toml 无法回到 ChatGPT 账号
+                auth_warning = detect_codex_apikey_mode(&config_dir);
+                format!(
+                    "已恢复 {} 的原始配置，重启 Codex 后将使用原账号（auth.json 未被改动）",
+                    app_def.label
+                )
+            } else {
+                format!("已恢复 {} 的原始配置", app_def.label)
+            };
+            Ok(ApplyResult {
+                success: true,
+                message,
+                auth_warning,
+            })
+        }
         Err(e) => Ok(ApplyResult {
             success: false,
             message: format!("恢复失败: {e}"),
+            auth_warning: None,
         }),
     }
 }
 
 #[tauri::command]
 pub async fn get_app_config_content(app_name: String) -> Result<ConfigContent, String> {
+    get_app_config_content_impl(&app_name).await
+}
+
+pub async fn get_app_config_content_impl(app_name: &str) -> Result<ConfigContent, String> {
     let app_def = APPS
         .iter()
         .find(|a| a.name == app_name)
@@ -950,23 +1589,7 @@ pub async fn get_app_config_content(app_name: String) -> Result<ConfigContent, S
 
 #[tauri::command]
 pub async fn open_config_folder(app_name: String) -> Result<(), String> {
-    let app_def = APPS
-        .iter()
-        .find(|a| a.name == app_name)
-        .ok_or_else(|| format!("不支持的应用: {app_name}"))?;
-
-    let config_dir = (app_def.config_dir_fn)();
-
-    // 如果目录不存在，尝试创建
-    if !config_dir.exists() {
-        fs::create_dir_all(&config_dir).map_err(|e| format!("创建目录失败: {e}"))?;
-    }
-
-    // 如果配置文件不存在，先创建一个空文件
-    let config_path = config_dir.join(app_def.config_file);
-    if !config_path.exists() {
-        atomic_write(&config_path, b"{}")?;
-    }
+    let config_dir = prepare_app_config_path_impl(&app_name).await?;
 
     #[cfg(target_os = "macos")]
     {
@@ -991,4 +1614,611 @@ pub async fn open_config_folder(app_name: String) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Prepare and return the server-side configuration directory. Browser clients
+/// cannot open a native file manager on a remote Linux host, so the Web bridge
+/// returns this path while still preserving the desktop command's behavior.
+pub async fn prepare_app_config_path_impl(app_name: &str) -> Result<String, String> {
+    let app_def = APPS
+        .iter()
+        .find(|a| a.name == app_name)
+        .ok_or_else(|| format!("不支持的应用: {app_name}"))?;
+
+    let config_dir = (app_def.config_dir_fn)();
+
+    // 如果目录不存在，尝试创建
+    if !config_dir.exists() {
+        fs::create_dir_all(&config_dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    }
+
+    // 如果配置文件不存在，先创建一个空文件
+    let config_path = config_dir.join(app_def.config_file);
+    if !config_path.exists() {
+        atomic_write(&config_path, b"{}")?;
+    }
+
+    Ok(config_dir.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "waliapi-appcfg-{}-{}",
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn restore_with_backup_recovers_original_and_removes_backup() {
+        let dir = temp_dir("backup");
+        let config = dir.join("config.toml");
+        fs::write(&config, b"original").unwrap();
+        backup_config(&config).unwrap();
+        // 模拟网关写入覆盖
+        fs::write(&config, b"model_provider = \"waliapi\"").unwrap();
+
+        restore_config(&config).unwrap();
+        assert_eq!(fs::read(&config).unwrap(), b"original");
+        assert!(!backup_path(&config).exists());
+    }
+
+    #[test]
+    fn restore_with_absent_marker_deletes_written_config() {
+        let dir = temp_dir("absent");
+        let config = dir.join("config.toml");
+        // 写入前配置不存在：打 absent 标记
+        atomic_write(&absent_marker_path(&config), b"").unwrap();
+        // 模拟网关写入
+        fs::write(&config, b"model_provider = \"waliapi\"").unwrap();
+
+        restore_config(&config).unwrap();
+        assert!(!config.exists());
+        assert!(!absent_marker_path(&config).exists());
+    }
+
+    #[test]
+    fn restore_without_backup_or_marker_errors() {
+        let dir = temp_dir("none");
+        let config = dir.join("config.toml");
+        assert!(restore_config(&config).is_err());
+    }
+
+    #[test]
+    fn detect_apikey_mode_flags_key_without_tokens() {
+        let dir = temp_dir("detect-key");
+        fs::write(
+            dir.join("auth.json"),
+            r#"{"OPENAI_API_KEY": "sk-waliapi", "tokens": null}"#,
+        )
+        .unwrap();
+        assert!(detect_codex_apikey_mode(&dir).is_some());
+    }
+
+    #[test]
+    fn detect_apikey_mode_flags_auth_mode_field() {
+        let dir = temp_dir("detect-mode");
+        fs::write(
+            dir.join("auth.json"),
+            r#"{"auth_mode": "apikey", "OPENAI_API_KEY": null}"#,
+        )
+        .unwrap();
+        assert!(detect_codex_apikey_mode(&dir).is_some());
+    }
+
+    #[test]
+    fn detect_apikey_mode_ignores_chatgpt_login() {
+        let dir = temp_dir("detect-chatgpt");
+        fs::write(
+            dir.join("auth.json"),
+            r#"{"OPENAI_API_KEY": null, "tokens": {"id_token": "x", "access_token": "y"}, "last_refresh": "2026-01-01"}"#,
+        )
+        .unwrap();
+        assert!(detect_codex_apikey_mode(&dir).is_none());
+    }
+
+    #[test]
+    fn detect_apikey_mode_ignores_missing_or_invalid_auth_json() {
+        let dir = temp_dir("detect-missing");
+        assert!(detect_codex_apikey_mode(&dir).is_none());
+
+        fs::write(dir.join("auth.json"), "not-json").unwrap();
+        assert!(detect_codex_apikey_mode(&dir).is_none());
+    }
+
+    #[test]
+    fn reset_codex_auth_backs_up_and_resets_to_chatgpt_mode() {
+        let dir = temp_dir("reset");
+        let auth_path = dir.join("auth.json");
+        fs::write(&auth_path, r#"{"OPENAI_API_KEY": "sk-waliapi"}"#).unwrap();
+
+        let result = reset_codex_auth_in(&dir).unwrap();
+        assert!(result.success);
+
+        let reset: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+        assert_eq!(reset["auth_mode"], "chatgpt");
+        assert!(reset["OPENAI_API_KEY"].is_null());
+
+        let backup: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.join("auth.json.waliapi-backup")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(backup["OPENAI_API_KEY"], "sk-waliapi");
+    }
+
+    #[test]
+    fn reset_codex_auth_without_auth_json_fails_gracefully() {
+        let dir = temp_dir("reset-missing");
+        let result = reset_codex_auth_in(&dir).unwrap();
+        assert!(!result.success);
+        assert!(result.message.contains("codex login"));
+    }
+
+    #[test]
+    fn claude_code_projection_preserves_user_fields_and_merges_env() {
+        let mut settings = serde_json::json!({
+            "permissions": {"allow": ["Bash"]},
+            "env": {"CUSTOM_PROXY": "http://proxy", "ANTHROPIC_MODEL": "old"},
+            "modelPicker": {"options": [{"model": "user-model", "label": "User model"}]}
+        });
+
+        apply_waliapi_claude_code_settings(
+            &mut settings,
+            "http://127.0.0.1:8777///",
+            "sk-waliapi-test",
+            "gpt-5.6-luna[1m]",
+        )
+        .unwrap();
+
+        assert_eq!(settings["permissions"]["allow"][0], "Bash");
+        assert_eq!(settings["env"]["CUSTOM_PROXY"], "http://proxy");
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:8777"
+        );
+        assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-waliapi-test");
+        assert!(settings["env"]["ANTHROPIC_API_KEY"].is_null());
+        assert_eq!(settings["model"], "gpt-5.6-luna[1m]");
+        assert_eq!(settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "372000");
+        assert_eq!(settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "360000");
+        assert_eq!(settings["modelPicker"]["options"][0]["model"], "user-model");
+    }
+
+    #[test]
+    fn claude_code_projection_respects_user_context_and_known_claude_model() {
+        let mut settings = serde_json::json!({
+            "env": {
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "123456",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "120000"
+            },
+            "modelPicker": {"options": [{"model": "user-model"}]}
+        });
+
+        apply_waliapi_claude_code_settings(
+            &mut settings,
+            "http://gateway/",
+            "key",
+            "claude-sonnet-4-6",
+        )
+        .unwrap();
+
+        assert_eq!(settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "123456");
+        assert_eq!(settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "120000");
+        assert_eq!(
+            settings["modelPicker"]["options"].as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn claude_code_unknown_model_does_not_guess_context_or_capabilities() {
+        let mut settings = serde_json::json!({"env": {}});
+
+        apply_waliapi_claude_code_settings(
+            &mut settings,
+            "http://gateway",
+            "key",
+            "vendor-private-model",
+        )
+        .unwrap();
+
+        assert!(settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"].is_null());
+        assert!(settings.get("modelPicker").is_none());
+        assert_eq!(
+            settings[WALIAPI_CLAUDE_SETTINGS_META]["modelCompatibility"]["confidence"],
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn claude_code_projection_rejects_unowned_auth_without_mutation() {
+        let mut settings = serde_json::json!({
+            "env": {"ANTHROPIC_AUTH_TOKEN": "user-secret", "CUSTOM": "keep"}
+        });
+        let original = settings.clone();
+
+        let error = apply_waliapi_claude_code_settings(
+            &mut settings,
+            "http://gateway",
+            "key",
+            "custom-model",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert_eq!(settings, original);
+    }
+
+    #[test]
+    fn claude_code_legacy_api_key_is_migrated_only_when_matching_selected_key() {
+        let mut settings = serde_json::json!({
+            "_waliapi": true,
+            "env": {"ANTHROPIC_API_KEY": "key"},
+            "modelPicker": {"options": [{"model": "user-model"}]}
+        });
+        apply_waliapi_claude_code_settings(&mut settings, "http://gateway", "key", "model")
+            .unwrap();
+        assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "key");
+        assert!(settings["env"]["ANTHROPIC_API_KEY"].is_null());
+        assert_eq!(settings["model"], "model");
+        assert_eq!(settings[WALIAPI_CLAUDE_SETTINGS_META]["version"], 3);
+    }
+
+    #[test]
+    fn claude_code_legacy_unknown_api_key_is_rejected_without_mutation() {
+        let mut settings = serde_json::json!({
+            "_waliapi": true,
+            "env": {"ANTHROPIC_API_KEY": "user-secret"}
+        });
+        let original = settings.clone();
+        assert!(apply_waliapi_claude_code_settings(
+            &mut settings,
+            "http://gateway",
+            "key",
+            "model"
+        )
+        .is_err());
+        assert_eq!(settings, original);
+    }
+
+    #[test]
+    fn claude_code_user_rewrite_of_managed_api_key_is_rejected() {
+        let mut settings = serde_json::json!({
+            "env": {"ANTHROPIC_API_KEY": "user-edited"},
+            WALIAPI_CLAUDE_SETTINGS_META: {
+                "version": 3,
+                "managedEnvKeys": ["ANTHROPIC_API_KEY"],
+                "managedAuthFingerprint": secret_fingerprint("old-key")
+            }
+        });
+        let original = settings.clone();
+        assert!(apply_waliapi_claude_code_settings(
+            &mut settings,
+            "http://gateway",
+            "new-key",
+            "model"
+        )
+        .is_err());
+        assert_eq!(settings, original);
+    }
+
+    #[test]
+    fn claude_code_marker_alone_is_not_detected_as_applied() {
+        let dir = temp_dir("claude-marker-only");
+        let path = dir.join("settings.json");
+        fs::write(&path, br#"{"_waliapi":true}"#).unwrap();
+        assert!(!detect_applied(&path, "claude-code"));
+    }
+
+    #[test]
+    fn claude_code_transaction_preserves_original_backup_across_repeated_apply_and_restore() {
+        let dir = temp_dir("claude-transaction");
+        let path = dir.join("settings.json");
+        let original = br#"{"env":{"CUSTOM":"keep"},"permissions":{"allow":["Bash"]}}"#;
+        fs::write(&path, original).unwrap();
+
+        write_claude_code_transactional(&dir, "http://gateway/", "key-1", "custom-model").unwrap();
+        let backup = backup_path(&path);
+        assert_eq!(fs::read(&backup).unwrap(), original);
+
+        write_claude_code_transactional(&dir, "http://gateway/", "key-2", "claude-opus-4-6")
+            .unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap()["env"]
+                ["ANTHROPIC_AUTH_TOKEN"],
+            "key-2"
+        );
+
+        restore_config(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn claude_code_transaction_rejects_invalid_json_without_creating_backup() {
+        let dir = temp_dir("claude-invalid");
+        let path = dir.join("settings.json");
+        fs::write(&path, b"not-json").unwrap();
+
+        assert!(write_claude_code_transactional(&dir, "http://gateway", "key", "model").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"not-json");
+        assert!(!backup_path(&path).exists());
+    }
+
+    #[test]
+    fn backup_is_idempotent_and_restore_returns_first_original() {
+        let dir = temp_dir("backup-idempotent");
+        let path = dir.join("config.yaml");
+        let original = b"model: user\n";
+        fs::write(&path, original).unwrap();
+
+        backup_config(&path).unwrap();
+        fs::write(&path, b"model: waliapi\n").unwrap();
+        backup_config(&path).unwrap();
+        assert_eq!(fs::read(backup_path(&path)).unwrap(), original);
+
+        restore_config(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// opencode 把 `models` 的键当作请求的 model：必须是真实模型名，
+    /// 写占位名会让网关以 "No available upstream candidate" 拒掉。
+    #[test]
+    fn opencode_config_uses_real_model_id_and_sets_default_model() {
+        let dir = temp_dir("opencode");
+        write_opencode(
+            &dir,
+            "http://127.0.0.1:8777",
+            "sk-waliapi-test",
+            "gemini-3.8-flash-medium",
+        )
+        .unwrap();
+
+        let config: serde_json::Value = read_json_file(&dir.join("opencode.json")).unwrap();
+        let models = &config["provider"]["waliapi"]["models"];
+        assert!(models.get("gemini-3.8-flash-medium").is_some());
+        assert!(models.get("waliapi-default").is_none());
+        assert_eq!(config["model"], "waliapi/gemini-3.8-flash-medium");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opencode_invalid_structure_is_rejected_without_mutation() {
+        let dir = temp_dir("opencode-invalid-structure");
+        let path = dir.join("opencode.json");
+        let original = b"[]\n";
+        fs::write(&path, original).unwrap();
+        assert!(write_opencode(&dir, "http://gateway", "key", "m").is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// OpenClaw 读 `models.providers.<id>` 与 `agents.defaults.model.primary`，
+    /// 不是平铺的 `{baseUrl, apiKey, model}`。
+    #[test]
+    fn openclaw_config_writes_models_providers_block() {
+        let dir = temp_dir("openclaw");
+        write_openclaw(
+            &dir,
+            "http://127.0.0.1:8777",
+            "sk-waliapi-test",
+            "gemini-3.8-flash-medium",
+        )
+        .unwrap();
+
+        let config: serde_json::Value = read_json_file(&dir.join("openclaw.json")).unwrap();
+        let provider = &config["models"]["providers"]["waliapi"];
+        assert_eq!(provider["baseUrl"], "http://127.0.0.1:8777/v1");
+        assert_eq!(provider["api"], "openai-completions");
+        assert_eq!(provider["apiKey"], "sk-waliapi-test");
+        assert_eq!(provider["models"][0]["id"], "gemini-3.8-flash-medium");
+        assert_eq!(
+            config["agents"]["defaults"]["model"]["primary"],
+            "waliapi/gemini-3.8-flash-medium"
+        );
+        assert!(config["agents"]["defaults"]["models"]
+            .get("waliapi/gemini-3.8-flash-medium")
+            .is_some());
+        assert!(config.get("baseUrl").is_none(), "不应再写平铺字段");
+        assert!(
+            config.get("_waliapi").is_none(),
+            "OpenClaw 对根级未知键严格校验，不能写 _waliapi 标记"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// OpenClaw 只把 `modelPolicy.allow` 里的模型暴露给 agent。若只写 provider
+    /// 目录而不同步 allow，选中的模型不可见，agent 会退回 allow 里的旧条目
+    /// （历史遗留的模型名），向网关请求一个没有候选的模型并进入 cooldown。
+    #[test]
+    fn openclaw_config_syncs_model_policy_allowlist() {
+        let dir = temp_dir("openclaw-policy");
+        let path = dir.join("openclaw.json");
+        fs::write(
+            &path,
+            br#"{"agents":{"defaults":{"modelPolicy":{"allow":["cliproxy/gpt-5.2","waliapi/wali","zai/glm-4.7"]},"models":{"cliproxy/gpt-5.2":{},"waliapi/wali":{},"zai/glm-4.7":{"alias":"GLM"}}}}}"#,
+        )
+        .unwrap();
+
+        write_openclaw(&dir, "http://127.0.0.1:8777", "sk-test", "Copazk").unwrap();
+
+        let config: serde_json::Value = read_json_file(&path).unwrap();
+        let allow = config["agents"]["defaults"]["modelPolicy"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        // 其它 provider 的条目保留，旧 waliapi 条目换成当前模型。
+        assert!(allow.contains(&"cliproxy/gpt-5.2"), "{allow:?}");
+        assert!(allow.contains(&"zai/glm-4.7"), "{allow:?}");
+        assert!(allow.contains(&"waliapi/Copazk"), "{allow:?}");
+        assert!(!allow.contains(&"waliapi/wali"), "{allow:?}");
+
+        // agents.defaults.models 同样只保留当前 waliapi 模型，其它 provider 不动。
+        let models = config["agents"]["defaults"]["models"].as_object().unwrap();
+        assert!(models.contains_key("waliapi/Copazk"));
+        assert!(!models.contains_key("waliapi/wali"));
+        assert_eq!(models["zai/glm-4.7"]["alias"], "GLM");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 没有 `modelPolicy` 时 OpenClaw 视为“不限制”（所有已配置模型可见）。
+    /// 此时不能凭空新建白名单，否则会把用户其它 provider 的模型全部挡掉。
+    #[test]
+    fn openclaw_config_does_not_create_model_policy() {
+        let dir = temp_dir("openclaw-no-policy");
+        write_openclaw(&dir, "http://127.0.0.1:8777", "sk-test", "grok-4.7").unwrap();
+
+        let config: serde_json::Value = read_json_file(&dir.join("openclaw.json")).unwrap();
+        assert!(
+            config["agents"]["defaults"].get("modelPolicy").is_none(),
+            "不应凭空创建 modelPolicy"
+        );
+        // 主模型与 allowlist 照常写入。
+        assert_eq!(
+            config["agents"]["defaults"]["model"]["primary"],
+            "waliapi/grok-4.7"
+        );
+        assert!(config["agents"]["defaults"]["models"]
+            .get("waliapi/grok-4.7")
+            .is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// OpenClaw 的严格 schema 会把根级的 `_waliapi` 当成非法键直接拒绝启动，
+    /// 所以历史版本写入的标记必须在下次应用时清掉；已应用状态改由
+    /// `models.providers.waliapi` 识别。
+    #[test]
+    fn openclaw_config_drops_legacy_marker_and_detects_provider_block() {
+        let dir = temp_dir("openclaw-legacy");
+        let path = dir.join("openclaw.json");
+        fs::write(&path, br#"{"_waliapi":true,"agents":{"defaults":{}}}"#).unwrap();
+
+        write_openclaw(
+            &dir,
+            "http://127.0.0.1:8777",
+            "[redacted]",
+            "gemini-3.8-flash-medium",
+        )
+        .unwrap();
+
+        let config: serde_json::Value = read_json_file(&path).unwrap();
+        assert!(config.get("_waliapi").is_none(), "遗留标记必须被清除");
+        assert!(detect_applied(&path, "openclaw"));
+
+        // 没有 provider 块（即未由 WaLiAPI 写入）时不得误判为已应用。
+        fs::write(&path, br#"{"agents":{"defaults":{}}}"#).unwrap();
+        assert!(!detect_applied(&path, "openclaw"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn openclaw_invalid_nested_structure_is_rejected_without_mutation() {
+        let dir = temp_dir("openclaw-invalid-structure");
+        let path = dir.join("openclaw.json");
+        let original = br#"{"models":[],"agents":{}}"#;
+        fs::write(&path, original).unwrap();
+        assert!(write_openclaw(&dir, "http://gateway", "key", "m").is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Hermes 的主配置是 `config.yaml`，`custom_providers` 用 `name` 字段；
+    /// 已经存在的 YAML 文本不得被覆盖。
+    #[test]
+    fn hermes_config_merges_yaml_and_backs_up_original() {
+        let dir = temp_dir("hermes");
+        write_hermes(
+            &dir,
+            "http://127.0.0.1:8777",
+            "sk-waliapi-test",
+            "gemini-3.8-flash-medium",
+        )
+        .unwrap();
+
+        let raw = fs::read_to_string(dir.join("config.yaml")).unwrap();
+        let config: serde_json::Value = serde_yaml::from_str(&raw).unwrap();
+        assert_eq!(config["model"]["provider"], "custom:waliapi");
+        assert_eq!(config["model"]["default"], "gemini-3.8-flash-medium");
+        assert_eq!(config["model"]["base_url"], "http://127.0.0.1:8777/v1");
+        assert_eq!(config["custom_providers"][0]["name"], "waliapi");
+        assert!(config["custom_providers"][0].get("id").is_none());
+
+        // 已有 YAML：只改本网关的段，其余配置（含不是本网关写的段）保留，
+        // 且原文件先落一份备份（YAML 重写不保留注释）。
+        let yaml_dir = temp_dir("hermes-merge");
+        let yaml_path = yaml_dir.join("config.yaml");
+        let original = "# 用户注释\nmodel:\n  provider: xai-oauth\n  default: grok-4.6\ntelegram:\n  enabled: true\n";
+        fs::write(&yaml_path, original).unwrap();
+        write_hermes(&yaml_dir, "http://127.0.0.1:8777", "k", "my-model").unwrap();
+        write_hermes(&yaml_dir, "http://127.0.0.1:8777", "k2", "my-model-2").unwrap();
+
+        let merged: serde_json::Value =
+            serde_yaml::from_str(&fs::read_to_string(&yaml_path).unwrap()).unwrap();
+        assert_eq!(merged["model"]["provider"], "custom:waliapi");
+        assert_eq!(merged["model"]["default"], "my-model-2");
+        assert_eq!(merged["telegram"]["enabled"], true, "用户其它配置必须保留");
+        assert_eq!(
+            fs::read_to_string(yaml_dir.join("config.yaml.waliapi-backup")).unwrap(),
+            original,
+            "备份必须是写入前的原文件"
+        );
+
+        // 语法坏的 YAML：报错且不碰原文件。
+        let bad_dir = temp_dir("hermes-bad");
+        let bad_path = bad_dir.join("config.yaml");
+        fs::write(&bad_path, "model: [unclosed\n").unwrap();
+        assert!(write_hermes(&bad_dir, "http://127.0.0.1:8777", "k", "m").is_err());
+        assert_eq!(
+            fs::read_to_string(&bad_path).unwrap(),
+            "model: [unclosed\n",
+            "解析失败时不得改写原文件"
+        );
+
+        let bad_shape_dir = temp_dir("hermes-bad-shape");
+        let bad_shape_path = bad_shape_dir.join("config.yaml");
+        let bad_shape = "custom_providers: {}\nmodel: {}\n";
+        fs::write(&bad_shape_path, bad_shape).unwrap();
+        assert!(write_hermes(&bad_shape_dir, "http://gateway", "k", "m").is_err());
+        assert_eq!(fs::read_to_string(&bad_shape_path).unwrap(), bad_shape);
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&yaml_dir);
+        let _ = fs::remove_dir_all(&bad_dir);
+        let _ = fs::remove_dir_all(&bad_shape_dir);
+    }
+
+    /// Hermes 的「已配置」检测必须能解析 YAML 主配置，并且认 `name` 字段。
+    #[test]
+    fn hermes_detection_parses_yaml_config() {
+        let dir = temp_dir("hermes-detect");
+        write_hermes(&dir, "http://127.0.0.1:8777", "k", "m").unwrap();
+        assert!(detect_applied(&dir.join("config.yaml"), "hermes"));
+
+        let other = temp_dir("hermes-other");
+        fs::write(
+            other.join("config.yaml"),
+            "model:\n  provider: xai-oauth\n  default: grok-4.6\n",
+        )
+        .unwrap();
+        assert!(
+            !detect_applied(&other.join("config.yaml"), "hermes"),
+            "不是 WaLiAPI 写入的 YAML 不应被误认为已配置"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&other);
+    }
 }
