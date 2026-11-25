@@ -154,9 +154,9 @@ pub struct SharedState {
     /// 供 /admin/api/invoke 分发用的 'static State（桌面：真实 handle；headless：mock handle）。
     pub state_static: tauri::State<'static, Arc<AppState>>,
     /// KB/Wiki REST 端点（/api/kb、/api/wiki）的管理员 Bearer token
-    /// （WALIAPI_ADMIN_TOKEN；None = 仅接受已授权 API Key 的 RAG 查询）。
+    /// （LKAPI_ADMIN_TOKEN；None = 仅接受已授权 API Key 的 RAG 查询）。
     pub admin_token: Option<Arc<str>>,
-    /// MCP 端点（/mcp*）的独立 Bearer token（WALIAPI_MCP_TOKEN；None = 仅接受已授权 API Key 的无会话查询）。
+    /// MCP 端点（/mcp*）的独立 Bearer token（LKAPI_MCP_TOKEN；None = 仅接受已授权 API Key 的无会话查询）。
     pub mcp_token: Option<Arc<str>>,
     /// 桌面端真实 AppHandle（文件对话框、自动启动等桌面专属命令）；headless 编译期不存在该字段。
     #[cfg(feature = "desktop-ui")]
@@ -177,7 +177,7 @@ mod tests {
     /// 中的处理器可以真正执行（列表查询、JSON-RPC 分发）。
     pub(super) async fn test_state() -> Arc<AppState> {
         let data_dir =
-            std::env::temp_dir().join(format!("waliapi-router-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("lkapi-router-test-{}", uuid::Uuid::new_v4()));
         let db = Arc::new(crate::db::Database::new_with_path(&data_dir).await);
         let auth_service = Arc::new(crate::auth_provider::service::AuthService::new(
             Arc::new(crate::db::repository::Repository::new(db.pool.clone())),

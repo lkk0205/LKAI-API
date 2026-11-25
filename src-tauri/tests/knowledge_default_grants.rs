@@ -313,7 +313,7 @@ impl Drop for TestDirectory {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_file_database_creations_do_not_miss_default_pairs() {
     let directory = TestDirectory(
-        std::env::temp_dir().join(format!("waliapi-default-grants-{}", uuid::Uuid::new_v4())),
+        std::env::temp_dir().join(format!("lkapi-default-grants-{}", uuid::Uuid::new_v4())),
     );
     std::fs::create_dir_all(&directory.0).unwrap();
     let options = SqliteConnectOptions::new()

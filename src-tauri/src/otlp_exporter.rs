@@ -155,7 +155,7 @@ fn span_from_row(row: &ExportLogRow) -> serde_json::Value {
     serde_json::json!({
         "traceId": trace_id_hex(row),
         "spanId": span_id_hex(row),
-        "name": format!("waliapi {}", row.model),
+        "name": format!("lkapi {}", row.model),
         "kind": 2, // SERVER
         "startTimeUnixNano": start.to_string(),
         "endTimeUnixNano": end.to_string(),
@@ -168,10 +168,10 @@ fn export_payload(rows: &[ExportLogRow]) -> serde_json::Value {
     serde_json::json!({
         "resourceSpans": [{
             "resource": {
-                "attributes": [attribute("service.name", "waliapi")]
+                "attributes": [attribute("service.name", "lkapi")]
             },
             "scopeSpans": [{
-                "scope": {"name": "waliapi.otlp-exporter", "version": "1"},
+                "scope": {"name": "lkapi.otlp-exporter", "version": "1"},
                 "spans": rows.iter().map(span_from_row).collect::<Vec<_>>(),
             }]
         }]
@@ -433,7 +433,7 @@ mod tests {
     async fn export_once_sends_spans_and_advances_cursor() {
         let pool = memory_pool().await;
         let (endpoint, captured) = mock_otlp_endpoint().await;
-        let dir = std::env::temp_dir().join(format!("waliapi-otlp-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("lkapi-otlp-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let settings = test_settings(&dir, &endpoint);
 
@@ -466,7 +466,7 @@ mod tests {
     async fn export_failure_keeps_cursor_for_retry() {
         let pool = memory_pool().await;
         // 端口占一个不存在的地址模拟不可达
-        let dir = std::env::temp_dir().join(format!("waliapi-otlp-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("lkapi-otlp-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let settings = test_settings(&dir, "http://127.0.0.1:9/v1/traces");
 

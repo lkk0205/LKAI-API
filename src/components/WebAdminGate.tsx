@@ -63,7 +63,7 @@ export function WebAdminGate({ children }: { children: ReactNode }) {
             <Server size={23} />
           </span>
           <div>
-            <h1 className="text-2xl font-bold tracking-[-0.03em] text-slate-900">WaLiAPI Web</h1>
+            <h1 className="text-2xl font-bold tracking-[-0.03em] text-slate-900">LKAPI Web</h1>
             <p className="mt-1 text-sm text-slate-500">连接此 Linux 实例的管理后台</p>
           </div>
         </div>
@@ -79,7 +79,7 @@ export function WebAdminGate({ children }: { children: ReactNode }) {
                 autoComplete="current-password"
                 value={token}
                 onChange={(event) => setToken(event.target.value)}
-                placeholder="WALIAPI_ADMIN_TOKEN"
+                placeholder="LKAPI_ADMIN_TOKEN"
                 className="h-12 w-full rounded-2xl border border-slate-200 bg-white pl-11 pr-4 text-sm"
               />
             </span>

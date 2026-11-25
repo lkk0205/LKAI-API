@@ -36,7 +36,7 @@ pub async fn start_server(
         let disabled = service_tokens.disabled_endpoints();
         if !disabled.is_empty() {
             tracing::info!(
-                "[服务端点鉴权] 未配置 WALIAPI_ADMIN_TOKEN / WALIAPI_MCP_TOKEN，\
+                "[服务端点鉴权] 未配置 LKAPI_ADMIN_TOKEN / LKAPI_MCP_TOKEN，\
                  {} 不可用。RAG 查询可在密钥页面授权 API Key，无需环境变量 token。",
                 disabled.join("、")
             );
@@ -74,7 +74,7 @@ pub async fn start_server(
     );
 
     tracing::info!(
-        "WaLiAPI server listening on http://{}:{}",
+        "LKAPI server listening on http://{}:{}",
         host,
         actual_port
     );
@@ -89,7 +89,7 @@ pub async fn start_server(
 }
 
 fn get_server_host(settings: &SettingsStore) -> String {
-    if let Ok(host) = std::env::var("WALIAPI_SERVER_HOST") {
+    if let Ok(host) = std::env::var("LKAPI_SERVER_HOST") {
         let trimmed = host.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
@@ -104,7 +104,7 @@ fn get_server_host(settings: &SettingsStore) -> String {
 }
 
 fn get_server_port(settings: &SettingsStore) -> u16 {
-    if let Ok(port) = std::env::var("WALIAPI_SERVER_PORT") {
+    if let Ok(port) = std::env::var("LKAPI_SERVER_PORT") {
         if let Ok(value) = port.trim().parse::<u16>() {
             if value != 0 {
                 return value;

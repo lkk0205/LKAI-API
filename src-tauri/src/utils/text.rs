@@ -35,7 +35,7 @@ mod tests {
 
     #[test]
     fn preserves_text_within_limit() {
-        assert_eq!(truncate_utf8("WaLiAPI", 7), "WaLiAPI");
-        assert_eq!(truncate_utf8("WaLiAPI", 16), "WaLiAPI");
+        assert_eq!(truncate_utf8("LKAPI", 7), "LKAPI");
+        assert_eq!(truncate_utf8("LKAPI", 16), "LKAPI");
     }
 }

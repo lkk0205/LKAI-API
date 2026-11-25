@@ -169,7 +169,7 @@ export interface ApiKey {
 
 export interface CreateApiKeyInput {
   name: string;
-  /** 可选自定义密钥。留空则自动生成 sk-waliapi-<uuid>。 */
+  /** 可选自定义密钥。留空则自动生成 sk-lkapi-<uuid>。 */
   key?: string;
   allowed_models?: string[];
   allowed_channels?: string[];

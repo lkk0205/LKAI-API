@@ -256,7 +256,7 @@ export function LogsPage() {
   // 默认开启保持既有语义，可关闭（偏好持久化，GAP-06，上游 #28 的跟进）。
   // 有日志行展开时不做静默轮询——新日志会把旧行顶出当前页导致详情
   // 悄然收起；正在阅读的详情优先（GAP-06）。
-  const [autoRefresh, setAutoRefresh] = useState(() => localStorage.getItem("waliapi:logs-auto-refresh") !== "off");
+  const [autoRefresh, setAutoRefresh] = useState(() => localStorage.getItem("lkapi:logs-auto-refresh") !== "off");
   const pageRef = useRef(page);
   pageRef.current = page;
   const expandedIdRef = useRef(expandedId);
@@ -280,7 +280,7 @@ export function LogsPage() {
 
   const toggleAutoRefresh = () => {
     setAutoRefresh(prev => {
-      localStorage.setItem("waliapi:logs-auto-refresh", prev ? "off" : "on");
+      localStorage.setItem("lkapi:logs-auto-refresh", prev ? "off" : "on");
       return !prev;
     });
   };

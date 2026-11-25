@@ -50,7 +50,7 @@ export function downloadTextFile(content: string, filename: string) {
   URL.revokeObjectURL(url);
 }
 
-const ADMIN_TOKEN_KEY = "waliapi_admin_token";
+const ADMIN_TOKEN_KEY = "lkapi_admin_token";
 
 /**
  * Web 管理面板管理接口请求（仅 Web 运行时调用；桌面端不会触发）。

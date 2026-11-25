@@ -27,7 +27,7 @@ bash scripts/fetch-pdfium.sh --dev      # 额外复制到 target/debug/pdfium/�
 `tauri.conf.json` 的 `bundle.resources` 已配置 `resources/pdfium/*`，`pnpm tauri build` 打包后
 库文件随安装包分发，运行时按以下顺序解析：
 
-1. 环境变量 `WALIAPI_PDFIUM_PATH`（指向库文件本体或其所在目录）
+1. 环境变量 `LKAPI_PDFIUM_PATH`（指向库文件本体或其所在目录）
 2. 可执行文件同目录 `pdfium/` 子目录
 3. macOS `.app` 包的 `Contents/Resources/pdfium/`，以及 glob `resources/pdfium/*` 保留前缀后的 `Contents/Resources/resources/pdfium/`（0.2.5 安装包实测落点）
 4. Linux 安装包的 `<prefix>/lib/<binary>/pdfium/`
@@ -37,9 +37,9 @@ bash scripts/fetch-pdfium.sh --dev      # 额外复制到 target/debug/pdfium/�
 
 ## Headless / Docker 部署
 
-官方 Docker 镜像已内置 `libpdfium.so`（`/usr/local/lib/waliapi/pdfium/`，由 `WALIAPI_PDFIUM_PATH` 指向）。
-手工部署 headless 二进制时，把库放到二进制同目录的 `pdfium/` 子目录（如 `/opt/waliapi/pdfium/libpdfium.so`），
-或设置环境变量 `WALIAPI_PDFIUM_PATH=/path/to/libpdfium.so`。
+官方 Docker 镜像已内置 `libpdfium.so`（`/usr/local/lib/lkapi/pdfium/`，由 `LKAPI_PDFIUM_PATH` 指向）。
+手工部署 headless 二进制时，把库放到二进制同目录的 `pdfium/` 子目录（如 `/opt/lkapi/pdfium/libpdfium.so`），
+或设置环境变量 `LKAPI_PDFIUM_PATH=/path/to/libpdfium.so`。
 
 ## 注意
 

@@ -239,7 +239,7 @@ pub async fn test_api_key_knowledge_health(
         .server_running
         .load(std::sync::atomic::Ordering::SeqCst)
     {
-        return Err("请先启动 WaLiAPI 服务".into());
+        return Err("请先启动 LKAPI 服务".into());
     }
     if kb_id.trim().is_empty() || model.trim().is_empty() || question.trim().is_empty() {
         return Err("请选择知识库并填写回答模型和测试问题".into());
@@ -272,7 +272,7 @@ pub async fn test_api_key_knowledge_health(
             if error.is_timeout() {
                 "RAG 检测超时，请检查本机网关日志".to_string()
             } else {
-                "无法连接本机 WaLiAPI 服务".to_string()
+                "无法连接本机 LKAPI 服务".to_string()
             }
         })?;
     let status = response.status().as_u16();
@@ -400,7 +400,7 @@ pub async fn test_api_key_knowledge_access(
         .server_running
         .load(std::sync::atomic::Ordering::SeqCst)
     {
-        return Err("请先启动 WaLiAPI 服务".into());
+        return Err("请先启动 LKAPI 服务".into());
     }
     let key = Repository::new(state.db.pool.clone())
         .get_api_key_by_id(&id)
@@ -423,7 +423,7 @@ pub async fn test_api_key_knowledge_access(
         .bearer_auth(&key.key)
         .send()
         .await
-        .map_err(|_| "无法连接本机 WaLiAPI 服务")?;
+        .map_err(|_| "无法连接本机 LKAPI 服务")?;
     let rest_status = rest.status().as_u16();
     let rest_body = rest.json::<serde_json::Value>().await.unwrap_or_default();
     let mcp = client.post(format!("http://127.0.0.1:{port}/mcp")).bearer_auth(&key.key)

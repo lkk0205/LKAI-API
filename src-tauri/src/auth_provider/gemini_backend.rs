@@ -296,7 +296,7 @@ impl GeminiProvider {
         model: &str,
     ) -> Result<Value, ProviderError> {
         let project = Self::project_id(account)?;
-        let session_id = format!("waliapi-{}", account.id);
+        let session_id = format!("lkapi-{}", account.id);
         let mut request = body.clone();
         if let Some(object) = request.as_object_mut() {
             object
@@ -892,7 +892,7 @@ mod tests {
         assert_eq!(hits[0].1["project"], "proj-1");
         assert_eq!(hits[0].1["model"], "gemini-2.5-flash");
         assert_eq!(hits[0].1["request"]["contents"][0]["role"], "user");
-        assert_eq!(hits[0].1["request"]["session_id"], "waliapi-acc-1");
+        assert_eq!(hits[0].1["request"]["session_id"], "lkapi-acc-1");
         assert!(hits[0].1["user_prompt_id"]
             .as_str()
             .is_some_and(|id| !id.is_empty()));

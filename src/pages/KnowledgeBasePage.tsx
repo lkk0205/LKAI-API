@@ -257,7 +257,7 @@ function McpSection() {
             </div>
           </div>
           <div className="rounded-lg bg-amber-50 border border-amber-100 px-3 py-2 text-xs text-amber-700">
-            RAG 查询使用在“密钥”页授权的 API Key，通过 HTTP POST /mcp 接入。管理工具、Wiki 和旧版 SSE 使用 WALIAPI_MCP_TOKEN；MCP 开关不代表已经授权。
+            RAG 查询使用在“密钥”页授权的 API Key，通过 HTTP POST /mcp 接入。管理工具、Wiki 和旧版 SSE 使用 LKAPI_MCP_TOKEN；MCP 开关不代表已经授权。
           </div>
         </div>
       </div>
@@ -297,7 +297,7 @@ function McpSection() {
           <h3 className="text-sm font-semibold text-slate-900">调用示例</h3>
         </div>
         <pre className="overflow-x-auto rounded-xl bg-slate-50 border border-slate-200 p-4 text-xs"><code className="text-slate-800">{`curl -X POST ${mcpEndpoint} \\
-  -H "Authorization: Bearer $WALIAPI_API_KEY" \\
+  -H "Authorization: Bearer $LKAPI_API_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{
     "jsonrpc": "2.0",
@@ -333,15 +333,15 @@ function SkillsSection() {
           </div>
           <div className="flex-1">
             <div className="flex items-center gap-3">
-              <h3 className="text-base font-semibold text-slate-900">WaLiAPI Skills</h3>
+              <h3 className="text-base font-semibold text-slate-900">LKAPI Skills</h3>
               <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-600 border border-emerald-100">v2.0.0</span>
             </div>
             <p className="mt-1 text-sm leading-relaxed text-slate-600">
-              即装即用的 Agent Skill 技能包，通过 MCP 协议连接 WaLiAPI 本地知识服务。安装后 AI Agent 可直接执行 RAG 语义搜索、RAG 问答、文档管理、Wiki 搜索与问答、知识图谱等操作，无需手写提示词。
+              即装即用的 Agent Skill 技能包，通过 MCP 协议连接 LKAPI 本地知识服务。安装后 AI Agent 可直接执行 RAG 语义搜索、RAG 问答、文档管理、Wiki 搜索与问答、知识图谱等操作，无需手写提示词。
             </p>
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <a
-                href="https://github.com/fuzhengwei/waliapi-skills"
+                href="https://github.com/fuzhengwei/lkapi-skills"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center gap-1.5 rounded-lg bg-slate-800 px-4 py-2 text-xs font-medium text-white transition-all hover:bg-slate-700"
@@ -351,7 +351,7 @@ function SkillsSection() {
                 <ExternalLink size={11} className="text-slate-300" />
               </a>
               <a
-                href="https://github.com/fuzhengwei/waliapi-skills#readme"
+                href="https://github.com/fuzhengwei/lkapi-skills#readme"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-4 py-2 text-xs font-medium text-slate-600 transition-all hover:border-slate-300 hover:bg-slate-50"
@@ -378,8 +378,8 @@ function SkillsSection() {
               <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">1</span>
               <div className="min-w-0 flex-1">
                 <p className="text-xs font-medium text-slate-700">下载技能包</p>
-                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">从 GitHub 仓库克隆技能包到本地。克隆完成后，技能包会自动安装到 <code className="rounded bg-slate-200 px-1 py-0.5 text-[10px] font-mono text-slate-700">waliapi-skills</code> 目录。</p>
-                <pre className="mt-2 overflow-x-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800">git clone https://github.com/fuzhengwei/waliapi-skills.git</pre>
+                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">从 GitHub 仓库克隆技能包到本地。克隆完成后，技能包会自动安装到 <code className="rounded bg-slate-200 px-1 py-0.5 text-[10px] font-mono text-slate-700">lkapi-skills</code> 目录。</p>
+                <pre className="mt-2 overflow-x-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800">git clone https://github.com/fuzhengwei/lkapi-skills.git</pre>
                 <p className="mt-2 text-[11px] leading-relaxed text-slate-500">安装完成后，在 Agent 客户端（如 WaLiCode、Codex、Claude Code）中即可直接使用以下能力：</p>
                 <div className="mt-1.5 space-y-1">
                   <p className="text-[11px] text-slate-600">🔍 <span className="font-medium text-slate-700">RAG 语义搜索</span> — 向量+关键词混合检索，支持 hybrid/vector/keyword 三种模式</p>
@@ -421,7 +421,7 @@ function SkillsSection() {
                 <MessageCircle size={14} className="text-emerald-500" />
                 <p className="text-xs font-semibold text-slate-800">RAG 问答</p>
               </div>
-              <p className="mt-1 text-[11px] text-slate-500">「问一下 RAG，WaLiAPI 支持哪些协议？」</p>
+              <p className="mt-1 text-[11px] text-slate-500">「问一下 RAG，LKAPI 支持哪些协议？」</p>
               <p className="mt-0.5 text-[11px] text-slate-400">调用 ask_knowledge_base，检索 + LLM 生成回答 + 来源引用</p>
             </div>
             <div className="rounded-lg border border-slate-100 bg-gradient-to-br from-white to-slate-50 px-3 py-2.5">
@@ -529,7 +529,7 @@ function SkillsSection() {
           </div>
           <div className="rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
             <p className="text-[11px] font-medium text-slate-400">验证 RAG 问答</p>
-            <code className="text-xs text-slate-700">问一下 RAG，WaLiAPI 支持哪些协议？</code>
+            <code className="text-xs text-slate-700">问一下 RAG，LKAPI 支持哪些协议？</code>
           </div>
         </div>
       </div>
@@ -2963,12 +2963,12 @@ function McpTab({ kb }: { kb: KnowledgeBase }) {
           <h3 className="text-sm font-semibold text-slate-900">调用示例</h3>
         </div>
 
-        <p className="mb-3 text-xs text-slate-500">将已授权的 API Key 设置为环境变量 WALIAPI_API_KEY，再执行以下命令。</p>
+        <p className="mb-3 text-xs text-slate-500">将已授权的 API Key 设置为环境变量 LKAPI_API_KEY，再执行以下命令。</p>
         <div className="space-y-3">
           <div>
             <label className="mb-1 block text-xs font-medium text-slate-500">1. 列出可用 RAG</label>
             <pre className="overflow-x-auto rounded-xl bg-slate-50 border border-slate-200 p-3 text-[11px]"><code className="text-slate-800">{`curl -X POST ${mcpEndpoint} \\
-  -H "Authorization: Bearer $WALIAPI_API_KEY" \\
+  -H "Authorization: Bearer $LKAPI_API_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{
     "jsonrpc": "2.0",
@@ -2984,7 +2984,7 @@ function McpTab({ kb }: { kb: KnowledgeBase }) {
           <div>
             <label className="mb-1 block text-xs font-medium text-slate-500">2. 语义检索</label>
             <pre className="overflow-x-auto rounded-xl bg-slate-50 border border-slate-200 p-3 text-[11px]"><code className="text-slate-800">{`curl -X POST ${mcpEndpoint} \\
-  -H "Authorization: Bearer $WALIAPI_API_KEY" \\
+  -H "Authorization: Bearer $LKAPI_API_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{
     "jsonrpc": "2.0",
@@ -3004,7 +3004,7 @@ function McpTab({ kb }: { kb: KnowledgeBase }) {
           <div>
             <label className="mb-1 block text-xs font-medium text-slate-500">3. RAG 问答</label>
             <pre className="overflow-x-auto rounded-xl bg-slate-50 border border-slate-200 p-3 text-[11px]"><code className="text-slate-800">{`curl -X POST ${mcpEndpoint} \\
-  -H "Authorization: Bearer $WALIAPI_API_KEY" \\
+  -H "Authorization: Bearer $LKAPI_API_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{
     "jsonrpc": "2.0",
@@ -3023,7 +3023,7 @@ function McpTab({ kb }: { kb: KnowledgeBase }) {
         </div>
 
         <div className="mt-3 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-xs text-slate-500">
-          API Key 使用无会话 HTTP POST /mcp，仅开放上方查询工具。旧版 SSE 和管理工具仍使用 WALIAPI_MCP_TOKEN。
+          API Key 使用无会话 HTTP POST /mcp，仅开放上方查询工具。旧版 SSE 和管理工具仍使用 LKAPI_MCP_TOKEN。
         </div>
       </div>
     </div>

@@ -2203,7 +2203,7 @@ async fn legacy_proxy_estimates_quota_when_upstream_omits_usage() {
     insert_channel(&pool, &ch).await;
 
     let settings = crate::settings_store::SettingsStore::file(std::env::temp_dir().join(format!(
-        "waliapi-proxy-quota-test-{}.json",
+        "lkapi-proxy-quota-test-{}.json",
         uuid::Uuid::new_v4()
     )));
     let repo = Arc::new(Repository::new(pool.clone()));

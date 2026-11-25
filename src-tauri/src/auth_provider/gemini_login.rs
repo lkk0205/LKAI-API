@@ -34,10 +34,10 @@ use super::{ProviderError, ProviderPayload, RefreshedPayload};
 // 用户点击登录即可进入浏览器授权，不要求启动前手动配置客户端变量。
 pub const ANTIGRAVITY_CLIENT_ID: &str =
     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-pub const ANTIGRAVITY_CLIENT_ID_ENV: &str = "WALIAPI_ANTIGRAVITY_CLIENT_ID";
+pub const ANTIGRAVITY_CLIENT_ID_ENV: &str = "LKAPI_ANTIGRAVITY_CLIENT_ID";
 // 这是公开桌面端 OAuth client 的 client material，不是用户个人凭据；环境变量可覆盖。
 pub const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
-pub const ANTIGRAVITY_CLIENT_SECRET_ENV: &str = "WALIAPI_ANTIGRAVITY_CLIENT_SECRET";
+pub const ANTIGRAVITY_CLIENT_SECRET_ENV: &str = "LKAPI_ANTIGRAVITY_CLIENT_SECRET";
 pub const GOOGLE_OAUTH_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 pub const ANTIGRAVITY_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -496,17 +496,17 @@ async fn oauth_callback(
         (Some(_), _) => (
             Err(ProviderError::AuthorizationDenied),
             StatusCode::BAD_REQUEST,
-            "Antigravity authorization was denied. Return to WaLiAPI for details.",
+            "Antigravity authorization was denied. Return to LKAPI for details.",
         ),
         (None, Some(code)) if !code.is_empty() => (
             Ok(code),
             StatusCode::OK,
-            "Antigravity authorization received. WaLiAPI is completing sign-in; return to the app.",
+            "Antigravity authorization received. LKAPI is completing sign-in; return to the app.",
         ),
         _ => (
             Err(ProviderError::CallbackFailed),
             StatusCode::BAD_REQUEST,
-            "Antigravity authorization callback is incomplete. Return to WaLiAPI and retry.",
+            "Antigravity authorization callback is incomplete. Return to LKAPI and retry.",
         ),
     };
     if let Some(sender) = callback.sender.lock().await.take() {

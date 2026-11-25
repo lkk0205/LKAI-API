@@ -33,7 +33,7 @@ const RESET_CONSUME_PATH: &str = "wham/rate-limit-reset-credits/consume";
 // GPT-5.6，0.156.1 起包含 GPT-6 系列。PR #148 起该值不再写死，默认
 // `CODEX_DEFAULT_CLIENT_VERSION`，并按 `CODEX_VERSION_REFRESH_INTERVAL`
 // 定期从 npm registry 拉取最新 Codex CLI 版本（可用
-// WALIAPI_CODEX_CLIENT_VERSION 环境变量覆盖）。
+// LKAPI_CODEX_CLIENT_VERSION 环境变量覆盖）。
 const CODEX_DEFAULT_CLIENT_VERSION: &str = "0.162.0";
 const CODEX_VERSION_METADATA_URL: &str = "https://registry.npmjs.org/@openai%2fcodex/latest";
 const CODEX_VERSION_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(6 * 60 * 60);
@@ -87,7 +87,7 @@ impl Default for CodexProvider {
 
 impl CodexProvider {
     pub fn new() -> Self {
-        let version = std::env::var("WALIAPI_CODEX_CLIENT_VERSION")
+        let version = std::env::var("LKAPI_CODEX_CLIENT_VERSION")
             .ok()
             .and_then(|value| normalize_client_version(&value))
             .unwrap_or_else(|| CODEX_DEFAULT_CLIENT_VERSION.to_owned());
@@ -106,7 +106,7 @@ impl CodexProvider {
 
     #[cfg(test)]
     fn with_endpoints(backend_base: String, login: CodexLogin) -> Self {
-        let version = std::env::var("WALIAPI_CODEX_CLIENT_VERSION")
+        let version = std::env::var("LKAPI_CODEX_CLIENT_VERSION")
             .ok()
             .and_then(|value| normalize_client_version(&value))
             .unwrap_or_else(|| CODEX_DEFAULT_CLIENT_VERSION.to_owned());
@@ -148,7 +148,7 @@ impl CodexProvider {
     }
 
     async fn refresh_client_version(&self) -> String {
-        if let Some(version) = std::env::var("WALIAPI_CODEX_CLIENT_VERSION")
+        if let Some(version) = std::env::var("LKAPI_CODEX_CLIENT_VERSION")
             .ok()
             .and_then(|value| normalize_client_version(&value))
         {

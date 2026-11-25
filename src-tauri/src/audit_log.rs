@@ -391,7 +391,7 @@ mod tests {
     fn policy_from_settings_selects_each_level() {
         // 打通「持久化设置 → 落库策略」这条接线：单测 parse 不足以证明
         // 用户在设置页选「简要」后真的会生效。
-        let dir = std::env::temp_dir().join(format!("waliapi-logpolicy-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("lkapi-logpolicy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = SettingsStore::file(dir.join("settings.json"));
         for (value, expect) in [

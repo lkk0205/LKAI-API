@@ -95,7 +95,7 @@ export function ChannelsPage() {
     try {
       const content = await importExportApi.exportChannels();
       const timestamp = new Date().toISOString().slice(0, 10);
-      const filename = `waliapi-export-${timestamp}.json`;
+      const filename = `lkapi-export-${timestamp}.json`;
       if (isWebRuntime()) {
         downloadTextFile(content, filename);
       } else {
@@ -357,7 +357,7 @@ export function ChannelsPage() {
                   <Upload size={16} className="text-muted-foreground" />
                   <div className="text-left">
                     <div>导入渠道</div>
-                    <div className="text-xs text-muted-foreground">WaLiAPI 导出 / 扫描本地 / WaLiCode 备份</div>
+                    <div className="text-xs text-muted-foreground">LKAPI 导出 / 扫描本地 / WaLiCode 备份</div>
                   </div>
                 </button>
               </div>

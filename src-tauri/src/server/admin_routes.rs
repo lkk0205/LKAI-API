@@ -4,7 +4,7 @@
 //! - `/invoke`：与 Tauri invoke 语义 1:1 对应的单一入口，按 cmd 名分发到 commands 函数
 //! - `/events`：SSE 事件桥，事件名与桌面端 `app.emit` 一致
 //!
-//! 除 `/auth/login` 外全部要求管理员会话（Bearer token 或 `waliapi_admin_token` Cookie）。
+//! 除 `/auth/login` 外全部要求管理员会话（Bearer token 或 `lkapi_admin_token` Cookie）。
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -32,7 +32,7 @@ use super::router::SharedState;
 use crate::commands;
 use crate::AppState;
 
-const SESSION_COOKIE: &str = "waliapi_admin_token";
+const SESSION_COOKIE: &str = "lkapi_admin_token";
 const SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 
 /// 认证通过后注入 request extensions 的身份信息。
@@ -267,7 +267,7 @@ async fn logout(
     let mut response = Json(json!({ "ok": true })).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_static("waliapi_admin_token=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly"),
+        HeaderValue::from_static("lkapi_admin_token=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly"),
     );
     response
 }
@@ -766,8 +766,8 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         "import_walicode_backup" => to_json(
             commands::import_export::import_walicode_backup(arg(&args, "content")?, state).await,
         ),
-        "import_waliapi_export" => to_json(
-            commands::import_export::import_waliapi_export(arg(&args, "content")?, state).await,
+        "import_lkapi_export" => to_json(
+            commands::import_export::import_lkapi_export(arg(&args, "content")?, state).await,
         ),
         "scan_local_ai_configs" => to_json(commands::import_export::scan_local_ai_configs().await),
         "import_scanned_sources" => to_json(

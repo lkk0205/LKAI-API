@@ -27,7 +27,7 @@ use std::path::PathBuf;
 // ─── Export types ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct WaliapiExport {
+pub struct LkapiExport {
     pub version: String,
     pub exported_at: String,
     pub r#type: String,
@@ -204,7 +204,7 @@ pub struct ImportResult {
 
 // ─── Commands ───────────────────────────────────────────────────────────────
 
-/// Export all channels as a waliapi v2 JSON backup.
+/// Export all channels as a lkapi v2 JSON backup.
 ///
 /// v2 carries BOTH the new protocol identity AND the legacy compat fields
 /// (design 5.2).  The API key is included in plaintext by design — this is the
@@ -221,12 +221,12 @@ pub async fn export_channels_impl(state: &std::sync::Arc<AppState>) -> Result<St
     let repo = Repository::new(state.db.pool.clone());
     let channels = repo.get_all_channels().await.map_err(|e| e.to_string())?;
 
-    let export = WaliapiExport {
+    let export = LkapiExport {
         version: "2.0".to_string(),
         exported_at: chrono::Utc::now()
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string(),
-        r#type: "waliapi-export".to_string(),
+        r#type: "lkapi-export".to_string(),
         channels: channels.into_iter().map(ExportedChannel::from).collect(),
     };
 
@@ -364,7 +364,7 @@ pub async fn import_walicode_backup_impl(
     })
 }
 
-/// Import channels from a waliapi export JSON file (v1 or v2).
+/// Import channels from a lkapi export JSON file (v1 or v2).
 ///
 /// * v1 → routed through the unified `resolve_channel_identity` (never the old
 ///   URL-guessing inference) and written with identity_revision 0.
@@ -374,19 +374,19 @@ pub async fn import_walicode_backup_impl(
 /// * `status`/`timeout_secs` (and every other business field) are preserved
 ///   verbatim via `Repository::import_channel` (round-trip contract 11.4).
 #[tauri::command]
-pub async fn import_waliapi_export(
+pub async fn import_lkapi_export(
     content: String,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<ImportResult, String> {
-    import_waliapi_export_impl(&content, state.inner()).await
+    import_lkapi_export_impl(&content, state.inner()).await
 }
 
-pub async fn import_waliapi_export_impl(
+pub async fn import_lkapi_export_impl(
     content: &str,
     state: &std::sync::Arc<AppState>,
 ) -> Result<ImportResult, String> {
-    let export: WaliapiExport =
-        serde_json::from_str(&content).map_err(|e| format!("解析 waliapi 导出文件失败: {}", e))?;
+    let export: LkapiExport =
+        serde_json::from_str(&content).map_err(|e| format!("解析 lkapi 导出文件失败: {}", e))?;
 
     let repo = Repository::new(state.db.pool.clone());
     let existing = repo.get_all_channels().await.map_err(|e| e.to_string())?;
@@ -419,7 +419,7 @@ pub async fn import_waliapi_export_impl(
 
 /// Convert one exported channel (v1 or v2) into an import-write input,
 /// applying the identity validation/degradation rules described on
-/// [`import_waliapi_export`].
+/// [`import_lkapi_export`].
 pub fn exported_channel_to_import(ch: &ExportedChannel) -> ImportChannelInput {
     let config = ch
         .config
@@ -574,7 +574,7 @@ fn is_known_endpoint(s: &str) -> bool {
 /// Scan local AI CLI tool configs (Claude Code, Codex, Cursor, etc.)
 #[tauri::command]
 pub async fn scan_local_ai_configs() -> Result<ScanResult, String> {
-    let home = std::env::var("WALIAPI_TARGET_HOME")
+    let home = std::env::var("LKAPI_TARGET_HOME")
         .ok()
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
@@ -946,7 +946,7 @@ pub async fn save_export_file(
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Legacy URL/hint -> old `type` mapping.  Used ONLY for the walicode backup
-/// and local-scan paths (which do not carry a waliapi v1/v2 identity).  Waliapi
+/// and local-scan paths (which do not carry a lkapi v1/v2 identity).  Lkapi
 /// v1 import goes through `resolve_channel_identity`, NOT this function.
 fn guess_channel_type(base_url: &str, api_format: Option<&str>) -> String {
     let url = base_url.to_lowercase();
@@ -1412,10 +1412,10 @@ mod tests {
 
         let v2 = v2_channel_fixture();
         let v1 = v1_channel_fixture();
-        let export = WaliapiExport {
+        let export = LkapiExport {
             version: "2.0".to_string(),
             exported_at: "2026-08-05T00:00:00.000Z".to_string(),
-            r#type: "waliapi-export".to_string(),
+            r#type: "lkapi-export".to_string(),
             channels: vec![
                 ExportedChannel::from(v2.clone()),
                 ExportedChannel::from(v1.clone()),
@@ -1424,7 +1424,7 @@ mod tests {
         let file = serde_json::to_string_pretty(&export).unwrap();
 
         // Parse as an incoming import (both v1 and v2 channels in one file).
-        let parsed: WaliapiExport = serde_json::from_str(&file).unwrap();
+        let parsed: LkapiExport = serde_json::from_str(&file).unwrap();
         assert_eq!(parsed.version, "2.0");
         let first = exported_channel_to_import(&parsed.channels[0]);
         let second = exported_channel_to_import(&parsed.channels[1]);

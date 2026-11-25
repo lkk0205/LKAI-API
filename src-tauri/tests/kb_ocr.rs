@@ -368,7 +368,7 @@ async fn migration_025_kb_ocr_columns_roundtrip() {
 
 #[test]
 fn ocr_settings_default_off_and_roundtrip() {
-    let dir = std::env::temp_dir().join(format!("waliapi_ocr_settings_{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("lkapi_ocr_settings_{}", uuid::Uuid::new_v4()));
     let store = SettingsStore::file(dir.join("settings.json"));
 
     // 默认关闭：未写入任何配置时 ocr.enabled = false

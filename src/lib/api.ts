@@ -262,7 +262,7 @@ export interface ScanResult {
 export const importExportApi = {
   exportChannels: () => invoke<string>("export_channels"),
   importWalicodeBackup: (content: string) => invoke<ImportResult>("import_walicode_backup", { content }),
-  importWaliapiExport: (content: string) => invoke<ImportResult>("import_waliapi_export", { content }),
+  importLkapiExport: (content: string) => invoke<ImportResult>("import_lkapi_export", { content }),
   scanLocalAiConfigs: () => invoke<ScanResult>("scan_local_ai_configs"),
   importScannedSources: (sources: ScannedSource[]) => invoke<ImportResult>("import_scanned_sources", { sources }),
   pickImportFile: () => invoke<string | null>("pick_import_file"),

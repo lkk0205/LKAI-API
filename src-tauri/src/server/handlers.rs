@@ -4928,7 +4928,7 @@ mod list_models_tests {
         ApiKey {
             id: "key-1".to_string(),
             name: "key-1".to_string(),
-            key: "sk-waliapi-test".to_string(),
+            key: "sk-lkapi-test".to_string(),
             status: 1,
             allowed_models: serde_json::to_string(allowed_models).unwrap(),
             allowed_channels: serde_json::to_string(allowed_channels).unwrap(),

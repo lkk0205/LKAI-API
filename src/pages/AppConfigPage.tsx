@@ -61,8 +61,8 @@ export function AppConfigPanel({ appName }: { appName: string }) {
   const [loading, setLoading] = useState(true);
 
   // Storage key for persisting model selection per app
-  const modelStorageKey = `waliapi:codex-model:${appName}`;
-  const keyStorageKey = `waliapi:codex-key:${appName}`;
+  const modelStorageKey = `lkapi:codex-model:${appName}`;
+  const keyStorageKey = `lkapi:codex-key:${appName}`;
   const [applying, setApplying] = useState(false);
   const [appliedResult, setAppliedResult] = useState<{ success: boolean; message: string; authWarning?: string | null } | null>(null);
   const [resultKind, setResultKind] = useState<"apply" | "clear" | "reset">("apply");

@@ -72,8 +72,8 @@ export function UsagePage() {
   const [usageTab, setUsageTab] = useState<UsageTab>("api");
 
   // Persist model & key selection across sessions
-  const modelStorageKey = "waliapi:usage-model";
-  const keyStorageKey = "waliapi:usage-key";
+  const modelStorageKey = "lkapi:usage-model";
+  const keyStorageKey = "lkapi:usage-key";
 
   useEffect(() => {
     Promise.all([
@@ -158,7 +158,7 @@ export function UsagePage() {
       setKeyValueLoading(false);
     }
   };
-  const keyForSamples = keyValue || "sk-waliapi-****";
+  const keyForSamples = keyValue || "sk-lkapi-****";
 
   // Three categories: API channel models, Auth account models, mapping aliases (unified).
   // Filtered by the selected API key's allowed/denied lists.

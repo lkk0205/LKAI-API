@@ -107,7 +107,7 @@ export function AuthChannelsPage() {
   const [quotaPendingIds, setQuotaPendingIds] = useState<Set<string>>(new Set());
   const [batchQuotaRefreshing, setBatchQuotaRefreshing] = useState(false);
   const [viewMode, setViewMode] = useState<"list" | "card">(() => {
-    try { return localStorage.getItem("waliapi:auth-channel-view") === "card" ? "card" : "list"; } catch { return "list"; }
+    try { return localStorage.getItem("lkapi:auth-channel-view") === "card" ? "card" : "list"; } catch { return "list"; }
   });
   const [showLogin, setShowLogin] = useState(false);
   const [reloginAccount, setReloginAccount] = useState<AuthAccount | null>(null);
@@ -221,7 +221,7 @@ export function AuthChannelsPage() {
 
   const setAuthViewMode = (mode: "list" | "card") => {
     setViewMode(mode);
-    try { localStorage.setItem("waliapi:auth-channel-view", mode); } catch {}
+    try { localStorage.setItem("lkapi:auth-channel-view", mode); } catch {}
   };
 
   const actionFor = (account: AuthAccount) => ({
