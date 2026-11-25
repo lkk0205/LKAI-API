@@ -31,7 +31,7 @@ const navItems = [
   { to: "/settings", icon: Settings, label: "设置" },
 ];
 
-const githubUrl = "https://github.com/fuzhengwei/LKAPI";
+const githubUrl = "https://github.com/lkk0205/LKAI-API";
 const appVersion = packageJson.version;
 
 /** Web 管理面板：清除会话并回到登录页（桌面端不渲染入口）。 */
@@ -171,7 +171,7 @@ export function Sidebar({
           </span>
           <span className="min-w-0 flex-1">
             <span className="block font-medium">GitHub 开源仓库</span>
-            <span className="block truncate text-xs text-slate-500">github.com/fuzhengwei/LKAPI</span>
+            <span className="block truncate text-xs text-slate-500">github.com/lkk0205/LKAI-API</span>
           </span>
           <ExternalLink size={14} className="text-slate-400" />
         </button>

@@ -341,7 +341,7 @@ function SkillsSection() {
             </p>
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <a
-                href="https://github.com/fuzhengwei/lkapi-skills"
+                href="https://github.com/lkk0205/LKAPI-skills"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center gap-1.5 rounded-lg bg-slate-800 px-4 py-2 text-xs font-medium text-white transition-all hover:bg-slate-700"
@@ -351,7 +351,7 @@ function SkillsSection() {
                 <ExternalLink size={11} className="text-slate-300" />
               </a>
               <a
-                href="https://github.com/fuzhengwei/lkapi-skills#readme"
+                href="https://github.com/lkk0205/LKAPI-skills#readme"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-4 py-2 text-xs font-medium text-slate-600 transition-all hover:border-slate-300 hover:bg-slate-50"
@@ -378,8 +378,8 @@ function SkillsSection() {
               <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">1</span>
               <div className="min-w-0 flex-1">
                 <p className="text-xs font-medium text-slate-700">下载技能包</p>
-                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">从 GitHub 仓库克隆技能包到本地。克隆完成后，技能包会自动安装到 <code className="rounded bg-slate-200 px-1 py-0.5 text-[10px] font-mono text-slate-700">lkapi-skills</code> 目录。</p>
-                <pre className="mt-2 overflow-x-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800">git clone https://github.com/fuzhengwei/lkapi-skills.git</pre>
+                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">从 GitHub 仓库克隆技能包到本地。克隆完成后，技能包会自动安装到 <code className="rounded bg-slate-200 px-1 py-0.5 text-[10px] font-mono text-slate-700">LKAPI-skills</code> 目录。</p>
+                <pre className="mt-2 overflow-x-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800">git clone https://github.com/lkk0205/LKAPI-skills.git</pre>
                 <p className="mt-2 text-[11px] leading-relaxed text-slate-500">安装完成后，在 Agent 客户端（如 WaLiCode、Codex、Claude Code）中即可直接使用以下能力：</p>
                 <div className="mt-1.5 space-y-1">
                   <p className="text-[11px] text-slate-600">🔍 <span className="font-medium text-slate-700">RAG 语义搜索</span> — 向量+关键词混合检索，支持 hybrid/vector/keyword 三种模式</p>
