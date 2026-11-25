@@ -5,7 +5,7 @@ use sqlx::{
     SqlitePool,
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
-use waliapi_lib::{
+use lkapi_lib::{
     db::{models::CreateApiKeyInput, repository::Repository},
     server::knowledge_access::{get_grants, set_grants},
     services::knowledge::{

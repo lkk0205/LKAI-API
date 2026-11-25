@@ -1,6 +1,6 @@
 //! 真实迁移、检索投影与原文窗口回归；不访问网络或个人知识库。
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
-use waliapi_lib::services::knowledge::{repository::KbRepository, retriever, text};
+use lkapi_lib::services::knowledge::{repository::KbRepository, retriever, text};
 
 async fn fixture() -> SqlitePool {
     let pool = SqlitePoolOptions::new()

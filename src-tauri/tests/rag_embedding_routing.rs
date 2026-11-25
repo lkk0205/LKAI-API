@@ -4,7 +4,7 @@ use rand::SeedableRng;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use waliapi_lib::{
+use lkapi_lib::{
     core::{
         feature_flags::FeatureFlags,
         route_plan::{authorize_and_plan, EndpointKind, PlanError},

@@ -3,8 +3,8 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     Acquire, SqlitePool,
 };
-use waliapi_lib::server::event_bridge::EventSink;
-use waliapi_lib::services::knowledge::{
+use lkapi_lib::server::event_bridge::EventSink;
+use lkapi_lib::services::knowledge::{
     repository::{ChunkInsert, KbRepository},
     retriever,
 };

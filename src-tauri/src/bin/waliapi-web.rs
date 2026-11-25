@@ -8,7 +8,7 @@
 //! 环境变量：WALIAPI_SERVER_HOST / WALIAPI_SERVER_PORT / WALIAPI_DATA_DIR / XDG_DATA_HOME
 
 use tracing_subscriber::prelude::*;
-use waliapi_lib::web_server::{resolve_data_dir, run, WebServerConfig};
+use lkapi_lib::web_server::{resolve_data_dir, run, WebServerConfig};
 
 fn print_usage() {
     println!(
@@ -60,7 +60,7 @@ async fn run_repair_cli(
             .and_then(|i| rest.get(i + 1).cloned()),
     );
     println!("数据目录: {}", data_dir.display());
-    let db = waliapi_lib::db::Database::new_with_path(&data_dir).await;
+    let db = lkapi_lib::db::Database::new_with_path(&data_dir).await;
     let pool = db.pool.clone();
 
     let mut total_scanned = 0i64;
@@ -70,9 +70,9 @@ async fn run_repair_cli(
     let mut total_completion = 0i64;
     let mut rounds = 0i64;
     loop {
-        let report = waliapi_lib::commands::log_repair::repair_pool(
+        let report = lkapi_lib::commands::log_repair::repair_pool(
             &pool,
-            waliapi_lib::commands::log_repair::RepairInput {
+            lkapi_lib::commands::log_repair::RepairInput {
                 apply: Some(apply),
                 limit: Some(limit),
                 reclassify: Some(reclassify),
