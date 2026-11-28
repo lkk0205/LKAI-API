@@ -1,7 +1,7 @@
 use crate::db::repository::Repository;
 use crate::server::knowledge_access::{self, KnowledgeAccess};
 use crate::server::router::SharedState;
-use crate::services::knowledge::{embedder, rag, repository::KbRepository, retriever};
+use crate::services::knowledge::{rag, repository::KbRepository};
 use crate::services::wiki::{
     handlers as wiki_handlers, ingest as wiki_ingest, project as wiki_project,
     repository::WikiRepository,
@@ -9,7 +9,7 @@ use crate::services::wiki::{
 use axum::{
     body::Body,
     extract::{Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     Extension,
 };
@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, RwLock};
 const MCP_INSTRUCTIONS: &str = r#"# LKAPI RAG — 本地向量检索
 
 RAG 已预建索引：文档已解析、分块、向量化并存入本地 SQLite + HNSW 索引。
-所有检索都是本地操作，亚秒级响应。
+资料检索在本地执行，查询向量可能调用已配置的模型；实际耗时取决于渠道与索引状态。
 
 ## 工具使用优先级
 
@@ -540,6 +540,18 @@ pub(crate) fn get_tools() -> Vec<serde_json::Value> {
             }
         }),
     ]
+    .into_iter().map(|mut tool| {
+        if matches!(tool["name"].as_str(), Some("search_knowledge_base" | "ask_knowledge_base")) {
+            let props = tool["inputSchema"]["properties"].as_object_mut().expect("tool properties");
+            props.insert("timeout_ms".into(), serde_json::json!({"type":"integer", "description":"整次请求共用可选预算，100 至 120000 毫秒；省略保持历史超时。"}));
+            props.insert("allow_keyword_fallback".into(), serde_json::json!({"type":"boolean","default":false,"description":"hybrid 可恢复向量分支失败时允许关键词降级，不绕过权限或整体截止。"}));
+            props.insert("allow_vector_fallback".into(), serde_json::json!({"type":"boolean","default":false,"description":"hybrid 可恢复关键词分支失败时允许向量降级，不绕过权限或整体截止。"}));
+            props.insert("strict_retrieval".into(), serde_json::json!({"type":"boolean","default":false,"description":"禁用历史本地检索部分成功；失败时仅允许显式授权的降级方向。"}));
+            props.insert("candidate_k".into(), serde_json::json!({"type":"integer","description":"候选数，top_k 至 100；省略保持默认。"}));
+            props.insert("diagnostics".into(), serde_json::json!({"type":"boolean","default":false,"description":"仅普通 API Key 可启用真实权限及阶段诊断。"}));
+        }
+        tool
+    }).collect()
 }
 
 // ── Core JSON-RPC dispatch ────────────────────────────────────────
@@ -552,10 +564,25 @@ const QUERY_TOOLS: &[&str] = &[
     "get_knowledge_base_stats",
 ];
 
+// Wiki 只读查询工具：API Key（scoped 模式）可用的子集，与 RAG 只读口径一致，
+// 不含任何写入/删除/摄入工具。是否可用由 api_key_wiki_access 授权 + 项目 mcp_enabled 决定。
+const WIKI_QUERY_TOOLS: &[&str] = &[
+    "list_wiki_projects",
+    "get_wiki_project",
+    "list_wiki_pages",
+    "get_wiki_page",
+    "search_wiki",
+    "ask_wiki",
+    "get_wiki_tags",
+    "get_wiki_graph",
+    "list_wiki_sources",
+];
+
 async fn dispatch_scoped(
     shared: &SharedState,
     access: &KnowledgeAccess,
     req: &McpRequest,
+    host: Option<&str>,
 ) -> McpResponse {
     if req.jsonrpc != "2.0" {
         return McpResponse::error(req.id.clone(), -32600, "Expected JSON-RPC 2.0".into());
@@ -572,17 +599,38 @@ async fn dispatch_scoped(
         "tools/list" => {
             let tools: Vec<_> = get_tools()
                 .into_iter()
-                .filter(|tool| QUERY_TOOLS.contains(&tool["name"].as_str().unwrap_or("")))
+                .filter(|tool| {
+                    let name = tool["name"].as_str().unwrap_or("");
+                    if QUERY_TOOLS.contains(&name) {
+                        // 无 RAG 授权时不暴露 KB 工具（纯 Wiki 的 Key 列表保持干净）。
+                        return !access.kb_ids.is_empty();
+                    }
+                    WIKI_QUERY_TOOLS.contains(&name) && !access.wiki_project_ids.is_empty()
+                })
                 .map(|mut tool| {
                     let name = tool["name"].as_str().unwrap_or("").to_string();
-                    tool["description"] = serde_json::json!(match name.as_str() {
-                        "list_knowledge_bases" => "列出已授权且开启 MCP 的 RAG。",
-                        "search_knowledge_base" => "检索指定知识库，支持向量、关键词和混合检索。",
-                        "ask_knowledge_base" => "使用已授权的模型回答问题，返回答案与来源。",
-                        "read_document" => "按切片顺序读取指定文档的已摄入正文。",
-                        _ => "获取指定知识库的文档、切片和 Token 统计。",
-                    });
-                    if name != "list_knowledge_bases" {
+                    // 方案 A：把服务端真实地址注入 ask_wiki 描述，让 LLM 在调用前就知道
+                    // ip:port，回答引用图片时直接拼出完整地址（根治"LLM 拿不到 host 只能编占位符"）。
+                    let desc: String = match name.as_str() {
+                        "list_knowledge_bases" => "列出已授权且开启 MCP 的 RAG。".to_string(),
+                        "search_knowledge_base" => "检索指定知识库，支持向量、关键词和混合检索。".to_string(),
+                        "ask_knowledge_base" => "使用已授权的模型回答问题，返回答案与来源。".to_string(),
+                        "read_document" => "按切片顺序读取指定文档的已摄入正文。".to_string(),
+                        "get_knowledge_base_stats" => "获取指定知识库的文档、切片和 Token 统计。".to_string(),
+                        "list_wiki_projects" => "列出已授权且开启 MCP 的 Wiki 项目。".to_string(),
+                        "ask_wiki" => {
+                            let mut d = "向 Wiki 提问，获取基于 Wiki 页面的 AI 回答。检索相关页面 → LLM 生成回答 → 返回回答 + 来源引用。".to_string();
+                            if let Some(h) = host.as_deref().filter(|h| !h.is_empty()) {
+                                d.push_str(&format!(
+                                    " 图片访问：Wiki 页面中的图片完整地址形如 http://{h}/api/wiki/projects/<project_id>/assets/<token>/<file>。回答引用图片时，必须输出完整 markdown 图片链接 ![描述](http://{h}/api/wiki/...)，禁止省略 host/端口或写成占位符（如 <wiki-host>）。"
+                                ));
+                            }
+                            d
+                        }
+                        _ => "在已授权的 Wiki 项目内查询页面、标签、图谱或问答。".to_string(),
+                    };
+                    tool["description"] = serde_json::json!(desc);
+                    if QUERY_TOOLS.contains(&name.as_str()) && name != "list_knowledge_bases" {
                         tool["inputSchema"]["properties"]["kb_id"]["description"] =
                             serde_json::json!("已授权且开启 MCP 的知识库 ID，必填。");
                         let required = tool["inputSchema"]["required"]
@@ -599,7 +647,7 @@ async fn dispatch_scoped(
                                 "type": "integer", "description": "可选整次 RAG 时间预算，服务端限幅为 100 至 120000 毫秒。"
                             });
                             tool["inputSchema"]["properties"]["allow_keyword_fallback"] = serde_json::json!({
-                                "type": "boolean", "default": false, "description": "hybrid 模式下允许已授权的可恢复 Embedding 失败降级到关键词检索。"
+                                "type": "boolean", "default": false, "description": "hybrid 模式下允许已授权的可恢复向量分支失败降级到关键词检索。"
                             });
                         }
                     }
@@ -610,26 +658,59 @@ async fn dispatch_scoped(
         }
         "tools/call" => {
             let name = req.params["name"].as_str().unwrap_or("");
-            if !QUERY_TOOLS.contains(&name) {
+            if !QUERY_TOOLS.contains(&name) && !WIKI_QUERY_TOOLS.contains(&name) {
                 return McpResponse::error(
                     req.id.clone(),
                     -32601,
                     "Tool is not available to this API key".into(),
                 );
             }
-            match scoped_tool_call(shared, access, name, &req.params["arguments"]).await {
-                Ok(value) => McpResponse::success(
-                    req.id.clone(),
-                    serde_json::json!({
-                        "content": [{"type": "text", "text": value.to_string()}], "isError": false
-                    }),
-                ),
-                Err(error) => McpResponse::success(
-                    req.id.clone(),
-                    serde_json::json!({
-                        "content": [{"type": "text", "text": format!("HTTP {}: {}", error.status.as_u16(), error.message)}], "isError": true
-                    }),
-                ),
+            match scoped_tool_call(shared, access, name, &req.params["arguments"], host).await {
+                Ok(value) => {
+                    let args = &req.params["arguments"];
+                    // 旧搜索首文本仍是数组；局部成功的元数据单独追加，保留既有解析入口。
+                    let legacy_partial = name == "search_knowledge_base"
+                        && value.get("degradation_reason").is_some()
+                        && args["timeout_ms"].is_null()
+                        && args["candidate_k"].is_null()
+                        && ![
+                            "allow_keyword_fallback",
+                            "allow_vector_fallback",
+                            "strict_retrieval",
+                            "diagnostics",
+                        ]
+                        .iter()
+                        .any(|field| args[*field].as_bool() == Some(true));
+                    let content = if legacy_partial {
+                        let metadata = serde_json::json!({
+                            "request_id": value["request_id"],
+                            "retrieval_mode": value["retrieval_mode"],
+                            "degradation_reason": value["degradation_reason"]
+                        });
+                        vec![
+                            serde_json::json!({"type":"text", "text":value["data"].to_string()}),
+                            serde_json::json!({"type":"text", "text":metadata.to_string()}),
+                        ]
+                    } else {
+                        vec![serde_json::json!({"type":"text", "text":value.to_string()})]
+                    };
+                    McpResponse::success(
+                        req.id.clone(),
+                        serde_json::json!({"content":content, "isError":false}),
+                    )
+                }
+                Err(error) => {
+                    let mut content = vec![
+                        serde_json::json!({"type": "text", "text": format!("HTTP {}: {}", error.status.as_u16(), error.message)}),
+                    ];
+                    if req.params["arguments"]["diagnostics"].as_bool() == Some(true) {
+                        content.push(serde_json::json!({"type":"text", "text":error.response_body().to_string()}));
+                    }
+                    McpResponse::success(
+                        req.id.clone(),
+                        serde_json::json!({"content":content, "isError":true}),
+                    )
+                }
             }
         }
         "ping" | "notifications/initialized" => {
@@ -644,6 +725,7 @@ async fn scoped_tool_call(
     access: &KnowledgeAccess,
     name: &str,
     args: &serde_json::Value,
+    host: Option<&str>,
 ) -> Result<serde_json::Value, crate::services::knowledge::model_client::QueryError> {
     use crate::services::knowledge::{model_client::QueryError, models::AskInput};
     let repo = KbRepository::new(shared.state.db.pool.clone());
@@ -652,6 +734,9 @@ async fn scoped_tool_call(
         let kbs: Vec<_> = kbs.iter().filter(|kb| kb.status == 1 && kb.mcp_enabled == 1 && access.kb_ids.contains(&kb.id))
             .map(|kb| serde_json::json!({"id": kb.id, "name": kb.name, "doc_count": kb.doc_count, "chunk_count": kb.chunk_count})).collect();
         return Ok(serde_json::json!(kbs));
+    }
+    if WIKI_QUERY_TOOLS.contains(&name) {
+        return scoped_wiki_tool_call(shared, access, name, args, host).await;
     }
     let kb_id = args["kb_id"].as_str().unwrap_or("");
     let kb = access.require_kb(shared, kb_id, true).await?;
@@ -674,9 +759,19 @@ async fn scoped_tool_call(
                     knowledge_access::ask(shared, access, input, true).await?
                 ))
             } else {
-                Ok(serde_json::json!(
-                    knowledge_access::search(shared, access, input, true).await?
-                ))
+                let extended = input.timeout_ms.is_some()
+                    || input.allow_keyword_fallback
+                    || input.allow_vector_fallback
+                    || input.strict_retrieval
+                    || input.diagnostics
+                    || input.candidate_k.is_some();
+                let response =
+                    knowledge_access::search_with_details(shared, access, input, true).await?;
+                if extended || response.degradation_reason.is_some() {
+                    Ok(serde_json::json!(response))
+                } else {
+                    Ok(serde_json::json!(response.data))
+                }
             }
         }
         "read_document" => {
@@ -708,8 +803,53 @@ async fn scoped_tool_call(
     }
 }
 
+/// API Key（scoped）的 Wiki 只读工具：先校验项目授权/启用，再复用全量分发实现。
+async fn scoped_wiki_tool_call(
+    shared: &SharedState,
+    access: &KnowledgeAccess,
+    name: &str,
+    args: &serde_json::Value,
+    host: Option<&str>,
+) -> Result<serde_json::Value, crate::services::knowledge::model_client::QueryError> {
+    use crate::services::knowledge::model_client::QueryError;
+
+    if name == "list_wiki_projects" {
+        let repo = WikiRepository::new(shared.state.db.pool.clone());
+        let projects = repo
+            .list_projects()
+            .await
+            .map_err(|e| QueryError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let list: Vec<_> = projects
+            .iter()
+            .filter(|p| {
+                p.status == 1
+                    && p.mcp_enabled == 1
+                    && access.wiki_project_ids.iter().any(|id| id == &p.id)
+            })
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id,
+                    "name": p.name,
+                    "page_count": p.page_count,
+                    "source_count": p.source_count
+                })
+            })
+            .collect();
+        return Ok(serde_json::json!(list));
+    }
+    let project_id = args["project_id"].as_str().unwrap_or("");
+    access.require_wiki_project(shared, project_id, true).await?;
+    handle_tool_call(shared, name, args, host)
+        .await
+        .map_err(|e| QueryError::new(StatusCode::BAD_REQUEST, e))
+}
+
 /// Main MCP JSON-RPC handler — async dispatch
-async fn dispatch_jsonrpc_async(shared: &SharedState, req: &McpRequest) -> McpResponse {
+async fn dispatch_jsonrpc_async(
+    shared: &SharedState,
+    req: &McpRequest,
+    host: Option<&str>,
+) -> McpResponse {
     match req.method.as_str() {
         "initialize" => McpResponse::success(
             req.id.clone(),
@@ -726,12 +866,22 @@ async fn dispatch_jsonrpc_async(shared: &SharedState, req: &McpRequest) -> McpRe
             }),
         ),
         "notifications/initialized" => McpResponse::success(req.id.clone(), serde_json::json!({})),
-        "tools/list" => McpResponse::success(
-            req.id.clone(),
-            serde_json::json!({
-                "tools": get_tools()
-            }),
-        ),
+        "tools/list" => {
+            let mut tools = get_tools();
+            // 方案 A：非 scoped 模式也注入真实 host 到 ask_wiki 描述（与 dispatch_scoped 一致）
+            if let Some(h) = host.as_deref().filter(|h| !h.is_empty()) {
+                for tool in &mut tools {
+                    if tool["name"].as_str() == Some("ask_wiki") {
+                        let base = tool["description"].as_str().unwrap_or("");
+                        tool["description"] = serde_json::json!(format!(
+                            "{} 图片访问：Wiki 页面中的图片完整地址形如 http://{h}/api/wiki/projects/<project_id>/assets/<token>/<file>。回答引用图片时，必须输出完整 markdown 图片链接 ![描述](http://{h}/api/wiki/...)，禁止省略 host/端口或写成占位符（如 <wiki-host>）。",
+                            base
+                        ));
+                    }
+                }
+            }
+            McpResponse::success(req.id.clone(), serde_json::json!({ "tools": tools }))
+        },
         "tools/call" => {
             let tool_name = req
                 .params
@@ -745,7 +895,7 @@ async fn dispatch_jsonrpc_async(shared: &SharedState, req: &McpRequest) -> McpRe
                 .cloned()
                 .unwrap_or(serde_json::Value::Object(Default::default()));
 
-            match handle_tool_call(shared, tool_name, &args).await {
+            match handle_tool_call(shared, tool_name, &args, host).await {
                 Ok(result) => McpResponse::success(req.id.clone(), result),
                 Err(e) => McpResponse::error(req.id.clone(), -32603, e),
             }
@@ -858,10 +1008,18 @@ pub struct McpQueryParams {
 pub async fn handle_mcp(
     State(shared): State<SharedState>,
     Query(params): Query<McpQueryParams>,
+    headers: HeaderMap,
     access: Option<Extension<KnowledgeAccess>>,
     body: axum::body::Bytes,
 ) -> Response {
     let body_str = String::from_utf8_lossy(&body);
+
+    // 供 ask_wiki 等处把页面内 root-relative 图像 URL 补成可渲染的绝对地址
+    // （按客户端实际访问本服务所用的 Host 动态构造，适配 127.0.0.1 / VPN 虚拟 IP / 内网 IP）。
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| format!("http://{h}"));
 
     // Parse JSON-RPC request
     let req: McpRequest = match serde_json::from_str(&body_str) {
@@ -875,9 +1033,9 @@ pub async fn handle_mcp(
     let is_notification = req.id.is_none();
 
     let response = if let Some(Extension(access)) = access {
-        dispatch_scoped(&shared, &access, &req).await
+        dispatch_scoped(&shared, &access, &req, host.as_deref()).await
     } else {
-        dispatch_jsonrpc_async(&shared, &req).await
+        dispatch_jsonrpc_async(&shared, &req, host.as_deref()).await
     };
 
     // If session_id is provided, push response through SSE stream
@@ -917,105 +1075,127 @@ async fn handle_tool_call(
     shared: &SharedState,
     tool_name: &str,
     args: &serde_json::Value,
+    host: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let pool = &shared.state.db.pool;
 
     match tool_name {
         "search_knowledge_base" => {
-            let query = args
-                .get("query")
-                .and_then(|q| q.as_str())
-                .ok_or("Missing query")?;
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).unwrap_or("");
-            let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(5) as usize;
-            let search_mode = args
-                .get("search_mode")
-                .and_then(|s| s.as_str())
-                .unwrap_or("hybrid");
-            let vector_weight = args
-                .get("vector_weight")
-                .and_then(|w| w.as_f64())
-                .unwrap_or(0.7) as f32;
-            let keyword_weight = args
-                .get("keyword_weight")
-                .and_then(|w| w.as_f64())
-                .unwrap_or(0.3) as f32;
-
-            let emb_model = if !kb_id.is_empty() {
-                let kb_repo = KbRepository::new(pool.clone());
-                kb_repo
-                    .get_kb(kb_id)
-                    .await
-                    .ok()
-                    .and_then(|kb| kb.embedding_model)
-                    .unwrap_or_else(|| "text-embedding-3-small".to_string())
-            } else {
-                "text-embedding-3-small".to_string()
+            use crate::services::knowledge::{
+                handlers::SearchQuery, model_client::ModelClient, models::SearchResponse,
             };
-
-            let repo = Repository::new(pool.clone());
-
-            // Keyword-only mode: no embedding needed
-            if search_mode == "keyword" && !kb_id.is_empty() {
-                let results = retriever::keyword_only_search(pool, kb_id, query, top_k).await?;
-                let content: Vec<serde_json::Value> = results.iter().map(|r| {
-                    serde_json::json!({
-                        "type": "text",
-                        "text": format!("[{}] (score: {:.2}) [keyword]\n{}", r.filename, r.score, r.content)
-                    })
-                }).collect();
-                return Ok(serde_json::json!({ "content": content, "isError": false }));
+            let mut value = args.clone();
+            value["q"] = args.get("query").cloned().ok_or("Missing query")?;
+            let query: SearchQuery = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            if query.diagnostics {
+                return Err("知识库健康检测需要使用普通 API Key".into());
             }
-
-            let embeddings = embedder::embed(&[query.to_string()], &emb_model, &repo).await?;
-            if embeddings.is_empty() {
-                return Err("Failed to embed query".to_string());
-            }
-
-            if kb_id.is_empty() {
-                // Cross-KB search: always hybrid (search_all doesn't support mode selection)
-                let results = retriever::search_all(pool, &embeddings[0], top_k, true).await?;
-                let content: Vec<serde_json::Value> = results.iter().map(|r| {
-                    serde_json::json!({
-                        "type": "text",
-                        "text": format!("[{}] (score: {:.2})\n{}", r.filename, r.score, r.content)
-                    })
-                }).collect();
-                Ok(serde_json::json!({ "content": content, "isError": false }))
+            let kb_id = query.kb_id.as_deref().unwrap_or("");
+            let mode = query.search_mode.as_deref().unwrap_or("hybrid");
+            knowledge_access::validate_query(
+                &query.q,
+                query.top_k,
+                mode,
+                query.vector_weight.unwrap_or(0.7),
+                query.keyword_weight.unwrap_or(0.3),
+            )
+            .map_err(|e| e.to_string())?;
+            rag::validate_candidate_k(query.top_k, query.candidate_k).map_err(|e| e.to_string())?;
+            let repo = KbRepository::new(pool.clone());
+            let embedding_model = if kb_id.is_empty() {
+                "text-embedding-3-small".to_string()
             } else {
-                // Single-KB search with details
-                let scored = retriever::hybrid_search_with_details(
+                let kb = repo.get_kb(kb_id).await.map_err(|e| e.to_string())?;
+                if kb.status != 1 || kb.mcp_enabled != 1 {
+                    return Err("知识库未开启 MCP 查询".into());
+                }
+                kb.embedding_model
+                    .unwrap_or_else(|| "text-embedding-3-small".into())
+            };
+            let client = ModelClient::Internal {
+                pool,
+                settings: &shared.state.settings,
+                kb_id,
+            };
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let retrieved = knowledge_access::run_request(
+                &request_id,
+                query.timeout_ms,
+                false,
+                Box::pin(rag::retrieve_with_client(
+                    &client,
                     pool,
                     kb_id,
-                    query,
-                    &embeddings[0],
-                    top_k,
-                    vector_weight,
-                    keyword_weight,
-                    // MCP 工具路径用默认融合模式（RRF）；面板路径按 kb.fusion_mode 设置
-                    retriever::FusionMode::Rrf,
-                )
-                .await?;
-
-                let content: Vec<serde_json::Value> = scored
-                    .iter()
-                    .map(|s| {
-                        let r = &s.result;
-                        let mut line = format!("[{}] (score: {:.2}", r.filename, r.score);
-                        if let Some(vs) = s.vector_score {
-                            line.push_str(&format!(", vec: {:.2}", vs));
-                        }
-                        if let Some(ks) = s.keyword_score {
-                            line.push_str(&format!(", kw: {:.2}", ks));
-                        }
-                        line.push_str(")\n");
-                        line.push_str(&r.content);
-                        serde_json::json!({ "type": "text", "text": line })
-                    })
+                    &query.q,
+                    &embedding_model,
+                    query.candidate_k.unwrap_or(query.top_k),
+                    true,
+                    crate::services::knowledge::retriever::FusionMode::Rrf,
+                    query.vector_weight.unwrap_or(0.7),
+                    query.keyword_weight.unwrap_or(0.3),
+                    mode,
+                    false,
+                    query.allow_keyword_fallback,
+                    query.allow_vector_fallback,
+                    query.strict_retrieval,
+                    false,
+                )),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let extended = query.timeout_ms.is_some()
+                || query.allow_keyword_fallback
+                || query.allow_vector_fallback
+                || query.strict_retrieval
+                || query.candidate_k.is_some();
+            if extended {
+                let mut data: Vec<_> = retrieved
+                    .scored_results
+                    .into_iter()
+                    .map(|s| s.result)
                     .collect();
-
-                Ok(serde_json::json!({ "content": content, "isError": false }))
+                data.truncate(query.top_k);
+                let response = SearchResponse {
+                    data,
+                    request_id: Some(request_id),
+                    retrieval_mode: Some(retrieved.actual_mode),
+                    degradation_reason: retrieved.degradation_reason,
+                    diagnostics: None,
+                };
+                return Ok(
+                    serde_json::json!({"content":[{"type":"text","text":serde_json::to_string(&response).map_err(|e| e.to_string())?}],"isError":false}),
+                );
             }
+            let mut content: Vec<_> = retrieved
+                .scored_results
+                .iter()
+                .take(query.top_k)
+                .map(|scored| {
+                    let result = &scored.result;
+                    let mut line = format!("[{}] (score: {:.2}", result.filename, result.score);
+                    if !kb_id.is_empty() && mode != "keyword" {
+                        if let Some(score) = scored.vector_score {
+                            line.push_str(&format!(", vec: {:.2}", score));
+                        }
+                        if let Some(score) = scored.keyword_score {
+                            line.push_str(&format!(", kw: {:.2}", score));
+                        }
+                    }
+                    if !kb_id.is_empty() && mode == "keyword" {
+                        line.push_str(") [keyword]\n");
+                    } else {
+                        line.push_str(")\n");
+                    }
+                    line.push_str(&result.content);
+                    serde_json::json!({"type":"text","text":line})
+                })
+                .collect();
+            if let Some(reason) = retrieved.degradation_reason {
+                let metadata = serde_json::json!({"request_id":request_id,
+                    "retrieval_mode":retrieved.actual_mode, "degradation_reason":reason});
+                content.push(serde_json::json!({"type":"text", "text":metadata.to_string()}));
+            }
+            Ok(serde_json::json!({"content":content,"isError":false}))
         }
 
         "list_knowledge_bases" => {
@@ -1091,13 +1271,24 @@ async fn handle_tool_call(
                 .and_then(|w| w.as_f64())
                 .unwrap_or(0.3) as f32;
 
+            knowledge_access::validate_query(
+                question,
+                top_k,
+                search_mode,
+                vector_weight,
+                keyword_weight,
+            )
+            .map_err(|error| error.to_string())?;
+
             let emb_model = if !kb_id.is_empty() {
-                let kb_repo = KbRepository::new(pool.clone());
-                kb_repo
+                let kb = KbRepository::new(pool.clone())
                     .get_kb(kb_id)
                     .await
-                    .ok()
-                    .and_then(|kb| kb.embedding_model)
+                    .map_err(|e| e.to_string())?;
+                if kb.status != 1 || kb.mcp_enabled != 1 {
+                    return Err("知识库未开启 MCP 查询".into());
+                }
+                kb.embedding_model
                     .unwrap_or_else(|| "text-embedding-3-small".to_string())
             } else {
                 "text-embedding-3-small".to_string()
@@ -1130,21 +1321,57 @@ async fn handle_tool_call(
                 picked.unwrap_or_else(|| "gpt-4o".to_string())
             };
 
-            let answer = rag::ask_with_config(
+            use crate::services::knowledge::{model_client::ModelClient, models::AskInput};
+            let input: AskInput =
+                serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+            if input.diagnostics {
+                return Err("知识库健康检测需要使用普通 API Key".into());
+            }
+            let client = ModelClient::Internal {
                 pool,
+                settings: &shared.state.settings,
                 kb_id,
-                question,
-                &emb_model,
-                &chat_model,
-                top_k,
-                true,
-                &[],
-                &shared.state.settings,
-                vector_weight,
-                keyword_weight,
-                search_mode,
+            };
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let answer = knowledge_access::run_request(
+                &request_id,
+                input.timeout_ms,
+                false,
+                Box::pin(rag::ask_with_client(
+                    &client,
+                    pool,
+                    kb_id,
+                    question,
+                    &emb_model,
+                    &chat_model,
+                    top_k,
+                    true,
+                    input.history.as_deref().unwrap_or(&[]),
+                    &shared.state.settings,
+                    vector_weight,
+                    keyword_weight,
+                    search_mode,
+                    false,
+                    input.allow_keyword_fallback,
+                    input.allow_vector_fallback,
+                    input.strict_retrieval,
+                    input.candidate_k,
+                    input.reasoning_effort.as_deref(),
+                    input.temperature,
+                )),
             )
-            .await?;
+            .await
+            .map_err(|e| e.to_string())?;
+            if input.timeout_ms.is_some()
+                || input.allow_keyword_fallback
+                || input.allow_vector_fallback
+                || input.strict_retrieval
+                || input.candidate_k.is_some()
+            {
+                return Ok(
+                    serde_json::json!({"content":[{"type":"text","text":serde_json::to_string(&answer).map_err(|e| e.to_string())?}],"isError":false}),
+                );
+            }
 
             let mut content = vec![serde_json::json!({
                 "type": "text",
@@ -1186,6 +1413,11 @@ async fn handle_tool_call(
                 }));
             }
 
+            if let Some(reason) = answer.degradation_reason {
+                let metadata = serde_json::json!({"request_id":request_id,
+                    "retrieval_mode":answer.retrieval_mode, "degradation_reason":reason});
+                content.push(serde_json::json!({"type":"text", "text":metadata.to_string()}));
+            }
             Ok(serde_json::json!({
                 "content": content,
                 "isError": false
@@ -1238,6 +1470,8 @@ async fn handle_tool_call(
                 embedding_channel_id: embedding_channel_id.map(|s| s.to_string()),
                 // MCP 工具不暴露 OCR 模型配置（在知识库设置表单中配置）
                 ocr_model: None,
+                reasoning_effort: None,
+                temperature: None,
             };
 
             let kb_repo = KbRepository::new(pool.clone());
@@ -1300,6 +1534,11 @@ async fn handle_tool_call(
                 embedding_batch_size: args.get("embedding_batch_size").and_then(|b| b.as_i64()),
                 // MCP 工具不暴露 OCR 模型配置（在知识库设置表单中配置）
                 ocr_model: None,
+                reasoning_effort: args
+                    .get("reasoning_effort")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string()),
+                temperature: args.get("temperature").and_then(|t| t.as_f64()),
             };
 
             let kb_repo = KbRepository::new(pool.clone());
@@ -1978,7 +2217,7 @@ async fn handle_tool_call(
             let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(5) as usize;
             let model = args.get("model").and_then(|m| m.as_str());
 
-            let result = wiki_handlers::ask_inner(shared, project_id, question, top_k, model).await;
+            let result = wiki_handlers::ask_inner(shared, project_id, question, top_k, model, host).await;
 
             match result {
                 Ok(json) => Ok(serde_json::json!({
@@ -2149,6 +2388,8 @@ async fn handle_tool_call(
                     .get("description")
                     .and_then(|d| d.as_str())
                     .map(|s| s.to_string()),
+                pdf_ocr_channel_id: None,
+                pdf_ocr_model: None,
                 ingest_model: args
                     .get("ingest_model")
                     .and_then(|m| m.as_str())
@@ -2169,6 +2410,11 @@ async fn handle_tool_call(
                     .get("schema_text")
                     .and_then(|s| s.as_str())
                     .map(|s| s.to_string()),
+                reasoning_effort: args
+                    .get("reasoning_effort")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string()),
+                temperature: args.get("temperature").and_then(|t| t.as_f64()),
             };
 
             let project_id = wiki_project::new_uuid();

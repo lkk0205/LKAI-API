@@ -241,6 +241,9 @@ pub fn run() {
                 });
                 app_handle.manage(state.clone());
 
+                // 注册全局网关事件出口（路由总览页的粒子动画数据源）。
+                server::event_bridge::register_gateway_sink(state.events.clone());
+
                 // Prompt 模板种子（C-07）：空表时写入源码字面量 v1——升级后行为逐字节不变
                 if let Err(error) = crate::prompt_templates::seed_if_empty(&state.db.pool).await {
                     tracing::warn!("[模板] 种子写入失败（运行时回退编译期默认）: {error}");
@@ -315,6 +318,8 @@ pub fn run() {
             commands::api_key::get_api_key_knowledge_access,
             commands::api_key::set_api_key_knowledge_access,
             commands::api_key::test_api_key_knowledge_access,
+            commands::api_key::get_api_key_wiki_access,
+            commands::api_key::set_api_key_wiki_access,
             commands::api_key::test_api_key_knowledge_health,
             commands::api_key::get_api_key_full,
             commands::api_key::create_api_key,
@@ -346,6 +351,7 @@ pub fn run() {
             commands::auth::auth_reorder_accounts,
             commands::log::get_logs,
             commands::log::count_logs,
+            commands::log::get_log_filter_options,
             commands::log::get_log,
             commands::log::get_log_security_findings,
             commands::log::get_log_stream_segments,
@@ -353,6 +359,8 @@ pub fn run() {
             commands::log::delete_logs_before,
             commands::log::delete_all_logs,
             commands::log::get_log_stats,
+            commands::log::get_log_prompt_parts,
+            commands::log::get_log_attempts,
             commands::prompt_template::list_prompt_templates,
             commands::prompt_template::create_prompt_template,
             commands::prompt_template::activate_prompt_template,
@@ -360,6 +368,9 @@ pub fn run() {
             commands::stats::get_dashboard_stats,
             commands::stats::get_model_stats,
             commands::stats::get_token_trend,
+            commands::stats::get_prompt_part_stats,
+            commands::stats::get_route_flow,
+            commands::stats::get_daily_token_stats,
             commands::settings::get_settings,
             commands::network::detect_local_proxies,
             commands::settings::get_feature_flags,
@@ -397,6 +408,7 @@ pub fn run() {
             commands::knowledge_base::ask_knowledge_base,
             commands::knowledge_base::get_kb_stats,
             commands::knowledge_base::upload_kb_document,
+            commands::knowledge_base::upload_kb_document_from_path,
             commands::knowledge_base::get_kb_conversations,
             commands::knowledge_base::clear_kb_conversations,
             commands::knowledge_base::get_kb_sources,
@@ -418,13 +430,16 @@ pub fn run() {
             commands::wiki::get_wiki_pages,
             commands::wiki::get_wiki_page,
             commands::wiki::save_wiki_page,
+            commands::wiki::delete_wiki_page,
             commands::wiki::get_wiki_sources,
             commands::wiki::add_wiki_source,
+            commands::wiki::add_wiki_source_from_path,
             commands::wiki::delete_wiki_source,
             commands::wiki::search_wiki,
             commands::wiki::get_wiki_graph,
             commands::wiki::get_wiki_stats,
             commands::wiki::ingest_wiki_source,
+            commands::wiki::cancel_wiki_ingest,
             commands::wiki::rescan_wiki_sources,
             commands::wiki::get_wiki_tags,
             // App Config (应用配置)

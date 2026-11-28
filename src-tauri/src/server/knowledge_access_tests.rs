@@ -4,11 +4,12 @@ use super::{
 };
 use crate::{
     db::{models::ApiKey, repository::Repository},
-    server::knowledge_access::{get_grants, set_grants},
+    server::knowledge_access::{get_grants, get_wiki_grants, set_grants, set_wiki_grants},
     services::knowledge::{
         models::KbKnowledgeBase,
         repository::{ChunkInsert, KbRepository},
     },
+    services::wiki::{models::CreateProjectInput, repository::WikiRepository},
     AppState,
 };
 use axum::{body::to_bytes, http::StatusCode, response::Response, routing::post, Json, Router};
@@ -18,6 +19,207 @@ use std::sync::{
     Arc,
 };
 use tower::ServiceExt;
+
+// ── Wiki 查询授权（与 RAG 平行的独立维度）─────────────────────────
+
+fn rpc_list(key: &str) -> axum::http::Request<axum::body::Body> {
+    json_request(
+        "POST",
+        "/mcp",
+        Some(key),
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).to_string(),
+    )
+}
+
+async fn create_wiki_project(state: &AppState, name: &str) -> String {
+    let repo = WikiRepository::new(state.db.pool.clone());
+    let id = uuid::Uuid::new_v4().to_string();
+    let input: CreateProjectInput = serde_json::from_value(json!({ "name": name })).unwrap();
+    repo.create_project_with_id(&id, &input, "/tmp/lkapi-test-wiki")
+        .await
+        .unwrap();
+    id
+}
+
+fn tool_names(listed: &Value) -> Vec<String> {
+    listed["result"]["tools"]
+        .as_array()
+        .expect("tools/list 应返回工具数组")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+/// 只有 Wiki 授权（无任何 RAG 授权）的 Key 也能连 MCP 并查询 Wiki 只读工具。
+#[tokio::test]
+async fn wiki_only_key_can_connect_mcp_and_query_wiki() {
+    let state = test_state().await;
+    let repo = Repository::new(state.db.pool.clone());
+    let project = create_wiki_project(&state, "handbook").await;
+    let key = repo
+        .create_api_key(&serde_json::from_value(json!({"name":"wiki-only"})).unwrap())
+        .await
+        .unwrap();
+    // 撤销全部 RAG 授权，只保留默认获得的 Wiki 授权。
+    set_grants(&state.db.pool, &key.id, &[]).await.unwrap();
+    assert!(get_grants(&state.db.pool, &key.id).await.unwrap().is_empty());
+    assert_eq!(
+        get_wiki_grants(&state.db.pool, &key.id).await.unwrap(),
+        vec![project.clone()]
+    );
+
+    let app = build_router(state.clone(), test_shared(&state, None, None));
+    // 入口不再因「无 RAG 授权」拒绝；tools/list 暴露 Wiki 只读工具。
+    let names = tool_names(
+        &body(app.clone().oneshot(rpc_list(&key.key)).await.unwrap()).await,
+    );
+    for expected in ["list_wiki_projects", "get_wiki_project", "search_wiki", "ask_wiki"] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "缺少 Wiki 工具 {expected}: {names:?}"
+        );
+    }
+    // 写入/删除/摄入类工具不开放给 API Key。
+    for forbidden in [
+        "create_wiki_project",
+        "save_wiki_page",
+        "delete_wiki_project",
+        "ingest_wiki_source",
+    ] {
+        assert!(
+            !names.iter().any(|n| n == forbidden),
+            "不应暴露写入工具 {forbidden}"
+        );
+    }
+    // 纯 Wiki 授权：RAG 相关工具不出现，列表保持干净。
+    assert!(
+        !names.iter().any(|n| n == "list_knowledge_bases"),
+        "纯 Wiki 授权的 Key 不应暴露 RAG 工具: {names:?}"
+    );
+
+    // list_wiki_projects 只返回已授权且开启 MCP 的项目。
+    let listed = body(
+        app.oneshot(rpc(&key.key, "list_wiki_projects", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(listed["result"]["isError"], false);
+    assert!(listed.to_string().contains(&project));
+}
+
+/// 新建 Key 默认授权全部 Wiki 项目；新建 Wiki 项目默认授权全部已有 Key。
+#[tokio::test]
+async fn new_key_and_wiki_project_grant_each_other_by_default() {
+    let state = test_state().await;
+    let repo = Repository::new(state.db.pool.clone());
+    let existing = create_wiki_project(&state, "existing").await;
+    let key = repo
+        .create_api_key(&serde_json::from_value(json!({"name":"fresh-key"})).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        get_wiki_grants(&state.db.pool, &key.id)
+            .await
+            .unwrap()
+            .contains(&existing),
+        "新建 Key 应默认授权全部 Wiki 项目"
+    );
+    let later = create_wiki_project(&state, "later").await;
+    assert!(
+        get_wiki_grants(&state.db.pool, &key.id)
+            .await
+            .unwrap()
+            .contains(&later),
+        "新建 Wiki 项目应默认授权全部已有 Key"
+    );
+}
+
+/// scoped API Key：未授权项目 / 关闭 MCP 暴露 / 写入工具均被拒。
+#[tokio::test]
+async fn scoped_wiki_tools_respect_grants_and_mcp_flag() {
+    let state = test_state().await;
+    let repo = Repository::new(state.db.pool.clone());
+    let granted = create_wiki_project(&state, "granted-wiki").await;
+    let other = create_wiki_project(&state, "other-wiki").await;
+    let key = repo
+        .create_api_key(&serde_json::from_value(json!({"name":"scoped-wiki"})).unwrap())
+        .await
+        .unwrap();
+    set_wiki_grants(&state.db.pool, &key.id, std::slice::from_ref(&granted))
+        .await
+        .unwrap();
+    let app = build_router(state.clone(), test_shared(&state, None, None));
+
+    // 未授权项目：拒绝。
+    let denied = body(
+        app.clone()
+            .oneshot(rpc(&key.key, "get_wiki_project", json!({"project_id": other})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(denied["result"]["isError"], true);
+    assert!(
+        denied.to_string().contains("Wiki project access denied"),
+        "{denied}"
+    );
+
+    // 关闭 MCP 暴露后，已授权项目也被拒。
+    sqlx::query("UPDATE wiki_projects SET mcp_enabled = 0 WHERE id = ?")
+        .bind(&granted)
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+    let hidden = body(
+        app.clone()
+            .oneshot(rpc(&key.key, "get_wiki_project", json!({"project_id": granted})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(hidden["result"]["isError"], true);
+    assert!(hidden.to_string().contains("not enabled"), "{hidden}");
+
+    // 写入工具不在白名单：JSON-RPC 直接拒绝。
+    let write = body(
+        app.oneshot(rpc(
+            &key.key,
+            "save_wiki_page",
+            json!({"project_id": granted, "path":"a.md","content":"x"}),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(write["error"]["code"], -32601);
+}
+
+/// Wiki 图像资产路由：token 即凭证——无凭据可命中（不落入 API Key 鉴权层）；
+/// 不存在的 token / 路径穿越一律 404，不能读取任意文件。
+#[tokio::test]
+async fn wiki_asset_route_serves_by_token_and_rejects_traversal() {
+    let state = test_state().await;
+    let app = build_router(state.clone(), test_shared(&state, None, None));
+
+    // 无任何 Bearer 也应能命中 assets 路由（<img> 无法携带凭据），返回 404 而非 401/403。
+    for path in [
+        "/api/wiki/projects/asset-p/assets/no-such-token/page-1.jpg",
+        "/api/wiki/projects/asset-p/assets/..%2F..%2Flkapi.db/x",
+        "/api/wiki/projects/asset-p/assets/t/../../etc/passwd",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request("GET", path, None))
+            .await
+            .unwrap();
+        assert!(
+            matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST),
+            "路径应 404/400 而非泄露文件: {path} => {}",
+            response.status()
+        );
+    }
+}
 
 async fn setup() -> (
     Arc<AppState>,
@@ -77,6 +279,16 @@ async fn candidate_limits_are_validated_before_model_call() {
 async fn body(response: Response) -> Value {
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+fn diagnostic_stage<'a>(result: &'a Value, name: &str) -> &'a Value {
+    result["diagnostics"]["stages"]
+        .as_array()
+        .expect("诊断必须包含阶段数组")
+        .iter()
+        .rev()
+        .find(|stage| stage["stage"] == name)
+        .unwrap_or_else(|| panic!("诊断缺少阶段 {name}: {result}"))
 }
 
 fn rpc(key: &str, name: &str, arguments: Value) -> axum::http::Request<axum::body::Body> {
@@ -556,12 +768,18 @@ async fn rag_reasoning_levels_reach_the_canonical_gateway_body_without_claiming_
                 json!({"requested":level,"status":"requested"})
             );
             assert_eq!(sent["reasoning_effort"], level);
+            // 档位与 thinking 联动（用户要求）：启用类→enabled，none→disabled
+            assert_eq!(
+                sent["thinking"]["type"],
+                if level == "none" { "disabled" } else { "enabled" }
+            );
         } else {
             assert!(result.get("reasoning").is_none());
             assert!(sent.get("reasoning_effort").is_none());
+            assert!(sent.get("thinking").is_none());
         }
         assert_eq!(sent["model"], "chat-test");
-        for provider_field in ["thinking", "enable_thinking", "reasoning"] {
+        for provider_field in ["enable_thinking", "reasoning"] {
             assert!(sent.get(provider_field).is_none());
         }
     }
@@ -840,8 +1058,8 @@ async fn embedding_spend_is_checked_before_answer_generation() {
     let result = body(response).await;
     assert_eq!(result["error"]["stage"], "answer");
     assert_eq!(result["error"]["code"], "quota_or_rate_limited");
-    assert_eq!(result["diagnostics"]["stages"][1]["status"], "passed");
-    assert_eq!(result["diagnostics"]["stages"][3]["status"], "failed");
+    assert_eq!(diagnostic_stage(&result, "embedding")["status"], "passed");
+    assert_eq!(diagnostic_stage(&result, "answer")["status"], "failed");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     task.abort();
 }
@@ -910,6 +1128,10 @@ async fn rag_diagnostics_cover_real_stages_and_correlate_gateway_logs() {
         stages
             .iter()
             .map(|s| s["stage"].as_str().unwrap())
+            .filter(|stage| matches!(
+                *stage,
+                "permission" | "embedding" | "retrieval" | "answer" | "validation"
+            ))
             .collect::<Vec<_>>(),
         [
             "permission",
@@ -919,9 +1141,17 @@ async fn rag_diagnostics_cover_real_stages_and_correlate_gateway_logs() {
             "validation"
         ]
     );
-    assert!(stages
-        .iter()
-        .all(|s| s["status"] == "passed" && s["elapsed_ms"].is_u64()));
+    assert!(stages.iter().all(|s| s["elapsed_ms"].is_u64()));
+    for stage in [
+        "permission",
+        "embedding",
+        "vector_search",
+        "retrieval",
+        "answer",
+        "validation",
+    ] {
+        assert_eq!(diagnostic_stage(&result, stage)["status"], "passed");
+    }
     let logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE api_key_id = ? AND trace_id = ? AND status_code = 200")
         .bind(&key.id).bind(request_id).fetch_one(&state.db.pool).await.unwrap();
     assert_eq!(logs, 2, "诊断编号必须对应实际网关日志");
@@ -956,8 +1186,8 @@ async fn rag_diagnostics_identify_missing_embedding_capability_without_calling_u
         let result = body(response).await;
         assert_eq!(result["error"]["stage"], "embedding");
         assert_eq!(result["error"]["code"], "endpoint_not_configured");
-        assert_eq!(result["diagnostics"]["stages"][0]["status"], "passed");
-        assert_eq!(result["diagnostics"]["stages"][1]["status"], "failed");
+        assert_eq!(diagnostic_stage(&result, "permission")["status"], "passed");
+        assert_eq!(diagnostic_stage(&result, "embedding")["status"], "failed");
         let trace = result["error"]["request_id"].as_str().unwrap();
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM request_logs WHERE trace_id = ? AND status_code = 501",
@@ -981,8 +1211,7 @@ async fn rag_diagnostics_identify_missing_embedding_capability_without_calling_u
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let result = body(response).await;
-    assert_eq!(result["diagnostics"]["stages"][1]["stage"], "embedding");
-    assert_eq!(result["diagnostics"]["stages"][1]["status"], "skipped");
+    assert_eq!(diagnostic_stage(&result, "embedding")["status"], "skipped");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     task.abort();
 }
@@ -1014,7 +1243,7 @@ async fn rag_diagnostics_reject_empty_retrieval_without_changing_regular_ask() {
         if diagnostics {
             assert_eq!(result["error"]["code"], "retrieval_empty");
             assert_eq!(result["error"]["stage"], "retrieval");
-            assert_eq!(result["diagnostics"]["stages"][2]["status"], "failed");
+            assert_eq!(diagnostic_stage(&result, "retrieval")["status"], "failed");
         } else {
             assert!(result["sources"].as_array().unwrap().is_empty());
             assert!(result.get("diagnostics").is_none());
@@ -1067,7 +1296,7 @@ async fn rag_diagnostics_reject_empty_answers_and_missing_sources() {
         let result = body(response).await;
         assert_eq!(result["error"]["code"], expected_code);
         assert_eq!(result["error"]["stage"], "validation");
-        assert_eq!(result["diagnostics"]["stages"][4]["status"], "failed");
+        assert_eq!(diagnostic_stage(&result, "validation")["status"], "failed");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         task.abort();
     }
@@ -1137,7 +1366,7 @@ async fn rag_diagnostics_identify_real_upstream_timeout_without_changing_status(
     let result = body(response).await;
     assert_eq!(result["error"]["stage"], "embedding");
     assert_eq!(result["error"]["code"], "model_timeout");
-    assert_eq!(result["diagnostics"]["stages"][1]["status"], "failed");
+    assert_eq!(diagnostic_stage(&result, "embedding")["status"], "failed");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -1176,7 +1405,7 @@ async fn rag_budget_stops_slow_embedding_without_another_key_or_answer() {
         .unwrap()
         .to_string();
     let result = body(response).await;
-    assert_eq!(result["error"]["code"], "rag_deadline_exceeded");
+    assert_eq!(result["error"]["code"], "stage_timeout");
     assert_eq!(result["error"]["request_id"], request_id);
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     assert_eq!(
@@ -1200,8 +1429,17 @@ async fn rag_explicit_keyword_fallback_uses_remaining_budget_and_reports_actual_
     let result = body(response).await;
     assert_eq!(result["answer"], "BCD");
     assert_eq!(result["retrieval_mode"], "keyword");
-    assert_eq!(result["degradation_reason"], "rag_deadline_exceeded");
-    assert_eq!(result["diagnostics"]["stages"][1]["status"], "degraded");
+    assert_eq!(result["degradation_reason"], "stage_timeout");
+    assert_eq!(diagnostic_stage(&result, "embedding")["status"], "failed");
+    assert_eq!(
+        diagnostic_stage(&result, "embedding")["code"],
+        "stage_timeout"
+    );
+    assert_eq!(
+        diagnostic_stage(&result, "embedding")["deadline_scope"],
+        "stage"
+    );
+    assert_eq!(diagnostic_stage(&result, "retrieval")["status"], "degraded");
     assert!(!result["sources"].as_array().unwrap().is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
@@ -1403,8 +1641,11 @@ async fn generic_search_preserves_legacy_data_and_returns_authorized_original_co
             assert_eq!(result["request_id"], request_id);
             assert_eq!(result["retrieval_mode"], "keyword");
             assert_eq!(result["diagnostics"]["request_id"], request_id);
-            assert_eq!(result["diagnostics"]["stages"][1]["status"], "skipped");
-            assert_eq!(result["diagnostics"]["stages"][2]["stage"], "retrieval");
+            assert_eq!(diagnostic_stage(&result, "embedding")["status"], "skipped");
+            assert_eq!(
+                diagnostic_stage(&result, "keyword_search")["status"],
+                "passed"
+            );
         } else {
             assert_eq!(
                 result.as_object().unwrap().len(),
@@ -1427,7 +1668,7 @@ async fn generic_search_preserves_legacy_data_and_returns_authorized_original_co
     assert_eq!(response.status(), StatusCode::OK);
     let result = body(response).await;
     assert_eq!(result["data"], json!([]));
-    assert_eq!(result["diagnostics"]["stages"][2]["status"], "empty");
+    assert_eq!(diagnostic_stage(&result, "retrieval")["status"], "empty");
 }
 
 #[tokio::test]
@@ -1456,9 +1697,21 @@ async fn generic_search_uses_only_embedding_even_when_generation_features_are_en
             stages
                 .iter()
                 .map(|s| s["stage"].as_str().unwrap())
+                .filter(|stage| matches!(*stage, "permission" | "embedding" | "retrieval"))
                 .collect::<Vec<_>>(),
             ["permission", "embedding", "retrieval"]
         );
+        assert_eq!(
+            diagnostic_stage(&result, "vector_search")["status"],
+            "passed"
+        );
+        if mode == "hybrid" {
+            assert_eq!(
+                diagnostic_stage(&result, "keyword_search")["status"],
+                "passed"
+            );
+            assert_eq!(diagnostic_stage(&result, "fusion")["status"], "passed");
+        }
         assert!(result.get("answer").is_none());
     }
     assert_eq!(
@@ -1504,16 +1757,25 @@ async fn generic_search_budget_and_opt_in_fallback_share_the_retrieval_path() {
         let result = body(response).await;
         if fallback {
             assert_eq!(result["retrieval_mode"], "keyword");
-            assert_eq!(result["degradation_reason"], "rag_deadline_exceeded");
+            assert_eq!(result["degradation_reason"], "stage_timeout");
             assert_eq!(
                 result["data"][0]["content"],
                 "alpha usable original evidence"
             );
-            assert_eq!(result["diagnostics"]["stages"][1]["status"], "degraded");
+            assert_eq!(diagnostic_stage(&result, "embedding")["status"], "failed");
+            assert_eq!(diagnostic_stage(&result, "retrieval")["status"], "degraded");
         } else {
-            assert_eq!(result["error"]["code"], "rag_deadline_exceeded");
+            assert_eq!(result["error"]["code"], "stage_timeout");
             assert_eq!(result["error"]["request_id"], request_id);
         }
+        assert_eq!(
+            diagnostic_stage(&result, "embedding")["code"],
+            "stage_timeout"
+        );
+        assert_eq!(
+            diagnostic_stage(&result, "embedding")["deadline_scope"],
+            "stage"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1561,8 +1823,12 @@ async fn generic_search_fallback_cannot_bypass_model_permission_or_quota() {
                 "access_denied"
             }
         );
-        assert_eq!(result["diagnostics"]["stages"][1]["stage"], "embedding");
-        assert_eq!(result["diagnostics"]["stages"][1]["status"], "failed");
+        assert_eq!(diagnostic_stage(&result, "permission")["status"], "failed");
+        assert!(result["diagnostics"]["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|stage| stage["stage"] != "embedding"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
     task.abort();
@@ -1620,6 +1886,50 @@ async fn generic_search_future_abort_does_not_start_another_request() {
     assert!(search.await.unwrap_err().is_cancelled());
     tokio::time::sleep(std::time::Duration::from_millis(350)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn admin_deep_research_rejects_explicit_retrieval_policies_before_model_io() {
+    let (state, _, first, _, _) = setup().await;
+    let (_, calls, task) = mock_model(&state).await;
+    document(&state, &first.id, "alpha deep research original").await;
+    let admin = "test-admin-0123456789abcdef0123456789abcdef";
+    let app = build_router(state.clone(), test_shared(&state, Some(admin), None));
+    for policy in [
+        "strict_retrieval",
+        "allow_keyword_fallback",
+        "allow_vector_fallback",
+    ] {
+        let mut input = json!({
+            "kb_id":first.id,"question":"alpha","model":"chat-test",
+            "deep_research":true,"max_rounds":1
+        });
+        input[policy] = json!(true);
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/kb/ask",
+                Some(admin),
+                &input.to_string(),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let result = body(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{policy}: {result}");
+        assert_eq!(result["error"]["code"], "unsupported_retrieval_policy");
+        assert_eq!(result["error"]["stage"], "permission");
+        assert!(result.get("answer").is_none());
+        assert!(result.get("sources").is_none());
+        assert!(!result.to_string().contains("deep research original"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "拒绝不支持的组合时不发送Embedding或生成请求"
+        );
+    }
     task.abort();
 }
 
@@ -1683,4 +1993,1166 @@ async fn admin_search_new_options_keep_cross_kb_vector_fallback_without_expandin
     );
     assert_eq!(calls.load(Ordering::SeqCst), 4);
     task.abort();
+}
+
+fn generic_fallback_request(
+    kb_id: &str,
+    key: &str,
+    keyword: bool,
+    vector: Option<bool>,
+    timeout_ms: u64,
+) -> axum::http::Request<axum::body::Body> {
+    let mut uri = format!(
+        "/api/kb/search?q=alpha&kb_id={kb_id}&search_mode=hybrid&top_k=5&candidate_k=20&timeout_ms={timeout_ms}&allow_keyword_fallback={keyword}&diagnostics=true"
+    );
+    if let Some(vector) = vector {
+        uri.push_str(&format!("&allow_vector_fallback={vector}"));
+    }
+    request("GET", &uri, Some(key))
+}
+
+async fn wait_for_mock_request(calls: &AtomicUsize) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("本地 mock 应收到 Embedding 请求");
+}
+
+#[test]
+fn generic_fallback_vector_flag_is_opt_in_in_legacy_ask_input() {
+    use crate::services::knowledge::models::AskInput;
+    for value in [
+        json!({"question":"alpha"}),
+        json!({"question":"alpha","allow_keyword_fallback":true}),
+    ] {
+        let input: AskInput = serde_json::from_value(value).unwrap();
+        assert!(!input.allow_vector_fallback);
+        assert!(!input.strict_retrieval);
+    }
+    let input: AskInput =
+        serde_json::from_value(json!({"question":"alpha","allow_vector_fallback":true})).unwrap();
+    assert!(input.allow_vector_fallback);
+    assert!(!input.allow_keyword_fallback);
+    assert!(!input.strict_retrieval);
+    for direction in ["allow_keyword_fallback", "allow_vector_fallback"] {
+        let mut value = json!({"question":"alpha","strict_retrieval":true});
+        value[direction] = json!(true);
+        let input: AskInput = serde_json::from_value(value).unwrap();
+        assert!(input.strict_retrieval);
+        assert!(input.allow_keyword_fallback || input.allow_vector_fallback);
+    }
+}
+
+#[tokio::test]
+async fn generic_fallback_legacy_local_errors_keep_historical_fusion_scores() {
+    for failed_route in ["keyword", "vector"] {
+        for fusion in ["rrf", "weighted"] {
+            let (state, key, first, _, app) = setup().await;
+            let (_, calls, task) = mock_model(&state).await;
+            let doc_id = document(&state, &first.id, "alpha legacy partial original").await;
+            state
+                .settings
+                .set_many(&[("kb.fusion_mode".into(), json!(fusion))])
+                .unwrap();
+            sqlx::query(if failed_route == "keyword" {
+                "DROP TABLE kb_chunks_fts"
+            } else {
+                "ALTER TABLE kb_chunks RENAME COLUMN embedding TO fixture_missing_embedding"
+            })
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+            // timeout/diagnostics 本身不切换严格策略；显式 false 也等同旧缺省。
+            for policy in [
+                "",
+                "&strict_retrieval=false&allow_keyword_fallback=false&allow_vector_fallback=false",
+            ] {
+                let response = app.clone().oneshot(request("GET", &format!(
+                    "/api/kb/search?q=alpha&kb_id={}&search_mode=hybrid&timeout_ms=3000&diagnostics=true{policy}", first.id),
+                    Some(&key.key))).await.unwrap();
+                let status = response.status();
+                let result = body(response).await;
+                assert_eq!(status, StatusCode::OK, "{failed_route}/{fusion}: {result}");
+                assert_eq!(result["data"].as_array().unwrap().len(), 1);
+                assert_eq!(result["data"][0]["doc_id"], doc_id);
+                assert_eq!(
+                    result["data"][0]["content"],
+                    "alpha legacy partial original"
+                );
+                assert_eq!(
+                    result["retrieval_mode"],
+                    if failed_route == "keyword" {
+                        "vector"
+                    } else {
+                        "keyword"
+                    }
+                );
+                assert_eq!(
+                    result["degradation_reason"],
+                    format!("{failed_route}_search_failed")
+                );
+                assert_eq!(
+                    diagnostic_stage(&result, &format!("{failed_route}_search"))["status"],
+                    "failed"
+                );
+                assert_eq!(diagnostic_stage(&result, "fusion")["status"], "degraded");
+                assert_eq!(diagnostic_stage(&result, "retrieval")["status"], "degraded");
+                let expected = if fusion == "rrf" {
+                    1.0 / 61.0
+                } else if failed_route == "keyword" {
+                    0.7
+                } else {
+                    0.3
+                };
+                assert!(
+                    (result["data"][0]["score"].as_f64().unwrap() - expected).abs() < 1e-6,
+                    "旧单路部分成功仍沿用融合分数: {result}"
+                );
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "各次仅一次Embedding，不生成或重试"
+            );
+            task.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn generic_fallback_strict_and_direction_flags_require_exact_authorization() {
+    for failed_route in ["keyword", "vector"] {
+        for (strict, keyword, vector) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let (state, key, first, _, app) = setup().await;
+            let (_, calls, task) = mock_model(&state).await;
+            document(&state, &first.id, "alpha explicit policy original").await;
+            sqlx::query(if failed_route == "keyword" {
+                "DROP TABLE kb_chunks_fts"
+            } else {
+                "ALTER TABLE kb_chunks RENAME COLUMN embedding TO fixture_missing_embedding"
+            })
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+            let response = app.oneshot(request("GET", &format!(
+                "/api/kb/search?q=alpha&kb_id={}&search_mode=hybrid&timeout_ms=3000&diagnostics=true&strict_retrieval={strict}&allow_keyword_fallback={keyword}&allow_vector_fallback={vector}", first.id),
+                Some(&key.key))).await.unwrap();
+            let status = response.status();
+            let result = body(response).await;
+            let authorized = if failed_route == "keyword" {
+                vector
+            } else {
+                keyword
+            };
+            if authorized {
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "strict={strict}/keyword={keyword}/vector={vector}: {result}"
+                );
+                assert_eq!(
+                    result["data"][0]["content"],
+                    "alpha explicit policy original"
+                );
+                assert_eq!(
+                    result["retrieval_mode"],
+                    if failed_route == "keyword" {
+                        "vector"
+                    } else {
+                        "keyword"
+                    }
+                );
+                assert_eq!(result["data"][0]["score"], 1.0, "显式单路降级保留原始分数");
+                assert_eq!(diagnostic_stage(&result, "fusion")["status"], "skipped");
+                assert_eq!(diagnostic_stage(&result, "retrieval")["status"], "degraded");
+            } else {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{result}");
+                assert_eq!(
+                    result["error"]["code"],
+                    format!("{failed_route}_search_failed")
+                );
+                assert!(result.get("data").is_none());
+            }
+            assert_eq!(
+                diagnostic_stage(&result, &format!("{failed_route}_search"))["status"],
+                "failed"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "strict与allow可同时传入，不添加模型请求"
+            );
+            task.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn generic_fallback_vector_requires_new_policy_after_real_fts_error() {
+    for vector in [None, Some(false), Some(true)] {
+        let (state, key, first, second, app) = setup().await;
+        let (_, calls, task) = mock_model(&state).await;
+        let doc_id = document(&state, &first.id, "alpha authorized vector original").await;
+        document(&state, &second.id, "alpha PRIVATE vector original").await;
+        // 仅破坏本 fixture 的 FTS；向量表和授权记录仍正常。
+        sqlx::query("DROP TABLE kb_chunks_fts")
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(generic_fallback_request(
+                &first.id, &key.key, true, vector, 3000,
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let result = body(response).await;
+        assert_eq!(
+            diagnostic_stage(&result, "keyword_search")["status"],
+            "failed"
+        );
+        assert_eq!(
+            diagnostic_stage(&result, "keyword_search")["code"],
+            "keyword_search_failed"
+        );
+        if vector == Some(true) {
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result["retrieval_mode"], "vector");
+            assert_eq!(result["degradation_reason"], "keyword_search_failed");
+            assert_eq!(result["data"].as_array().unwrap().len(), 1);
+            assert_eq!(result["data"][0]["doc_id"], doc_id);
+            assert_eq!(
+                result["data"][0]["content"],
+                "alpha authorized vector original"
+            );
+            assert_eq!(
+                diagnostic_stage(&result, "vector_search")["status"],
+                "passed"
+            );
+            assert_eq!(diagnostic_stage(&result, "fusion")["status"], "skipped");
+            assert_eq!(diagnostic_stage(&result, "retrieval")["status"], "degraded");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        } else {
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(result["error"]["code"], "keyword_search_failed");
+            assert_eq!(result["error"]["stage"], "keyword_search");
+            assert!(result.get("data").is_none());
+            assert!(calls.load(Ordering::SeqCst) <= 1);
+        }
+        assert!(!result.to_string().contains("PRIVATE vector original"));
+        assert!(!result.to_string().contains("no such table"));
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn generic_fallback_keyword_requires_old_policy_after_real_vector_error() {
+    for keyword in [false, true] {
+        let (state, key, first, second, app) = setup().await;
+        let (_, calls, task) = mock_model(&state).await;
+        let doc_id = document(&state, &first.id, "alpha authorized keyword original").await;
+        document(&state, &second.id, "alpha PRIVATE keyword original").await;
+        // 向量 SELECT 所需列缺失，但 FTS 和正文连接查询仍可工作。
+        sqlx::query("ALTER TABLE kb_chunks RENAME COLUMN embedding TO fixture_missing_embedding")
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(generic_fallback_request(
+                &first.id,
+                &key.key,
+                keyword,
+                Some(true),
+                3000,
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let result = body(response).await;
+        assert_eq!(
+            diagnostic_stage(&result, "vector_search")["status"],
+            "failed"
+        );
+        assert_eq!(
+            diagnostic_stage(&result, "vector_search")["code"],
+            "vector_search_failed"
+        );
+        if keyword {
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result["retrieval_mode"], "keyword");
+            assert_eq!(result["degradation_reason"], "vector_search_failed");
+            assert_eq!(result["data"].as_array().unwrap().len(), 1);
+            assert_eq!(result["data"][0]["doc_id"], doc_id);
+            assert_eq!(
+                result["data"][0]["content"],
+                "alpha authorized keyword original"
+            );
+            assert_eq!(
+                diagnostic_stage(&result, "keyword_search")["status"],
+                "passed"
+            );
+            assert_eq!(result["data"][0]["score"], 1.0, "保留关键词单路原始分数");
+            assert_eq!(diagnostic_stage(&result, "fusion")["status"], "skipped");
+            assert_eq!(diagnostic_stage(&result, "retrieval")["status"], "degraded");
+        } else {
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(result["error"]["code"], "vector_search_failed");
+            assert_eq!(result["error"]["stage"], "vector_search");
+            assert!(result.get("data").is_none());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!result.to_string().contains("PRIVATE keyword original"));
+        assert!(!result.to_string().contains("fixture_missing_embedding"));
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn generic_fallback_vector_policy_reaches_ask_without_extra_generation() {
+    for allow_vector in [false, true] {
+        let (state, key, first, _, app) = setup().await;
+        let (_, calls, task) = mock_model(&state).await;
+        document(&state, &first.id, "alpha authorized answer evidence").await;
+        sqlx::query("DROP TABLE kb_chunks_fts")
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/api/kb/ask",
+                Some(&key.key),
+                &json!({
+                    "kb_id":first.id,"question":"alpha","model":"chat-test",
+                    "search_mode":"hybrid","timeout_ms":3000,"diagnostics":true,
+                    "allow_keyword_fallback":true,"allow_vector_fallback":allow_vector,"strict_retrieval":true
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let result = body(response).await;
+        if allow_vector {
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result["answer"], "BCD");
+            assert_eq!(result["retrieval_mode"], "vector");
+            assert_eq!(result["degradation_reason"], "keyword_search_failed");
+            assert_eq!(result["sources"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                result["sources"][0]["snippet"],
+                "alpha authorized answer evidence"
+            );
+            assert_eq!(diagnostic_stage(&result, "fusion")["status"], "skipped");
+            assert_eq!(diagnostic_stage(&result, "answer")["status"], "passed");
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "仅一次Embedding和一次生成");
+        } else {
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{result}");
+            assert_eq!(result["error"]["code"], "keyword_search_failed");
+            assert!(result.get("answer").is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "未授权降级不能生成");
+        }
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn generic_fallback_cannot_report_success_when_both_routes_fail_or_survivor_is_empty() {
+    for both_fail in [true, false] {
+        let (state, key, first, _, app) = setup().await;
+        let (_, calls, task) = mock_model(&state).await;
+        document(&state, &first.id, "alpha fixture original").await;
+        if both_fail {
+            sqlx::query(
+                "ALTER TABLE kb_chunks RENAME COLUMN embedding TO fixture_missing_embedding",
+            )
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+        } else {
+            sqlx::query("UPDATE kb_chunks SET embedding = NULL")
+                .execute(&state.db.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DROP TABLE kb_chunks_fts")
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(generic_fallback_request(
+                &first.id,
+                &key.key,
+                true,
+                Some(true),
+                3000,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if both_fail {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        );
+        let result = body(response).await;
+        assert_eq!(
+            result["error"]["code"],
+            if both_fail {
+                "retrieval_both_failed"
+            } else {
+                "retrieval_empty"
+            }
+        );
+        assert!(result.get("data").is_none());
+        assert_eq!(
+            diagnostic_stage(&result, "keyword_search")["code"],
+            "keyword_search_failed"
+        );
+        if both_fail {
+            assert_eq!(
+                diagnostic_stage(&result, "vector_search")["code"],
+                "vector_search_failed"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn generic_fallback_flags_cannot_bypass_identity_grants_model_permission_or_quota() {
+    for fault in ["disabled", "private_kb", "denied_model", "quota"] {
+        let (state, key, first, second, app) = setup().await;
+        let (_, calls, task) = mock_model(&state).await;
+        document(&state, &first.id, "alpha authorized original").await;
+        let kb_id = if fault == "private_kb" {
+            &second.id
+        } else {
+            &first.id
+        };
+        if fault != "private_kb" {
+            sqlx::query(match fault {
+                "disabled" => "UPDATE api_keys SET status = 0 WHERE id = ?",
+                "denied_model" => {
+                    "UPDATE api_keys SET denied_models = '[\"embed-test\"]' WHERE id = ?"
+                }
+                "quota" => "UPDATE api_keys SET quota_used = quota_limit WHERE id = ?",
+                _ => unreachable!(),
+            })
+            .bind(&key.id)
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+        }
+        let response = app
+            .oneshot(generic_fallback_request(
+                kb_id,
+                &key.key,
+                true,
+                Some(true),
+                2000,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            match fault {
+                "disabled" => StatusCode::UNAUTHORIZED,
+                "quota" => StatusCode::TOO_MANY_REQUESTS,
+                _ => StatusCode::FORBIDDEN,
+            },
+            "{fault}"
+        );
+        let result = body(response).await;
+        assert!(result.get("data").is_none());
+        assert_eq!(result["error"]["stage"], "permission");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{fault}");
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn generic_fallback_rechecks_grants_before_returning_surviving_vector_material() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) =
+        mock_model_with_delay(&state, "unused", std::time::Duration::from_millis(250)).await;
+    document(&state, &first.id, "alpha authorized original").await;
+    sqlx::query("DROP TABLE kb_chunks_fts")
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+    let input = generic_fallback_request(&first.id, &key.key, true, Some(true), 2000);
+    let search = tokio::spawn(async move { app.oneshot(input).await });
+    wait_for_mock_request(&calls).await;
+    set_grants(&state.db.pool, &key.id, &[]).await.unwrap();
+    let response = search.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let result = body(response).await;
+    assert!(result.get("data").is_none());
+    assert_eq!(result["error"]["code"], "knowledge_access_denied");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+// 该用例依赖上游 sqlite-compat 的 libsqlite3-sys 探针（LKAPI 未引入该兼容层），
+// 0.4.2 复刻时暂时移除，其余用例保持完整。
+#[tokio::test]
+async fn generic_fallback_completed_embedding_can_exhaust_quota_without_losing_material() {
+    for fts_failure in [false, true] {
+        let (state, key, first, _, app) = setup().await;
+        let (_, calls, task) = mock_model(&state).await;
+        let doc_id = document(&state, &first.id, "alpha authorized original").await;
+        sqlx::query("UPDATE api_keys SET quota_limit = 7 WHERE id = ?")
+            .bind(&key.id)
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+        if fts_failure {
+            sqlx::query("DROP TABLE kb_chunks_fts")
+                .execute(&state.db.pool)
+                .await
+                .unwrap();
+        }
+        let response = app
+            .clone()
+            .oneshot(generic_fallback_request(
+                &first.id,
+                &key.key,
+                true,
+                Some(true),
+                3000,
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let result = body(response).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(
+            result["retrieval_mode"],
+            if fts_failure { "vector" } else { "hybrid" }
+        );
+        assert_eq!(result["data"][0]["doc_id"], doc_id);
+        assert_eq!(result["data"][0]["content"], "alpha authorized original");
+        let quota_used: i64 = sqlx::query_scalar("SELECT quota_used FROM api_keys WHERE id = ?")
+            .bind(&key.id)
+            .fetch_one(&state.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(quota_used, 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let response = app
+            .oneshot(generic_fallback_request(
+                &first.id,
+                &key.key,
+                true,
+                Some(true),
+                3000,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(body(response).await.get("data").is_none());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "额度耗尽后禁止再次调用模型"
+        );
+        task.abort();
+    }
+}
+
+fn mcp_json_content(response: &Value) -> Value {
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    serde_json::from_str(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("MCP 应返回 text content"),
+    )
+    .expect("该 MCP 请求应返回可解析 JSON")
+}
+
+#[tokio::test]
+async fn generic_mcp_search_preserves_legacy_array_and_opt_in_metadata() {
+    let (state, key, first, second, app) = setup().await;
+    let (_, calls, task) = mock_model(&state).await;
+    let doc_id = document(&state, &first.id, "alpha authorized MCP material").await;
+    document(&state, &second.id, "alpha PRIVATE MCP material").await;
+    sqlx::query("UPDATE kb_chunks SET metadata = ? WHERE kb_id = ?")
+        .bind(r#"{"heading":"authorized heading","page_no":3}"#)
+        .bind(&first.id)
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE kb_chunks SET metadata = ? WHERE kb_id = ?")
+        .bind(r#"{"private_marker":"PRIVATE MCP metadata"}"#)
+        .bind(&second.id)
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+    for extra in [
+        json!({}),
+        json!({"allow_vector_fallback":true}),
+        json!({"timeout_ms":2000}),
+        json!({"diagnostics":true}),
+    ] {
+        let mut arguments = json!({"kb_id":first.id,"query":"alpha","search_mode":"hybrid"});
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let response = body(
+            app.clone()
+                .oneshot(rpc(&key.key, "search_knowledge_base", arguments))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let value = mcp_json_content(&response);
+        let data = if extra.as_object().unwrap().is_empty() {
+            assert!(value.is_array(), "旧请求保持数组结构");
+            &value
+        } else {
+            assert!(value["request_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()));
+            assert_eq!(value["retrieval_mode"], "hybrid");
+            assert!(value.get("degradation_reason").is_none());
+            if extra["diagnostics"] == true {
+                assert_eq!(
+                    diagnostic_stage(&value, "keyword_search")["status"],
+                    "passed"
+                );
+                assert_eq!(
+                    diagnostic_stage(&value, "vector_search")["status"],
+                    "passed"
+                );
+            } else {
+                assert!(value.get("diagnostics").is_none());
+            }
+            &value["data"]
+        };
+        assert_eq!(data.as_array().unwrap().len(), 1);
+        assert_eq!(data[0]["doc_id"], doc_id);
+        assert_eq!(data[0]["content"], "alpha authorized MCP material");
+        assert_eq!(
+            data[0]["metadata"],
+            json!({"heading":"authorized heading","page_no":3})
+        );
+        assert!(!response.to_string().contains("PRIVATE MCP"));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 4, "各请求仅一次Embedding");
+    task.abort();
+}
+
+#[tokio::test]
+async fn generic_mcp_vector_fallback_requires_flag_and_preserves_scoped_metadata() {
+    for allow_vector in [None, Some(false), Some(true)] {
+        let (state, key, first, second, app) = setup().await;
+        let (_, calls, task) = mock_model(&state).await;
+        let doc_id = document(&state, &first.id, "alpha authorized MCP vector original").await;
+        document(&state, &second.id, "alpha PRIVATE MCP vector original").await;
+        sqlx::query("UPDATE kb_chunks SET metadata = ? WHERE kb_id = ?")
+            .bind(r#"{"heading":"authorized vector heading","page_no":4}"#)
+            .bind(&first.id)
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE kb_chunks_fts")
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+        let mut arguments = json!({
+            "kb_id":first.id,"query":"alpha","search_mode":"hybrid",
+            "allow_keyword_fallback":true,"diagnostics":true
+        });
+        if let Some(value) = allow_vector {
+            arguments["allow_vector_fallback"] = json!(value);
+        }
+        let response = body(
+            app.oneshot(rpc(&key.key, "search_knowledge_base", arguments))
+                .await
+                .unwrap(),
+        )
+        .await;
+        if allow_vector == Some(true) {
+            let value = mcp_json_content(&response);
+            assert_eq!(value["retrieval_mode"], "vector");
+            assert_eq!(value["degradation_reason"], "keyword_search_failed");
+            assert_eq!(value["data"].as_array().unwrap().len(), 1);
+            assert_eq!(value["data"][0]["doc_id"], doc_id);
+            assert_eq!(
+                value["data"][0]["content"],
+                "alpha authorized MCP vector original"
+            );
+            assert_eq!(
+                value["data"][0]["metadata"],
+                json!({"heading":"authorized vector heading","page_no":4})
+            );
+            assert_eq!(
+                diagnostic_stage(&value, "keyword_search")["code"],
+                "keyword_search_failed"
+            );
+            assert_eq!(
+                diagnostic_stage(&value, "vector_search")["status"],
+                "passed"
+            );
+            assert_eq!(diagnostic_stage(&value, "fusion")["status"], "skipped");
+            assert_eq!(diagnostic_stage(&value, "retrieval")["status"], "degraded");
+        } else {
+            assert_eq!(response["result"]["isError"], true);
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.starts_with("HTTP 500:"), "{response}");
+            assert!(!text.contains("authorized MCP vector original"));
+        }
+        assert!(!response.to_string().contains("PRIVATE MCP vector original"));
+        assert!(!response.to_string().contains("no such table"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn generic_mcp_tools_schema_keeps_both_fallback_directions_disabled_by_default() {
+    let (state, key, _, _, _) = setup().await;
+    let mcp_token = "test-mcp-0123456789abcdef0123456789abcdef";
+    let app = build_router(state.clone(), test_shared(&state, None, Some(mcp_token)));
+    for token in [key.key.as_str(), mcp_token] {
+        let response = body(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/mcp",
+                    Some(token),
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        for name in ["search_knowledge_base", "ask_knowledge_base"] {
+            let tool = response["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            for flag in [
+                "allow_keyword_fallback",
+                "allow_vector_fallback",
+                "strict_retrieval",
+            ] {
+                assert_eq!(tool["inputSchema"]["properties"][flag]["type"], "boolean");
+                assert_eq!(tool["inputSchema"]["properties"][flag]["default"], false);
+                assert!(!tool["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == flag));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn generic_mcp_admin_cannot_query_disabled_or_unexposed_explicit_kb() {
+    for fault in ["disabled", "mcp_off"] {
+        let (state, _, first, _, _) = setup().await;
+        let (_, calls, task) = mock_model(&state).await;
+        document(&state, &first.id, "alpha forbidden MCP material").await;
+        sqlx::query(if fault == "disabled" {
+            "UPDATE kb_knowledge_bases SET status = 0 WHERE id = ?"
+        } else {
+            "UPDATE kb_knowledge_bases SET mcp_enabled = 0 WHERE id = ?"
+        })
+        .bind(&first.id)
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+        let token = "test-mcp-0123456789abcdef0123456789abcdef";
+        let app = build_router(state.clone(), test_shared(&state, None, Some(token)));
+        for name in ["search_knowledge_base", "ask_knowledge_base"] {
+            let response = body(
+                app.clone()
+                    .oneshot(rpc(
+                        token,
+                        name,
+                        json!({
+                            "kb_id":first.id,"query":"alpha","question":"alpha","model":"chat-test",
+                            "search_mode":"hybrid","timeout_ms":2000,
+                            "allow_keyword_fallback":true,"allow_vector_fallback":true
+                        }),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                response["error"]["code"], -32603,
+                "{fault}/{name}: {response}"
+            );
+            assert!(response.get("result").is_none());
+            assert!(response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("知识库未开启 MCP 查询"));
+            assert!(!response.to_string().contains("forbidden MCP material"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn generic_mcp_admin_diagnostics_are_rejected_without_upstream_calls() {
+    let (state, _, first, _, _) = setup().await;
+    let (_, calls, task) = mock_model(&state).await;
+    document(&state, &first.id, "alpha MCP original").await;
+    let token = "test-mcp-0123456789abcdef0123456789abcdef";
+    let app = build_router(state.clone(), test_shared(&state, None, Some(token)));
+    for name in ["search_knowledge_base", "ask_knowledge_base"] {
+        let response = body(
+            app.clone()
+                .oneshot(rpc(
+                    token,
+                    name,
+                    json!({
+                        "kb_id":first.id,"query":"alpha","question":"alpha","model":"chat-test",
+                        "diagnostics":true,"allow_vector_fallback":true,"timeout_ms":2000
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], -32603, "{name}: {response}");
+        assert!(response.get("result").is_none());
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("知识库健康检测需要使用普通 API Key"));
+        assert!(!response.to_string().contains("alpha MCP original"));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn generic_mcp_admin_ask_rejects_invalid_query_limits_before_model_io() {
+    let (state, _, first, _, _) = setup().await;
+    let (_, calls, task) = mock_model(&state).await;
+    document(&state, &first.id, "alpha MCP original must not be returned").await;
+    let token = "test-mcp-0123456789abcdef0123456789abcdef";
+    let app = build_router(state.clone(), test_shared(&state, None, Some(token)));
+    for invalid in [
+        json!({"top_k":0}),
+        json!({"top_k":51}),
+        json!({"search_mode":"unsupported"}),
+        json!({"vector_weight":1e100}),
+        json!({"keyword_weight":1e100}),
+        json!({"question":" "}),
+    ] {
+        let mut arguments = json!({
+            "kb_id":first.id,"question":"alpha","model":"chat-test",
+            "search_mode":"hybrid","allow_keyword_fallback":true,"allow_vector_fallback":true
+        });
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(invalid.as_object().unwrap().clone());
+        let response = body(
+            app.clone()
+                .oneshot(rpc(token, "ask_knowledge_base", arguments))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], -32603, "{invalid}: {response}");
+        assert!(response.get("result").is_none());
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid query"));
+        assert!(!response
+            .to_string()
+            .contains("alpha MCP original must not be returned"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{invalid}");
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn generic_mcp_admin_default_search_keeps_rrf_text_and_scores_across_settings() {
+    let (state, _, first, _, _) = setup().await;
+    let (_, calls, task) = mock_model(&state).await;
+    document(&state, &first.id, "alpha MCP fusion compatibility material").await;
+    let token = "test-mcp-0123456789abcdef0123456789abcdef";
+    let app = build_router(state.clone(), test_shared(&state, None, Some(token)));
+    let mut responses = Vec::new();
+    for mode in ["weighted", "rrf"] {
+        state
+            .settings
+            .set_many(&[("kb.fusion_mode".into(), json!(mode))])
+            .unwrap();
+        assert_eq!(state.settings.get_str("kb.fusion_mode", ""), mode);
+        let response = body(
+            app.clone()
+                .oneshot(rpc(
+                    token,
+                    "search_knowledge_base",
+                    json!({
+                        "kb_id":first.id,"query":"alpha"
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false, "{mode}: {response}");
+        let content = &response["result"]["content"];
+        assert_eq!(content.as_array().unwrap().len(), 1);
+        let text = content[0]["text"].as_str().unwrap();
+        // 同一首位候选的 RRF 总分约 0.0328，weighted 为 1.0；fixture 能区分接线错误。
+        assert_eq!(text, "[test.txt] (score: 0.03, vec: 1.00, kw: 1.00)\nalpha MCP fusion compatibility material");
+        responses.push(content.clone());
+    }
+    assert_eq!(
+        responses[0], responses[1],
+        "全局设置不得改变管理 MCP 的旧 RRF 文本与分数"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "两次检索各一次Embedding");
+    task.abort();
+}
+
+#[tokio::test]
+async fn generic_mcp_admin_legacy_keyword_and_cross_kb_text_keep_original_format() {
+    let (state, _, first, second, _) = setup().await;
+    let (channel, calls, task) = mock_model(&state).await;
+    sqlx::query("UPDATE channels SET models = '[\"chat-test\",\"embed-test\",\"text-embedding-3-small\"]' WHERE id = ?")
+        .bind(channel).execute(&state.db.pool).await.unwrap();
+    document(&state, &first.id, "alpha first legacy original").await;
+    document(&state, &second.id, "alpha second legacy original").await;
+    let token = "test-mcp-0123456789abcdef0123456789abcdef";
+    let app = build_router(state.clone(), test_shared(&state, None, Some(token)));
+    let keyword = body(
+        app.clone()
+            .oneshot(rpc(
+                token,
+                "search_knowledge_base",
+                json!({
+                    "kb_id":first.id,"query":"alpha","search_mode":"keyword"
+                }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(keyword["result"]["isError"], false, "{keyword}");
+    assert_eq!(
+        keyword["result"]["content"],
+        json!([{
+            "type":"text","text":"[test.txt] (score: 1.00) [keyword]\nalpha first legacy original"
+        }])
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let cross_kb = body(
+        app.oneshot(rpc(
+            token,
+            "search_knowledge_base",
+            json!({"query":"alpha"}),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(cross_kb["result"]["isError"], false, "{cross_kb}");
+    let mut texts: Vec<_> = cross_kb["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value["text"].as_str().unwrap())
+        .collect();
+    texts.sort();
+    assert_eq!(
+        texts,
+        [
+            "[test.txt] (score: 1.00)\nalpha first legacy original",
+            "[test.txt] (score: 1.00)\nalpha second legacy original"
+        ]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn generic_mcp_legacy_partial_keeps_first_array_and_appends_safe_metadata() {
+    let (state, key, first, second, app) = setup().await;
+    let (_, calls, task) = mock_model(&state).await;
+    let doc_id = document(&state, &first.id, "alpha legacy scoped partial original").await;
+    document(&state, &second.id, "alpha PRIVATE legacy scoped partial").await;
+    sqlx::query("DROP TABLE kb_chunks_fts")
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+    let response = body(
+        app.oneshot(rpc(
+            &key.key,
+            "search_knowledge_base",
+            json!({"kb_id":first.id,"query":"alpha"}),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let content = response["result"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2, "保留旧数组首块，降级元数据独立追加");
+    let data: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(data.as_array().unwrap().len(), 1);
+    assert_eq!(data[0]["doc_id"], doc_id);
+    assert_eq!(data[0]["content"], "alpha legacy scoped partial original");
+    assert!((data[0]["score"].as_f64().unwrap() - 1.0 / 61.0).abs() < 1e-6);
+    let metadata: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["retrieval_mode"], "vector");
+    assert_eq!(metadata["degradation_reason"], "keyword_search_failed");
+    assert!(uuid::Uuid::parse_str(metadata["request_id"].as_str().unwrap()).is_ok());
+    assert!(metadata.get("data").is_none());
+    assert!(!metadata.to_string().contains("original"));
+    assert!(!response
+        .to_string()
+        .contains("PRIVATE legacy scoped partial"));
+    assert!(!response.to_string().contains("no such table"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn generic_mcp_admin_legacy_partial_keeps_first_text_and_appends_safe_metadata() {
+    let (state, _, first, second, _) = setup().await;
+    let (_, calls, task) = mock_model(&state).await;
+    document(&state, &first.id, "alpha legacy admin partial original").await;
+    document(&state, &second.id, "alpha unrelated legacy admin partial").await;
+    sqlx::query("DROP TABLE kb_chunks_fts")
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+    let token = "test-mcp-0123456789abcdef0123456789abcdef";
+    let app = build_router(state.clone(), test_shared(&state, None, Some(token)));
+    let response = body(
+        app.oneshot(rpc(
+            token,
+            "search_knowledge_base",
+            json!({"kb_id":first.id,"query":"alpha"}),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let content = response["result"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    assert_eq!(
+        content[0]["text"],
+        "[test.txt] (score: 0.02, vec: 1.00)\nalpha legacy admin partial original"
+    );
+    let metadata: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["retrieval_mode"], "vector");
+    assert_eq!(metadata["degradation_reason"], "keyword_search_failed");
+    assert!(uuid::Uuid::parse_str(metadata["request_id"].as_str().unwrap()).is_ok());
+    assert!(metadata.get("data").is_none());
+    assert!(!metadata.to_string().contains("original"));
+    assert!(!response
+        .to_string()
+        .contains("unrelated legacy admin partial"));
+    assert!(!response.to_string().contains("no such table"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn generic_mcp_explicit_failure_diagnostics_preserve_safe_stages_and_legacy_text() {
+    let mut legacy_texts = Vec::new();
+    for diagnostics in [false, true] {
+        let (state, key, first, _, app) = setup().await;
+        let (_, calls, task) = mock_model(&state).await;
+        document(
+            &state,
+            &first.id,
+            "alpha MCP diagnostic original must remain private",
+        )
+        .await;
+        sqlx::query("DROP TABLE kb_chunks_fts")
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+        let response = body(
+            app.oneshot(rpc(
+                &key.key,
+                "search_knowledge_base",
+                json!({
+                    "kb_id":first.id,"query":"alpha","search_mode":"hybrid",
+                    "allow_vector_fallback":false,"strict_retrieval":true,"diagnostics":diagnostics
+                }),
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let content = response["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), if diagnostics { 2 } else { 1 });
+        assert_eq!(content[0]["type"], "text");
+        let legacy_text = content[0]["text"].as_str().unwrap();
+        assert!(legacy_text.starts_with("HTTP 500:"));
+        legacy_texts.push(legacy_text.to_string());
+        if diagnostics {
+            assert_eq!(content[1]["type"], "text");
+            let details: Value = serde_json::from_str(content[1]["text"].as_str().unwrap())
+                .expect("显式失败诊断使用与REST相同的安全JSON结构");
+            assert_eq!(details["error"]["code"], "keyword_search_failed");
+            assert_eq!(details["error"]["stage"], "keyword_search");
+            let request_id = details["error"]["request_id"].as_str().unwrap();
+            assert!(!request_id.is_empty());
+            assert_eq!(details["diagnostics"]["request_id"], request_id);
+            assert_eq!(
+                diagnostic_stage(&details, "keyword_search")["status"],
+                "failed"
+            );
+            assert_eq!(
+                diagnostic_stage(&details, "keyword_search")["code"],
+                "keyword_search_failed"
+            );
+            assert_eq!(diagnostic_stage(&details, "embedding")["status"], "passed");
+            assert_eq!(
+                diagnostic_stage(&details, "vector_search")["status"],
+                "passed"
+            );
+            assert!(details.get("data").is_none());
+            assert!(details.get("sources").is_none());
+            assert!(!details.to_string().contains("\"object\":\"list\""));
+        }
+        let encoded = response.to_string();
+        assert!(!encoded.contains("MCP diagnostic original must remain private"));
+        assert!(!encoded.contains("no such table"));
+        assert!(!encoded.contains("mock-upstream"));
+        assert!(!encoded.contains(&key.key));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "仅一次Embedding，不生成或重试"
+        );
+        task.abort();
+    }
+    assert_eq!(legacy_texts[0], legacy_texts[1], "首个错误文本保持旧合同");
 }
