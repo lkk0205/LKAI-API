@@ -24,6 +24,10 @@ pub struct KbKnowledgeBase {
     /// 知识库级 OCR 视觉模型（如 qwen-vl-max）；None/空 = 不启用。
     /// 仅在全局设置 ocr.enabled 开启后对扫描版 PDF 生效。
     pub ocr_model: Option<String>,
+    /// 知识库级推理档位（default/none/low/medium/high）；None/空 = 跟随模型默认。
+    pub reasoning_effort: Option<String>,
+    /// 知识库级采样温度（0~2）；None = 用问答默认值。
+    pub temperature: Option<f64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -35,6 +39,8 @@ pub struct CreateKbInput {
     pub embedding_model: Option<String>,
     pub embedding_channel_id: Option<String>,
     pub ocr_model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub temperature: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +58,8 @@ pub struct UpdateKbInput {
     pub included_files: Option<String>,
     pub embedding_batch_size: Option<i64>,
     pub ocr_model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub temperature: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -73,7 +81,7 @@ pub struct KbDocument {
     pub doc_meta: String,
     /// OCR 识别引擎（'vlm' / NULL = 未经过 OCR）
     pub ocr_engine: Option<String>,
-    /// PDF 页数（仅 OCR 文档回填）
+    /// PDF 实际页数；未重新导入的旧文档可能为 0。
     pub page_count: i64,
     /// OCR 失败页码的 JSON 数组（如 "[3,7]"）
     pub ocr_failed_pages: String,
@@ -133,7 +141,7 @@ pub struct RagAnswer {
     pub retrieval_details: Option<Vec<RetrievalDetail>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<RagDiagnostics>,
-    /// 仅显式启用关键词降级的请求返回实际检索模式。
+    /// 显式选择检索策略或实际部分成功时返回检索模式。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,6 +176,11 @@ pub struct RagDiagnosticStage {
     pub stage: String,
     pub status: String,
     pub elapsed_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// stage / channel / request；仅失败的截止或取消阶段提供。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,12 +287,21 @@ pub struct AskInput {
     /// 授权通过后的可恢复向量查询失败，允许使用关键词检索。
     #[serde(default)]
     pub allow_keyword_fallback: bool,
+    /// hybrid 的可恢复关键词检索失败，允许使用已授权的向量结果；默认关闭。
+    #[serde(default)]
+    pub allow_vector_fallback: bool,
+    /// 禁用历史本地分支隐式部分成功；仍允许显式授权的降级方向。
+    #[serde(default)]
+    pub strict_retrieval: bool,
     /// 最终截断前的候选池；省略时保持普通请求原有行为。
     #[serde(default)]
     pub candidate_k: Option<usize>,
     /// 省略或 default 不覆盖网关 / 模型默认；其他档位使用通用协议参数。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// 采样温度（0~2）；省略时用知识库级配置，再省略则跟随模型默认。
+    #[serde(default)]
+    pub temperature: Option<f64>,
 }
 
 fn default_top_k() -> usize {
