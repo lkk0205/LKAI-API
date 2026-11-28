@@ -1,0 +1,5 @@
+# 迁移文件的字节内容参与 sqlx migrate! 的 SHA-384 校验：
+# 行尾转换会改变编译期内嵌的 checksum，导致已安装数据库启动时 VersionMismatch。
+# 锁定 LF，禁止 EOL 转换；历史 CRLF 库由启动期修复函数兼容。
+
+src-tauri/migrations/*.sql text eol=lf
