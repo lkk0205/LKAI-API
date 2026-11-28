@@ -4,6 +4,7 @@ import type {
   ChannelKey,
   ApiKey, CreateApiKeyInput, ApiKeyStats,
   RequestLog, LogStats, SecurityFinding,
+  LogPromptPart, LogAttempt, PromptPartStat, RouteFlow, DailyTokenPoint,
   DashboardStats,
   ModelStats,
   TokenTrendPoint,
@@ -88,8 +89,11 @@ export interface KnowledgeHealthTest {
 }
 
 export const apiKeyApi = {
+  getAnswerModels: (id: string) => invoke<string[]>("get_api_key_answer_models", { id }),
   getKnowledgeAccess: (id: string) => invoke<string[]>("get_api_key_knowledge_access", { id }),
   setKnowledgeAccess: (id: string, kbIds: string[]) => invoke<void>("set_api_key_knowledge_access", { id, kbIds }),
+  getWikiAccess: (id: string) => invoke<string[]>("get_api_key_wiki_access", { id }),
+  setWikiAccess: (id: string, projectIds: string[]) => invoke<void>("set_api_key_wiki_access", { id, projectIds }),
   testKnowledgeAccess: (id: string, kbId: string) => invoke<{ rest_status: number; rest_ok: boolean; mcp_status: number; mcp_ok: boolean }>("test_api_key_knowledge_access", { id, kbId }),
   testKnowledgeHealth: (id: string, kbId: string, model: string, question: string, searchMode: string) =>
     invoke<KnowledgeHealthTest>("test_api_key_knowledge_health", { id, kbId, model, question, searchMode }),
@@ -108,11 +112,24 @@ export interface GetLogsInput {
   keyword?: string;
   api_key_name?: string;
   channel_name?: string;
+  /** 调用来源精确匹配（快捷筛选 chips 使用，值来自 getLogFilterOptions）。 */
+  client_name?: string;
   model?: string;
   date_from?: string;
   date_to?: string;
   trace_id?: string;
   upstream_type?: "channel" | "auth_account";
+}
+
+/** 日志快捷筛选选项：近 7 天调用来源 / 渠道去重列表（附请求数，降序）。 */
+export interface LogFilterOption {
+  name: string;
+  count: number;
+}
+
+export interface LogFilterOptions {
+  clients: LogFilterOption[];
+  channels: LogFilterOption[];
 }
 
 // Log commands
@@ -121,15 +138,65 @@ export const logApi = {
   getAll: (input?: GetLogsInput) => invoke<RequestLog[]>("get_logs", { input: input || {} }),
   /** 与 getAll 相同过滤条件下的日志总数，用于分页页码展示。 */
   count: (input?: GetLogsInput) => invoke<number>("count_logs", { input: input || {} }),
+  /** 快捷筛选选项：最近调用来源 + 渠道（按近 7 天请求数降序）。 */
+  getFilterOptions: () => invoke<LogFilterOptions>("get_log_filter_options", {}),
   get: (id: string) => invoke<RequestLog>("get_log", { id }),
   getSecurityFindings: (logId: string) => invoke<SecurityFinding[]>("get_log_security_findings", { logId }),
   /** 流式请求的已生成内容段（detailed 策略下落库；按 seq 升序拼接即完整内容）。 */
   getStreamSegments: (logId: string) => invoke<Array<{ seq: number; content: string }>>("get_log_stream_segments", { logId }),
+  /** 单条日志的按消息分类 token 拆分（迁移 048，上下文构成卡片）。 */
+  getPromptParts: (logId: string) => invoke<LogPromptPart[]>("get_log_prompt_parts", { logId }),
+  /** 单条日志的上游尝试明细（迁移 048，failover 时间线）。 */
+  getAttempts: (logId: string) => invoke<LogAttempt[]>("get_log_attempts", { logId }),
   getStats: (days?: number) => invoke<LogStats[]>("get_log_stats", { days }),
   delete: (id: string) => invoke<void>("delete_log", { id }),
   deleteBefore: (beforeDate: string) => invoke<number>("delete_logs_before", { beforeDate }),
   deleteAll: () => invoke<number>("delete_all_logs"),
+  /** 多条件组合清理日志(Task 4):时间 + 状态/成功与否 + 渠道/Key/模型,AND 组合。
+   *  clear_stats=true 同步清除对应 usage_stats;dry_run=true 只返回匹配行数不删除。 */
+  deleteMany: (input: DeleteLogsInput) => invoke<DeleteLogsReport>("delete_logs", { input }),
+  /** 独立清除历史统计数据(不删日志)。 */
+  clearStats: (input: DeleteLogsInput) => invoke<number>("clear_usage_stats", { input }),
+  /** 按渠道维度组合清理(渠道清理 tab):清日志/清统计/重置失败计数,dry_run 预览。 */
+  cleanupChannel: (input: CleanupChannelInput) => invoke<CleanupChannelReport>("cleanup_channel", { input }),
 };
+
+export interface CleanupChannelInput {
+  channel_id: string;
+  before_date?: string;
+  after_date?: string;
+  keep_recent_days?: number;
+  clear_logs?: boolean;
+  clear_stats?: boolean;
+  reset_fail?: boolean;
+  dry_run?: boolean;
+}
+
+export interface CleanupChannelReport {
+  dry_run: boolean;
+  matched_logs: number;
+  matched_stats: number;
+  reset_fail_rows: number;
+}
+
+export interface DeleteLogsInput {
+  before_date?: string;
+  after_date?: string;
+  keep_recent_days?: number;
+  status_code?: number;
+  is_success?: boolean;
+  channel_id?: string;
+  api_key_id?: string;
+  model?: string;
+  clear_stats?: boolean;
+  dry_run?: boolean;
+}
+
+export interface DeleteLogsReport {
+  dry_run: boolean;
+  matched_logs: number;
+  matched_stats: number;
+}
 
 // Auth account commands. All result contracts are safe summaries; credential
 // payloads remain inside the native command layer.
@@ -189,6 +256,12 @@ export const statsApi = {
   getDashboard: () => invoke<DashboardStats>("get_dashboard_stats"),
   getModelStats: () => invoke<ModelStats[]>("get_model_stats"),
   getTokenTrend: (hours?: number) => invoke<TokenTrendPoint[]>("get_token_trend", { hours: hours ?? 24 }),
+  /** 近 N 小时按消息分类聚合的 token 构成（迁移 048）。 */
+  getPromptPartStats: (hours?: number) => invoke<PromptPartStat[]>("get_prompt_part_stats", { hours: hours ?? 24 }),
+  /** 路由图渠道侧流量数据（迁移 048）。 */
+  getRouteFlow: (hours?: number) => invoke<RouteFlow[]>("get_route_flow", { hours: hours ?? 24 }),
+  /** 每日 token 消耗聚合（热力图数据源，默认近 182 天）。 */
+  getDailyTokenStats: (days?: number) => invoke<DailyTokenPoint[]>("get_daily_token_stats", { days: days ?? 182 }),
 };
 
 // Settings commands
@@ -293,6 +366,8 @@ export interface KnowledgeBase {
     embedding_model: string | null;
     embedding_channel_id: string | null;
     ocr_model: string | null;
+    reasoning_effort: string | null;
+    temperature: number | null;
     mcp_enabled: number;
     chunk_size: number;
     chunk_overlap: number;
@@ -304,6 +379,20 @@ export interface KnowledgeBase {
     embedding_batch_size: number;
     created_at: string;
     updated_at: string;
+}
+
+/** doc_meta.pdf_text_extraction：只记录文字层质量，不含原文，不代表内容完整性。 */
+export interface PdfTextExtraction {
+  version: 1;
+  page_count: number;
+  status: "complete" | "partial" | "failed";
+  pages: {
+    page_no: number;
+    char_count: number;
+    status: "extracted" | "insufficient" | "failed";
+    error_code?: string;
+  }[];
+  error_code?: string;
 }
 
 export interface KbDocument {
@@ -323,6 +412,7 @@ export interface KbDocument {
   source_path: string | null;
   doc_meta: string;
   ocr_engine: string | null;
+  /** PDF 页面树中的页数；未记录或无法读取页面树时为 0。 */
   page_count: number;
   /** JSON 数组字符串，如 "[3,7]"，前端自行 JSON.parse */
   ocr_failed_pages: string;
@@ -410,14 +500,16 @@ export interface KbTag {
 export const kbApi = {
   getEmbeddingCapability: (model: string) => invoke<{ available: boolean; message: string }>("get_knowledge_embedding_capability", { model }),
   getAll: () => invoke<KnowledgeBase[]>("get_knowledge_bases"),
-  create: (input: { name: string; description?: string; embedding_model?: string; ocr_model?: string | null }) =>
+  create: (input: { name: string; description?: string; embedding_model?: string; embedding_channel_id?: string; ocr_model?: string | null; reasoning_effort?: string | null; temperature?: number | null }) =>
     invoke<KnowledgeBase>("create_knowledge_base", { input }),
-  update: (id: string, input: Partial<{ name: string; description: string; embedding_model: string; embedding_channel_id: string; ocr_model: string | null; status: number; mcp_enabled: number; chunk_size: number; chunk_overlap: number; excluded_dirs: string; excluded_files: string; included_files: string; embedding_batch_size: number }>) =>
+  update: (id: string, input: Partial<{ name: string; description: string; embedding_model: string; embedding_channel_id: string; ocr_model: string | null; reasoning_effort: string | null; temperature: number | null; status: number; mcp_enabled: number; chunk_size: number; chunk_overlap: number; excluded_dirs: string; excluded_files: string; included_files: string; embedding_batch_size: number }>) =>
         invoke<KnowledgeBase>("update_knowledge_base", { id, input }),
   delete: (id: string) => invoke<void>("delete_knowledge_base", { id }),
   getDocuments: (kbId: string) => invoke<KbDocument[]>("get_kb_documents", { kbId }),
   uploadDocument: (input: { kb_id: string; filename: string; content: string }) =>
     invoke<KbDocument>("upload_kb_document", { input }),
+  uploadDocumentFromPath: (kbId: string, path: string) =>
+    invoke<KbDocument>("upload_kb_document_from_path", { kbId, path }),
   deleteDocument: (docId: string, kbId: string) =>
     invoke<void>("delete_kb_document", { docId, kbId }),
   reindexDocument: (docId: string) =>
@@ -454,6 +546,10 @@ export interface WikiProject {
     chat_model: string | null;
     ingest_channel_id: string | null;
     chat_channel_id: string | null;
+    pdf_ocr_channel_id: string | null;
+    pdf_ocr_model: string | null;
+    reasoning_effort: string | null;
+    temperature: number | null;
     mcp_enabled: number;
     source_count: number;
     page_count: number;
@@ -470,6 +566,10 @@ export interface CreateWikiProjectInput {
     chat_model?: string;
     ingest_channel_id?: string;
     chat_channel_id?: string;
+    pdf_ocr_channel_id?: string;
+    pdf_ocr_model?: string;
+    reasoning_effort?: string;
+    temperature?: number;
     schema_text?: string;
 }
 
@@ -482,6 +582,10 @@ export interface UpdateWikiProjectInput {
     chat_model?: string;
     ingest_channel_id?: string;
     chat_channel_id?: string;
+    pdf_ocr_channel_id?: string;
+    pdf_ocr_model?: string;
+    reasoning_effort?: string;
+    temperature?: number;
     mcp_enabled?: number;
 }
 
@@ -566,13 +670,16 @@ export const wikiApi = {
     getPages: (projectId: string) => invoke<WikiPage[]>("get_wiki_pages", { projectId }),
     getPage: (projectId: string, path: string) => invoke<WikiPage & { content: string }>("get_wiki_page", { projectId, path }),
     savePage: (projectId: string, path: string, content: string) => invoke<void>("save_wiki_page", { projectId, path, content }),
+    deletePage: (projectId: string, path: string) => invoke<void>("delete_wiki_page", { projectId, path }),
     getSources: (projectId: string) => invoke<WikiSource[]>("get_wiki_sources", { projectId }),
     addSource: (projectId: string, input: AddWikiSourceInput) => invoke<WikiSource>("add_wiki_source", { projectId, input }),
+    addSourceFromPath: (projectId: string, path: string) => invoke<WikiSource>("add_wiki_source_from_path", { projectId, path }),
     deleteSource: (sourceId: string) => invoke<void>("delete_wiki_source", { sourceId }),
     search: (projectId: string, query: string, topK?: number) => invoke<WikiSearchResult[]>("search_wiki", { projectId, query, topK }),
     getGraph: (projectId: string) => invoke<WikiGraphData>("get_wiki_graph", { projectId }),
     getStats: (projectId: string) => invoke<Record<string, unknown>>("get_wiki_stats", { projectId }),
     ingestSource: (projectId: string, sourceId: string) => invoke<{ status: string; pages_created: number; page_paths: string[] }>("ingest_wiki_source", { projectId, sourceId }),
+    cancelIngest: (projectId: string, sourceId: string) => invoke<{ status: string }>("cancel_wiki_ingest", { projectId, sourceId }),
     rescanSources: (projectId: string) => invoke<{ status: string; processed: number; results: unknown[] }>("rescan_wiki_sources", { projectId }),
     getTags: (projectId: string, limit?: number) => invoke<WikiTag[]>("get_wiki_tags", { projectId, limit }),
 };
