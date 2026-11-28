@@ -1,6 +1,8 @@
-## LKAPI v0.1.0 — 本地 LLM API 网关
+## LKAPI v0.4.1 — 本地 LLM API 网关
 
 > 本地运行的 LLM API 网关桌面软件，统一转换各供应商 API 为 OpenAI 兼容协议。可配合 [WaLiCode](https://walicode.xiaofuge.cn/)、Codex、Claude Code、QClaw 等 AI IDE，让你知道 AI 对话，到底在说啥。
+
+> **数据兼容**：0.4.1 起升级保留数据。渠道、密钥、日志、知识库自动沿用；升级前生成 `lkapi.db.pre-upgrade-*` 备份（保留最近 3 份），迁移失败时原库以 `lkapi.db.broken-*` 隔离保留，不再静默删库。
 
 网盘下载：[https://pan.quark.cn/s/b6a134a77efa](https://pan.quark.cn/s/b6a134a77efa)
 
@@ -50,6 +52,12 @@
 **📡 流式响应**
 
 - 完整 SSE 流式转发，兼容 ChatBox / NextChat / OpenAI SDK 等下游客户端
+
+### 🔄 自动更新与数据升级
+
+- 客户端启动即检查 `releases/latest/download/latest.json`，提示后可一键下载并静默安装
+- 安装包签名与内置 pubkey 校验，签名不匹配直接拒绝
+- 升级前自动备份数据库；行尾校验差异自动修复，0.4.0 的库可直接升到 0.4.1
 
 ### 🏗️ 技术栈
 

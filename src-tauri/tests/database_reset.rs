@@ -1,7 +1,7 @@
-//! 数据兼容策略的端到端验证：老版本数据一律丢弃，不与新 schema 共存。
+//! 数据兼容策略的端到端验证：从 0.4.0 开始升级必须保留用户数据。
 //!
 //! 这些用例走 `Database::new_with_path`（桌面端与 headless 共用的入口），
-//! 因此覆盖到清理残留、建库、跑迁移、补建索引的完整启动链路。
+//! 因此覆盖到清理残留、迁移前备份、行尾校验修复、建库、跑迁移的完整启动链路。
 
 use std::path::{Path, PathBuf};
 
@@ -50,7 +50,7 @@ async fn fresh_directory_is_initialised_to_latest_schema() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 目录里残留的旧库/旧备份会被直接清掉，不影响新库建立。
+/// 旧产品名数据库会被清掉；本产品的迁移前备份与隔离文件必须保留。
 #[tokio::test]
 async fn legacy_artifacts_are_purged_on_startup() {
     let dir = temp_dir("purge");
@@ -70,26 +70,30 @@ async fn legacy_artifacts_are_purged_on_startup() {
     for name in [
         "waliapi.db",
         "waliapi.db.pre-upgrade-20260101-000000",
-        "lkapi.db.pre-upgrade-20260101-000000",
-        "lkapi.db.broken-20260101-000000",
     ] {
         assert!(
             !dir.join(name).exists(),
-            "旧数据应被清理，但仍存在: {name}"
+            "旧产品名数据应被清理，但仍存在: {name}"
         );
     }
-    assert!(
-        dir.join("settings.json").exists(),
-        "配置文件不属于旧数据库，必须保留"
-    );
+    for name in [
+        "lkapi.db.pre-upgrade-20260101-000000",
+        "lkapi.db.broken-20260101-000000",
+        "settings.json",
+    ] {
+        assert!(
+            dir.join(name).exists(),
+            "备份/隔离/配置文件必须保留，但已被删除: {name}"
+        );
+    }
 
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 无法按当前 schema 打开的旧库：整库丢弃重建，而不是尝试修补或备份。
+/// 无法按当前 schema 打开的旧库：隔离保留原文件后重建，绝不静默删除。
 #[tokio::test]
-async fn incompatible_database_is_replaced() {
+async fn incompatible_database_is_quarantined() {
     let dir = temp_dir("replace");
     let db_path = dir.join("lkapi.db");
 
@@ -134,6 +138,80 @@ async fn incompatible_database_is_replaced() {
     .await
     .unwrap();
     assert_eq!(exists, Some(0), "旧表不应存在于重建后的库里");
+
+    // 原库必须以 `lkapi.db.broken-*` 形式留在目录里，供手工恢复。
+    let quarantined: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("lkapi.db.broken-"))
+        .collect();
+    assert!(
+        !quarantined.is_empty(),
+        "原库应被隔离保留，而不是删除"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 0.4.0 的老库（CRLF checksum）升级：业务数据必须原样保留，不触发重建。
+#[tokio::test]
+async fn crlf_legacy_database_upgrades_without_data_loss() {
+    use sha2::Digest;
+
+    let dir = temp_dir("crlf-upgrade");
+
+    {
+        let db = Database::new_with_path(&dir).await;
+        // 写一条业务数据，升级后必须还在。
+        sqlx::query("CREATE TABLE IF NOT EXISTS _lkapi_upgrade_marker (id INTEGER PRIMARY KEY, note TEXT)")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO _lkapi_upgrade_marker (note) VALUES ('keep-me')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // 模拟 0.4.0 安装包：所有迁移 checksum 都是 CRLF 变体。
+        let migrator = sqlx::migrate!("./migrations");
+        let mut tx = db.pool.begin().await.unwrap();
+        for migration in migrator.iter() {
+            let crlf = migration.sql.replace("\r\n", "\n").replace('\n', "\r\n");
+            let checksum = sha2::Sha384::digest(crlf.as_bytes()).to_vec();
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+                .bind(checksum)
+                .bind(migration.version)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        db.pool.close().await;
+    }
+
+    // 模拟升级后的首次启动
+    let db = Database::new_with_path(&dir).await;
+    assert_eq!(applied_version(&db).await, expected_version(), "不应重建数据库");
+
+    let note: String = sqlx::query_scalar("SELECT note FROM _lkapi_upgrade_marker LIMIT 1")
+        .fetch_one(&db.pool)
+        .await
+        .expect("升级后业务数据必须保留");
+    assert_eq!(note, "keep-me");
+
+    let backups = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("lkapi.db.pre-upgrade-")
+        })
+        .count();
+    assert_eq!(backups, 0, "无 schema 变更时不应产生备份文件");
 
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&dir);
