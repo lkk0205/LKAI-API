@@ -32,6 +32,17 @@ src-tauri/logs/
 # Tauri generated
 src-tauri/gen/
 
+# 本地生成的更新清单（发布时由 CI 生成并上传到 release）
+/latest.json
+
+# 一次性排查用的签名/密钥探针
+.signtest.txt
+.signtest.txt.sig
+.signtest.txt.blake2b
+.keycheck.py
+.keycheck2.py
+.acl-report/
+
 # Lock files (keep pnpm-lock.yaml and Cargo.lock)
 !pnpm-lock.yaml
 !Cargo.lock

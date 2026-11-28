@@ -22,8 +22,9 @@ pub mod settings_store;
 pub mod utils;
 pub mod web_server;
 
-/// 应用标识符（与 tauri.conf.json 一致），用于 headless 数据目录解析。
-pub const APP_IDENTIFIER: &str = "lkapi.xiaofuge.cn";
+/// 应用标识符（必须与 tauri.conf.json 的 identifier 一致），用于 headless 数据目录解析。
+/// 桌面端与 headless 共用同一数据目录，避免出现两份互不相干的数据库。
+pub const APP_IDENTIFIER: &str = "lkapi.liangkun.cn";
 
 use std::sync::Arc;
 #[cfg(feature = "desktop-ui")]

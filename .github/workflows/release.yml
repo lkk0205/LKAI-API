@@ -6,8 +6,13 @@ on:
       - 'lkapi-v*'
   workflow_dispatch:
 
+env:
+  RELEASE_BODY: >-
+    Windows 下载 -setup.exe（安装版，支持应用内自动更新）。
+    0.4.0 起不再兼容旧版本数据：升级会重建数据库，渠道 / 密钥 / 日志需重新配置。
+
 jobs:
-  # Windows 先跑：负责创建 draft release，并完成版本一致性校验
+  # Windows 先跑：创建 draft release，完成版本一致性校验，并产出 latest.json 的 windows 条目
   windows:
     permissions:
       contents: write
@@ -34,15 +39,16 @@ jobs:
       - name: install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: verify versions (package.json / tauri.conf.json / tag / Cargo.lock)
+      - name: verify versions (package.json / tauri.conf.json / Cargo.toml / tag)
         shell: bash
         run: |
           set -euo pipefail
           CONF=$(node -p "require('./src-tauri/tauri.conf.json').version")
           PKG=$(node -p "require('./package.json').version")
-          echo "tauri.conf.json=$CONF  package.json=$PKG  ref=${GITHUB_REF_NAME:-none}"
-          if [ "$CONF" != "$PKG" ]; then
-            echo "::error::package.json ($PKG) 与 tauri.conf.json ($CONF) 版本不一致"
+          CARGO=$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -n 1)
+          echo "tauri.conf.json=$CONF  package.json=$PKG  Cargo.toml=$CARGO  ref=${GITHUB_REF_NAME:-none}"
+          if [ "$CONF" != "$PKG" ] || [ "$CONF" != "$CARGO" ]; then
+            echo "::error::版本号不一致（tauri.conf.json=$CONF package.json=$PKG Cargo.toml=$CARGO），先用 node scripts/set-version.mjs <版本> 统一"
             exit 1
           fi
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
@@ -55,6 +61,19 @@ jobs:
           cd src-tauri
           cargo metadata --locked --format-version 1 > /dev/null
 
+      - name: verify updater signing key matches pubkey
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::error::缺少仓库 secret TAURI_SIGNING_PRIVATE_KEY，构建出的安装包没有 .sig，应用内自动更新会直接失效"
+            exit 1
+          fi
+          node scripts/verify-updater-key.mjs
+
       - name: build Tauri app (windows)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -62,11 +81,15 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: lkapi-v__VERSION__
-          releaseName: 'LKAPI v__VERSION__'
-          releaseBody: 'Windows 下载 -setup.exe；Linux 下载 .AppImage（应用内自动更新仅对 AppImage 生效）。'
+          # 手动触发（workflow_dispatch）只做构建校验，不创建 release/不占用 tag；
+          # 打 tag 触发时才真正出包并上传到 draft release。
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && 'lkapi-v__VERSION__' || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && 'LKAPI v__VERSION__' || '' }}
+          releaseBody: ${{ env.RELEASE_BODY }}
           releaseDraft: true
           prerelease: false
+          # Windows 的更新包必须指向 NSIS 的 setup.exe，否则 latest.json 的 windows 条目会指向 msi
+          updaterJsonPreferNsis: true
           args: '--bundles nsis'
 
   # Linux 串行在 Windows 之后：避免两个 job 同时读改写同一个 latest.json
@@ -118,9 +141,44 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: lkapi-v__VERSION__
-          releaseName: 'LKAPI v__VERSION__'
-          releaseBody: 'Windows 下载 -setup.exe；Linux 下载 .AppImage（应用内自动更新仅对 AppImage 生效）。'
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && 'lkapi-v__VERSION__' || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && 'LKAPI v__VERSION__' || '' }}
+          releaseBody: ${{ env.RELEASE_BODY }}
           releaseDraft: true
           prerelease: false
           args: '--bundles deb,appimage,rpm'
+
+  # 把 draft 转正：应用内自动更新的 endpoints 指向 releases/latest/download/latest.json，
+  # 而 /releases/latest 不解析 draft —— 不转正的话客户端永远检查不到新版本。
+  publish:
+    needs: [windows, linux]
+    # workflow_dispatch 只做构建校验，不碰 release
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: publish release for this version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="lkapi-v${VERSION}"
+          echo "目标 tag: $TAG"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft > tag.json 2>/dev/null; then
+            echo "::error::找不到 $TAG 对应的 release，检查构建 job 是否成功"
+            exit 1
+          fi
+          DRAFT=$(node -p "require('./tag.json').isDraft")
+          if [ "$DRAFT" = "true" ]; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+            echo "已发布 $TAG 并设为 latest"
+          else
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest
+            echo "$TAG 已是正式 release，已设为 latest"
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const a=JSON.parse(s).assets.map(x=>x.name);if(!a.includes('latest.json')){console.error('release 缺少 latest.json，应用内自动更新会失效');process.exit(1);}if(!a.some(x=>x.endsWith('.sig'))){console.error('release 缺少 .sig 签名文件，自动更新会因验签失败被拒绝');process.exit(1);}console.log('latest.json +',a.filter(x=>x.endsWith('.sig')).length,'个签名文件，自动更新链路完整')})"

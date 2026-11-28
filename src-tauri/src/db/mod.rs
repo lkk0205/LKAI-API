@@ -6,147 +6,19 @@ use std::path::{Path, PathBuf};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use tauri::{AppHandle, Manager};
 
-/// 迁移前备份文件名前缀。备份形如 `lkapi.db.pre-upgrade-20260806-190400`，与数据库同目录。
-const BACKUP_PREFIX: &str = "lkapi.db.pre-upgrade-";
+/// 数据库文件名。
+const DB_FILE_NAME: &str = "lkapi.db";
 
-/// 保留的最近备份份数（超出后删除最旧的）。
-const BACKUP_KEEP: usize = 3;
+/// 旧产品名留下的数据库文件名（`waliapi.db` 等）。
+///
+/// 本应用明确**不兼容任何历史版本的用户数据**，启动时会清掉这些遗留文件。
+const LEGACY_DB_STEMS: &[&str] = &["waliapi.db", "xapi.db"];
+
+/// 历史上由“迁移前备份/损坏隔离”逻辑产生的文件前缀。
+const LEGACY_ARTIFACT_PREFIXES: &[&str] = &["lkapi.db.pre-upgrade-", "lkapi.db.broken-"];
 
 pub struct Database {
     pub pool: SqlitePool,
-}
-
-/// 修复旧版迁移记录的 checksum，使 v0.1.1 用户升级到 v0.1.3 时不会 VersionMismatch
-///
-/// v0.1.1 → v0.1.3 迁移文件变更：
-/// - 005_add_response_choices.sql → 005_add_response_choices_and_seq.sql（内容变更）
-/// - 007 文件可能被本地修改过（description 不匹配）
-///
-/// 此函数在 sqlx::migrate 之前运行，将旧 checksum 更新为当前文件的 checksum。
-/// 仅更新已有记录，不会跳过任何迁移。
-async fn fix_legacy_migration_checksums(pool: &SqlitePool) {
-    use sha2::Digest;
-
-    // 计算当前迁移文件的 SHA-384 checksum（与 sqlx 算法一致：对文件内容原始字节做 SHA-384）
-    let migration_005 = include_str!("../../migrations/005_add_response_choices_and_seq.sql");
-    let checksum_005: Vec<u8> = sha2::Sha384::digest(migration_005.as_bytes()).to_vec();
-
-    let migration_007 = include_str!("../../migrations/007_fix_log_seq.sql");
-    let checksum_007: Vec<u8> = sha2::Sha384::digest(migration_007.as_bytes()).to_vec();
-
-    // 更新 version=5 和 version=7 的 checksum（BLOB 类型），使其匹配当前文件
-    for (version, new_checksum) in [(5i64, checksum_005), (7i64, checksum_007)] {
-        let result = sqlx::query(
-            "UPDATE _sqlx_migrations SET checksum = ? WHERE version = ? AND checksum != ?",
-        )
-        .bind(&new_checksum)
-        .bind(version)
-        .bind(&new_checksum)
-        .execute(pool)
-        .await;
-
-        if let Ok(res) = result {
-            if res.rows_affected() > 0 {
-                log::warn!("已修复迁移版本 {} 的 checksum 以兼容 v0.1.3", version);
-            }
-        }
-    }
-}
-
-/// 迁移集内的最大版本号（当前编译进二进制的迁移文件）。
-fn migration_max_version() -> i64 {
-    sqlx::migrate!("./migrations")
-        .iter()
-        .map(|m| m.version)
-        .max()
-        .unwrap_or(0)
-}
-
-/// 数据库当前迁移版本：`_sqlx_migrations` 中最大的已成功版本。
-/// 表不存在或为空时返回 0（全新数据库）。
-async fn current_db_version(pool: &SqlitePool) -> i64 {
-    let max: Option<i64> =
-        sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
-            .fetch_one(pool)
-            .await
-            .ok()
-            .flatten();
-    max.unwrap_or(0)
-}
-
-/// 生成本次备份路径：`lkapi.db.pre-upgrade-<YYYYmmdd-HHMMSS>`，与数据库同目录。
-fn make_backup_path(db_path: &Path) -> PathBuf {
-    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    db_path.with_file_name(format!("{BACKUP_PREFIX}{ts}"))
-}
-
-/// 删除同目录下过旧的迁移前备份，只保留最近 `BACKUP_KEEP` 份。
-/// 按文件修改时间排序（相同则按名称），新的在前。只匹配 `BACKUP_PREFIX` 前缀文件。
-fn prune_old_backups(db_path: &Path) -> Result<(), String> {
-    let dir = db_path.parent().ok_or("数据库路径缺少父目录")?;
-    let mut backups: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
-        .map_err(|e| format!("读取备份目录失败: {e}"))?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_name()?.to_string_lossy();
-            if !name.starts_with(BACKUP_PREFIX) {
-                return None;
-            }
-            let mtime = std::fs::metadata(&path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            Some((mtime, path))
-        })
-        .collect();
-
-    backups.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    for (_mtime, path) in backups.into_iter().skip(BACKUP_KEEP) {
-        std::fs::remove_file(&path)
-            .map_err(|e| format!("删除旧备份 {} 失败: {e}", path.display()))?;
-    }
-    Ok(())
-}
-
-/// 迁移前自动备份。仅当数据库已存在（有迁移记录）且 schema 版本低于当前迁移集时执行。
-///
-/// 备份用 SQLite `VACUUM INTO` 生成一致快照（原子、对 live DB 安全），命名
-/// `lkapi.db.pre-upgrade-<YYYYmmdd-HHMMSS>`，随后按 `BACKUP_KEEP` 清理旧备份。
-/// 恢复为纯文件级：手动把备份文件复制回 `lkapi.db` 即可。
-///
-/// 无需备份时返回 `Ok(None)`。备份失败只记录错误，不阻断启动。
-async fn backup_before_migration(
-    pool: &SqlitePool,
-    db_path: &Path,
-) -> Result<Option<PathBuf>, String> {
-    let db_max = current_db_version(pool).await;
-    let migration_max = migration_max_version();
-
-    if db_max == 0 || db_max >= migration_max {
-        return Ok(None);
-    }
-
-    let backup_path = make_backup_path(db_path);
-    // VACUUM INTO 目标已存在时行为未定义，先清除旧目标（同名同秒重复时防御）
-    if backup_path.exists() {
-        std::fs::remove_file(&backup_path)
-            .map_err(|e| format!("移除旧备份 {} 失败: {e}", backup_path.display()))?;
-    }
-    let dest = backup_path.to_string_lossy().replace('\'', "''");
-    sqlx::query(&format!("VACUUM INTO '{dest}'"))
-        .execute(pool)
-        .await
-        .map_err(|e| format!("创建备份失败: {e}"))?;
-
-    log::info!(
-        "迁移前已备份数据库 (schema {db_max} -> {migration_max}): {}",
-        backup_path.display()
-    );
-
-    prune_old_backups(db_path)?;
-
-    Ok(Some(backup_path))
 }
 
 impl Database {
@@ -162,29 +34,13 @@ impl Database {
     pub async fn new_with_path(app_data_dir: &Path) -> Self {
         std::fs::create_dir_all(app_data_dir).expect("failed to create app data dir");
 
-        let db_path = app_data_dir.join("lkapi.db");
-        let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let db_path = app_data_dir.join(DB_FILE_NAME);
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(&db_url)
+        purge_legacy_files(app_data_dir, &db_path);
+
+        let pool = Self::connect_and_migrate(&db_path)
             .await
-            .expect("failed to connect to database");
-
-        // 修复旧版迁移 checksum（v0.1.1 → v0.1.3 兼容）
-        fix_legacy_migration_checksums(&pool).await;
-
-        // 迁移前自动备份：schema 落后时先做文件级快照，再跑迁移。
-        // 失败不阻断启动——迁移本身是增量、可逆的，备份是额外保险。
-        if let Err(e) = backup_before_migration(&pool, &db_path).await {
-            log::error!("迁移前自动备份失败，继续启动: {e}");
-        }
-
-        // Run migrations
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("failed to run database migrations");
+            .expect("failed to prepare database");
 
         // 补建升级前切片的关键词投影，不改动已有正文和向量。
         crate::services::knowledge::repository::KbRepository::new(pool.clone())
@@ -197,173 +53,234 @@ impl Database {
 
         Self { pool }
     }
+
+    /// 连接并跑迁移。**任何失败都视为“旧库不可用”**，直接丢弃整个数据库文件重来。
+    ///
+    /// 本应用不再尝试复用/修补历史版本的 schema：迁移 checksum 不匹配、schema
+    /// 缺列、文件损坏，一律删库重建，避免把兼容代码和迁移补丁留在启动路径上。
+    async fn connect_and_migrate(db_path: &Path) -> Result<SqlitePool, String> {
+        match open_and_migrate(db_path).await {
+            Ok(pool) => Ok(pool),
+            Err(first_error) => {
+                let removed = discard_database(db_path);
+                log::warn!(
+                    "数据库无法按当前 schema 打开（{first_error}），已删除重建: {}",
+                    removed.join(", ")
+                );
+                open_and_migrate(db_path)
+                    .await
+                    .map_err(|second_error| {
+                        format!("重建数据库失败: {second_error}（首次失败: {first_error}）")
+                    })
+            }
+        }
+    }
+}
+
+/// 打开数据库并跑全部迁移，任何一步失败都返回错误。
+async fn open_and_migrate(db_path: &Path) -> Result<SqlitePool, String> {
+    let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .map_err(|e| format!("连接数据库失败: {e}"))?;
+
+    if let Err(e) = sqlx::migrate!("./migrations").run(&pool).await {
+        pool.close().await;
+        return Err(format!("执行数据库迁移失败: {e}"));
+    }
+
+    Ok(pool)
+}
+
+/// 删除数据库文件及其 SQLite 伴生文件。返回被删除文件的路径（用于日志）。
+fn discard_database(db_path: &Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    for path in sqlite_files(db_path) {
+        if std::fs::remove_file(&path).is_ok() {
+            removed.push(path.display().to_string());
+        }
+    }
+    removed
+}
+
+/// 主库文件 + SQLite 运行期伴生文件（`-wal` / `-shm` / `-journal`）。
+fn sqlite_files(db_path: &Path) -> Vec<PathBuf> {
+    let mut files = vec![db_path.to_path_buf()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let name = format!("{}{suffix}", DB_FILE_NAME);
+        files.push(db_path.with_file_name(name));
+    }
+    files
+}
+
+/// 清理历史版本在同一目录里留下的数据库与备份残留。
+///
+/// 只动“确定属于旧数据”的文件：旧产品名的库、旧迁移备份、旧损坏隔离文件。
+/// 当前使用的 `lkapi.db` 不在这里处理（它由迁移失败路径负责重建）。
+fn purge_legacy_files(app_data_dir: &Path, db_path: &Path) {
+    let Ok(entries) = std::fs::read_dir(app_data_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == db_path {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+
+        let is_legacy_db = LEGACY_DB_STEMS.iter().any(|stem| {
+            name == *stem
+                || name.starts_with(&format!("{stem}-"))
+                || name.starts_with(&format!("{stem}."))
+        });
+        let is_legacy_artifact = LEGACY_ARTIFACT_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+
+        if is_legacy_db || is_legacy_artifact {
+            if std::fs::remove_file(&path).is_ok() {
+                log::info!("已清理旧版本数据残留: {name}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
-    use std::time::{Duration, SystemTime};
 
-    fn temp_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("lkapi-backup-{}", uuid::Uuid::new_v4()))
-    }
-
-    async fn test_pool(db_path: &Path) -> SqlitePool {
-        SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
-            .await
-            .expect("connect test db")
-    }
-
-    /// 在数据库里模拟旧版迁移记录（版本 5）与一条业务数据。
-    async fn seed_legacy_db(pool: &SqlitePool) {
-        sqlx::query("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
-            .execute(pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO items (name) VALUES ('pre-upgrade-data')")
-            .execute(pool)
-            .await
-            .unwrap();
-        sqlx::query("CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, success INTEGER)")
-            .execute(pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO _sqlx_migrations (version, success) VALUES (5, 1)")
-            .execute(pool)
-            .await
-            .unwrap();
-    }
-
-    #[test]
-    fn make_backup_path_uses_pre_upgrade_prefix() {
-        let db_path = Path::new("/tmp/lkapi/lkapi.db");
-        let backup = make_backup_path(db_path);
-        let name = backup.file_name().unwrap().to_string_lossy().to_string();
-        assert!(name.starts_with(BACKUP_PREFIX), "备份名应带前缀: {name}");
-        let ts = &name[BACKUP_PREFIX.len()..];
-        assert_eq!(ts.len(), 15, "时间戳应为 YYYYmmdd-HHMMSS: {ts}");
-        assert_eq!(ts.as_bytes()[8], b'-', "时间戳第 9 位应为分隔符: {ts}");
-        assert!(
-            ts.chars()
-                .enumerate()
-                .filter(|(i, _)| *i != 8)
-                .all(|(_, c)| c.is_ascii_digit()),
-            "时间戳除分隔符外应全为数字: {ts}"
-        );
-        assert_eq!(backup.parent(), Some(Path::new("/tmp/lkapi")));
-    }
-
-    #[test]
-    fn prune_keeps_latest_three_and_ignores_others() {
-        let dir = temp_dir();
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lkapi-db-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
-        // 5 份按时间递增的备份（名称与 mtime 一致：090000 最旧 … 090004 最新）
-        let names: Vec<String> = (0..5)
-            .map(|i| format!("{BACKUP_PREFIX}20260806-09000{i}"))
+    #[test]
+    fn sqlite_files_covers_wal_and_journal_companions() {
+        let files = sqlite_files(Path::new("/tmp/lkapi/lkapi.db"));
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
-        for (i, name) in names.iter().enumerate() {
-            let p = dir.join(name);
-            std::fs::write(&p, b"backup").unwrap();
-            let f = std::fs::File::open(&p).unwrap();
-            let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(i as u64);
-            let _ = f.set_modified(ts);
-        }
-        // 无关文件不应被清理
-        std::fs::write(dir.join("lkapi.db"), b"db").unwrap();
-        std::fs::write(dir.join("config.toml.lkapi-backup"), b"cfg").unwrap();
+        assert_eq!(names.len(), 4, "应覆盖主库与 3 个伴生文件: {names:?}");
+        assert!(names.contains(&"lkapi.db".to_string()));
+        assert!(names.contains(&"lkapi.db-wal".to_string()));
+        assert!(names.contains(&"lkapi.db-shm".to_string()));
+        assert!(names.contains(&"lkapi.db-journal".to_string()));
+    }
 
-        prune_old_backups(&dir.join("lkapi.db")).unwrap();
+    #[test]
+    fn purge_removes_legacy_files_and_keeps_current_db() {
+        let dir = temp_dir("purge");
+        let db_path = dir.join(DB_FILE_NAME);
 
-        let remaining: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.starts_with(BACKUP_PREFIX))
-            .collect();
-        assert_eq!(remaining.len(), 3, "应只剩 3 份备份: {remaining:?}");
-        for name in remaining.iter() {
-            let newest = ["090002", "090003", "090004"];
-            assert!(
-                newest.iter().any(|s| name.ends_with(s)),
-                "应保留最新的三份，但找到: {name}"
-            );
+        for name in [
+            "lkapi.db",
+            "lkapi.db-wal",
+            "lkapi.db.pre-upgrade-20260101-000000",
+            "lkapi.db.broken-20260101-000000",
+            "waliapi.db",
+            "waliapi.db.pre-upgrade-20260101-000000",
+            "xapi.db",
+            "settings.json",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
         }
-        assert!(dir.join("lkapi.db").exists(), "数据库文件不应被清理");
+
+        purge_legacy_files(&dir, &db_path);
+
+        assert!(dir.join("lkapi.db").exists(), "当前库文件不应被清理");
         assert!(
-            dir.join("config.toml.lkapi-backup").exists(),
-            "配置文件不应被清理"
+            dir.join("lkapi.db-wal").exists(),
+            "当前库的伴生文件不应被清理"
         );
+        assert!(dir.join("settings.json").exists(), "配置文件不应被清理");
+        for name in [
+            "lkapi.db.pre-upgrade-20260101-000000",
+            "lkapi.db.broken-20260101-000000",
+            "waliapi.db",
+            "waliapi.db.pre-upgrade-20260101-000000",
+            "xapi.db",
+        ] {
+            assert!(!dir.join(name).exists(), "旧数据应被清理: {name}");
+        }
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
-    async fn creates_backup_when_schema_is_behind() {
-        let dir = temp_dir();
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("lkapi.db");
-        let pool = test_pool(&db_path).await;
-        seed_legacy_db(&pool).await;
+    async fn fresh_directory_gets_a_full_schema() {
+        let dir = temp_dir("fresh");
+        let db_path = dir.join(DB_FILE_NAME);
 
-        let backup = backup_before_migration(&pool, &db_path)
+        let pool = Database::connect_and_migrate(&db_path)
             .await
-            .unwrap()
-            .expect("schema 落后时应创建备份");
-        assert!(backup.exists(), "备份文件应存在: {}", backup.display());
+            .expect("全新目录应能建库");
 
-        // 备份内容一致：业务数据完整，迁移版本仍是旧版本 5
-        let backup_pool = test_pool(&backup).await;
-        let name: String = sqlx::query_scalar("SELECT name FROM items WHERE id = 1")
-            .fetch_one(&backup_pool)
-            .await
-            .unwrap();
-        assert_eq!(name, "pre-upgrade-data");
-        let ver: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
-            .fetch_one(&backup_pool)
-            .await
-            .unwrap();
-        assert_eq!(ver, 5, "备份应保留升级前的旧版本记录");
-
-        // VACUUM INTO 是只读快照：备份后同一连接必须仍可写，迁移才能继续
-        sqlx::query("INSERT INTO items (name) VALUES ('post-backup')")
-            .execute(&pool)
-            .await
-            .expect("备份后连接应仍可写");
+        let expected: i64 = sqlx::migrate!("./migrations")
+            .iter()
+            .map(|m| m.version)
+            .max()
+            .unwrap_or(0);
+        let applied: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(applied, expected, "应跑到最新迁移");
 
         pool.close().await;
-        backup_pool.close().await;
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// 旧版本留下的库（迁移 checksum 与当前文件不一致）不再试图修补，
+    /// 而是整体丢弃重建：这是“不要管老版本用户数据”的落地点。
     #[tokio::test]
-    async fn no_backup_when_already_latest() {
-        let dir = temp_dir();
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("lkapi.db");
-        let pool = test_pool(&db_path).await;
-        seed_legacy_db(&pool).await;
-        // 把迁移记录改成当前最新版本
-        let max = migration_max_version();
-        sqlx::query("UPDATE _sqlx_migrations SET version = ? WHERE version = 5")
-            .bind(max)
-            .execute(&pool)
+    async fn incompatible_legacy_database_is_replaced_instead_of_repaired() {
+        let dir = temp_dir("legacy");
+        let db_path = dir.join(DB_FILE_NAME);
+
+        // 用一个 SQLite 库模拟旧版 schema：只有一个 `_sqlx_migrations` 表，
+        // 版本号与 checksum 都与当前迁移集对不上。
+        {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, installed_on TEXT NOT NULL, success INTEGER NOT NULL, checksum BLOB NOT NULL, execution_time INTEGER NOT NULL)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time) VALUES (1, 'legacy', '2026-01-01T00:00:00Z', 1, X'00', 0)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+
+        let pool = Database::connect_and_migrate(&db_path)
             .await
-            .unwrap();
+            .expect("旧库应被丢弃后重建成功");
 
-        let result = backup_before_migration(&pool, &db_path).await.unwrap();
-        assert!(result.is_none(), "已是最新时不应备份");
-
-        let backups: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.starts_with(BACKUP_PREFIX))
-            .collect();
-        assert!(backups.is_empty(), "不应产生备份: {backups:?}");
+        let expected: i64 = sqlx::migrate!("./migrations")
+            .iter()
+            .map(|m| m.version)
+            .max()
+            .unwrap_or(0);
+        let applied: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(applied, expected, "重建后应跑到最新迁移");
 
         pool.close().await;
         std::fs::remove_dir_all(&dir).unwrap();
