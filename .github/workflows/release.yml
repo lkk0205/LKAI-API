@@ -9,7 +9,8 @@ on:
 env:
   RELEASE_BODY: >-
     Windows 下载 -setup.exe（安装版，支持应用内自动更新）。
-    0.4.1 起升级保留数据：渠道 / 密钥 / 日志 / 知识库自动沿用，不再重建数据库。
+    0.4.2 新增：链路可观测（路由地图 / Prompt 分段 / 首字耗时 / 重试详情）、Qoder 账号、Wiki 采集与 PDF OCR、用量统计与日志清理解耦。
+    0.4.1 起升级保留数据：渠道 / 密钥 / 日志 / 知识库 / Wiki 自动沿用，迁移 046-052 自动补齐。
     升级前会自动生成 lkapi.db.pre-upgrade-* 备份（最多保留 3 份）；迁移失败时原库以 lkapi.db.broken-* 隔离保留。
 
 jobs:
@@ -75,6 +76,12 @@ jobs:
           fi
           node scripts/verify-updater-key.mjs
 
+      # pdfium 动态库（知识库 PDF OCR 渲染依赖）不随源码入库：打包前下载到
+      # src-tauri/resources/pdfium/，tauri.conf.json 的 bundle.resources 会自动打进安装包。
+      - name: fetch pdfium
+        shell: bash
+        run: bash scripts/fetch-pdfium.sh
+
       - name: build Tauri app (windows)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -134,6 +141,10 @@ jobs:
 
       - name: install dependencies
         run: pnpm install --frozen-lockfile
+
+      # 同 Windows：OCR 依赖的 pdfium 动态库在打包前拉取
+      - name: fetch pdfium
+        run: bash scripts/fetch-pdfium.sh
 
       - name: build Tauri app (linux)
         uses: tauri-apps/tauri-action@v0
