@@ -9,7 +9,8 @@ on:
 env:
   RELEASE_BODY: >-
     Windows 下载 -setup.exe（安装版，支持应用内自动更新）。
-    0.4.0 起不再兼容旧版本数据：升级会重建数据库，渠道 / 密钥 / 日志需重新配置。
+    0.4.1 起升级保留数据：渠道 / 密钥 / 日志 / 知识库自动沿用，不再重建数据库。
+    升级前会自动生成 lkapi.db.pre-upgrade-* 备份（最多保留 3 份）；迁移失败时原库以 lkapi.db.broken-* 隔离保留。
 
 jobs:
   # Windows 先跑：创建 draft release，完成版本一致性校验，并产出 latest.json 的 windows 条目
@@ -168,6 +169,25 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           TAG="lkapi-v${VERSION}"
           echo "目标 tag: $TAG"
+
+          # 版本守卫：新旧版本号不得倒退，防止重发旧 tag 抢走 latest 标记。
+          LATEST_TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || true)
+          if [ -n "$LATEST_TAG" ]; then
+            LATEST_VERSION="${LATEST_TAG#lkapi-v}"
+            if ! node -e '
+              const toNum = (v) => v.split("-")[0].split(".").map((n) => Number(n) || 0);
+              const a = toNum(process.argv[1]);
+              const b = toNum(process.argv[2]);
+              for (let i = 0; i < 3; i += 1) {
+                if ((a[i] || 0) !== (b[i] || 0)) process.exit((a[i] || 0) < (b[i] || 0) ? 1 : 0);
+              }
+            ' "$VERSION" "$LATEST_VERSION"; then
+              echo "::error::版本 $VERSION 低于当前 latest 版本 $LATEST_VERSION（$LATEST_TAG），拒绝发布。检查 tag 是否打错，或先发布更高版本。"
+              exit 1
+            fi
+            echo "版本守卫通过：$VERSION >= $LATEST_VERSION（当前 latest）"
+          fi
+
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft > tag.json 2>/dev/null; then
             echo "::error::找不到 $TAG 对应的 release，检查构建 job 是否成功"
             exit 1
